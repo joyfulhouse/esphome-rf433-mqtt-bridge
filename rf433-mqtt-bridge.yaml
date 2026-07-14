@@ -202,7 +202,14 @@ mqtt:
               reject(std::string(key) + " must be a B0 string");
               return false;
             }
-            if (!rf433::normalize_b0(x[key].as<std::string>(), out, reason)) {
+            const std::string value = x[key].as<std::string>();
+            if (value.empty()) {
+              // An explicitly empty optional field means "absent".
+              if (required)
+                reject(std::string(key) + " must be a B0 string");
+              return !required;
+            }
+            if (!rf433::normalize_b0(value, out, reason)) {
               reject(std::string("invalid ") + key + ": " + reason);
               return false;
             }

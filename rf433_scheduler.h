@@ -99,6 +99,12 @@ inline bool normalize_b0(const std::string &input, std::string &output, std::str
     reason = "frame bucket table is truncated";
     return false;
   }
+  if (data_start == body_end) {
+    // Structurally valid but transmits nothing; scheduling it would only
+    // burn dispatch slots on empty UART handoffs.
+    reason = "frame contains no pulse data";
+    return false;
+  }
   std::array<uint32_t, 8> bucket_us{};
   for (size_t bucket = 0; bucket < bucket_count; bucket++) {
     for (size_t nibble = 0; nibble < 4; nibble++) {
@@ -453,7 +459,30 @@ class TargetScheduler {
     return false;
   }
 
+  bool is_active_(const std::string &command_id) const {
+    if (command_id.empty())
+      return false;
+    for (const auto &item : this->commands_) {
+      if (item.second.command_id == command_id)
+        return true;
+    }
+    return false;
+  }
+
   void remember_(const std::string &command_id, uint8_t state) {
+    // Never evict the memory of a command still scheduled (a timed command
+    // can sit in WAIT_STOP up to an hour): forgetting it would let a QoS-1
+    // redelivery displace and physically re-run its own live command. The
+    // ring (32) is larger than MAX_TARGETS (16), so a free slot always
+    // exists within one sweep; the fallback is unreachable but safe.
+    for (size_t probe = 0; probe < COMMAND_ID_RING_SIZE; probe++) {
+      RecentCommand &slot = this->recent_ids_[this->recent_cursor_];
+      this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
+      if (!this->is_active_(slot.command_id)) {
+        slot = RecentCommand{command_id, state, 0};
+        return;
+      }
+    }
     this->recent_ids_[this->recent_cursor_] = RecentCommand{command_id, state, 0};
     this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
   }
