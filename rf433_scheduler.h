@@ -237,10 +237,14 @@ class TargetScheduler {
     for (const FlushStop &entry : this->flush_stops_)
       flush_bytes += entry.raw.size();
     if (retained_targets >= MAX_TARGETS) {
+      // State-dependent rejection: remembered so a QoS-1 redelivery of this
+      // command_id cannot be silently admitted after capacity drains.
+      this->remember_(command_id, 3);
       reason = "target scheduler is full";
       return false;
     }
     if (retained_bytes + flush_bytes + command_bytes > MAX_TOTAL_FRAME_BYTES) {
+      this->remember_(command_id, 3);
       reason = "scheduler frame storage budget exceeded";
       return false;
     }
@@ -262,21 +266,27 @@ class TargetScheduler {
     command.phase = Phase::ACTION;
     this->commands_[target] = std::move(command);
     this->order_.push_back(target);
-    this->remember_(command_id);
+    this->remember_(command_id, 1);
     reason.clear();
     return true;
   }
 
-  // Remembered lifecycle of a recently admitted command_id, for answering
-  // QoS-1 broker redeliveries idempotently: 0 = unknown (not a duplicate),
-  // 1 = admitted but RF not yet started, 2 = admitted and RF started. Only
-  // admitted commands are remembered; a redelivered command that was
-  // originally rejected re-validates identically, which is already
-  // idempotent.
-  int replay_state(const std::string &command_id) const {
+  // Remembered lifecycle of a recent command_id, for answering QoS-1 broker
+  // redeliveries idempotently: 0 = unknown (not a duplicate), 1 = admitted
+  // but RF not yet started, 2 = admitted and RF started (started_age_ms is
+  // set to how long ago), 3 = rejected by a STATE-DEPENDENT check (scheduler
+  // full / storage budget) whose outcome must not silently flip on a later
+  // redelivery. Deterministic validation rejections are not remembered --
+  // a redelivery re-validates identically, which is already idempotent.
+  int replay_state(const std::string &command_id, uint32_t now_ms,
+                   uint32_t &started_age_ms) const {
+    started_age_ms = 0;
     for (const RecentCommand &recent : this->recent_ids_) {
-      if (recent.command_id == command_id)
-        return recent.started ? 2 : 1;
+      if (recent.command_id == command_id) {
+        if (recent.state == 2)
+          started_age_ms = now_ms - recent.started_at_ms;
+        return recent.state;
+      }
     }
     return 0;
   }
@@ -354,7 +364,7 @@ class TargetScheduler {
         if (command.phase == Phase::ACTION && !command.started) {
           command.started = true;
           started_command_id = command.command_id;
-          this->mark_started_(command.command_id);
+          this->mark_started_(command.command_id, now_ms);
           if (command.stop_after_ms > 0) {
             command.deadline_armed = true;
             command.deadline_at = now_ms + command.stop_after_ms;
@@ -443,15 +453,16 @@ class TargetScheduler {
     return false;
   }
 
-  void remember_(const std::string &command_id) {
-    this->recent_ids_[this->recent_cursor_] = RecentCommand{command_id, false};
+  void remember_(const std::string &command_id, uint8_t state) {
+    this->recent_ids_[this->recent_cursor_] = RecentCommand{command_id, state, 0};
     this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
   }
 
-  void mark_started_(const std::string &command_id) {
+  void mark_started_(const std::string &command_id, uint32_t now_ms) {
     for (RecentCommand &recent : this->recent_ids_) {
       if (recent.command_id == command_id) {
-        recent.started = true;
+        recent.state = 2;
+        recent.started_at_ms = now_ms;
         return;
       }
     }
@@ -502,11 +513,14 @@ class TargetScheduler {
     }
   }
 
-  // One admitted command's remembered lifecycle, used to answer QoS-1 broker
-  // redeliveries idempotently instead of rejecting the duplicate.
+  // One recent command's remembered lifecycle, used to answer QoS-1 broker
+  // redeliveries idempotently instead of rejecting (or re-running) the
+  // duplicate. state: 1 admitted, 2 started (at started_at_ms), 3 rejected
+  // by a state-dependent admission check.
   struct RecentCommand {
     std::string command_id;
-    bool started{false};
+    uint8_t state{0};
+    uint32_t started_at_ms{0};
   };
 
   uint32_t repeat_gap_ms_;

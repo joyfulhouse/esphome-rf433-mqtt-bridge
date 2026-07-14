@@ -49,10 +49,17 @@ All topics live under the fixed `rf433/` root:
 | `rf433/<bridge_id>/availability` | bridge → broker (retained) | `online` / `offline` |
 | `rf433/<bridge_id>/info` | bridge → broker (retained) | `{"bridge","area","default"}` |
 | `rf433/<bridge_id>/tx` | controller → bridge | JSON command (below) |
-| `rf433/<bridge_id>/status` | bridge → controller | `{"status","command_id"[,"reason"]}` |
+| `rf433/<bridge_id>/status` | bridge → controller | `{"status","command_id"[,"reason"][,"age_ms"]}` |
 
 `status` is `accepted`, `rejected` (with `reason`), `started` (first RF dispatch), or `displaced`
 (a newer overlapping command replaced this one — see below).
+
+QoS-1 broker redeliveries are answered idempotently: an already-admitted `command_id` gets its
+`accepted` (and, if RF already started, `started`) statuses replayed instead of a fresh rejection.
+A replayed `started` carries `age_ms` — how long ago the original RF handoff happened — so the
+controller can anchor its motion model at the true start. A `command_id` that was rejected by a
+state-dependent admission check (scheduler full, storage budget) is remembered and re-rejected,
+never silently admitted later.
 
 Command body on `tx`:
 

@@ -140,16 +140,30 @@ mqtt:
             return;
           }
 
-          // QoS-1 broker redelivery of an already-admitted command replays
-          // the original lifecycle statuses idempotently. Rejecting the
-          // duplicate would tell a controller whose `accepted` was lost in
-          // an MQTT hiccup that the command failed, although its RF already
-          // moved the motor.
-          const int replay = rf433::tx_scheduler(${repeat_gap_ms}).replay_state(command_id);
+          // QoS-1 broker redelivery of an already-seen command replays the
+          // original lifecycle idempotently. Rejecting an admitted duplicate
+          // would tell a controller whose `accepted` was lost in an MQTT
+          // hiccup that the command failed although its RF already moved the
+          // motor; re-admitting a state-dependently rejected one would
+          // transmit a command the controller was told failed. A replayed
+          // `started` carries age_ms so the controller anchors its motion
+          // model at the ORIGINAL RF handoff, not the redelivery time.
+          uint32_t started_age_ms = 0;
+          const int replay =
+              rf433::tx_scheduler(${repeat_gap_ms}).replay_state(command_id, millis(), started_age_ms);
+          if (replay == 3) {
+            reject("duplicate command_id (previously rejected)");
+            return;
+          }
           if (replay > 0) {
             publish_status("accepted", "");
-            if (replay == 2)
-              publish_status("started", "");
+            if (replay == 2) {
+              id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
+                root["status"] = "started";
+                root["command_id"] = command_id;
+                root["age_ms"] = started_age_ms;
+              }, 1, false);
+            }
             return;
           }
 

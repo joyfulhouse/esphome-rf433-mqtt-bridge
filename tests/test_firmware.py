@@ -315,16 +315,26 @@ int main() {
   }
 
   // Duplicate-redelivery lifecycle memory: admitted commands are remembered
-  // with their RF-start state so a QoS-1 replay can answer idempotently.
-  assert(fair.replay_state("fa") == 2);
-  assert(fair.replay_state("fc") == 2);
-  assert(fair.replay_state("unknown-id") == 0);
+  // with their RF-start state and timestamp so a QoS-1 replay can answer
+  // idempotently and report how old the original start is.
+  uint32_t age = 0;
+  assert(fair.replay_state("fa", 500, age) == 2);
+  assert(age == 500);  // fa started at 0
+  assert(fair.replay_state("fc", 500, age) == 2);
+  assert(fair.replay_state("unknown-id", 500, age) == 0);
   TargetScheduler rep(35);
   assert(rep.schedule("r1", "aabbcc:33:1", "R1", "", 1, 0, "", 0, displaced, reason));
-  assert(rep.replay_state("r1") == 1);  // admitted, RF not yet started
+  assert(rep.replay_state("r1", 10, age) == 1);  // admitted, RF not yet started
+  assert(age == 0);
   raw = rep.next(0, started);
   assert(raw && *raw == "R1" && started == "r1");
-  assert(rep.replay_state("r1") == 2);  // admitted and started
+  assert(rep.replay_state("r1", 4000, age) == 2);  // admitted and started
+  assert(age == 4000);
+
+  // State-dependent rejections (scheduler full / storage budget) are also
+  // remembered, so a redelivery after capacity drains is NOT silently
+  // admitted. bz was budget-rejected in the flush-accounting block above.
+  assert(budget2.replay_state("bz", 100, age) == 3);
 
   // A due scheduled fail-safe STOP alternates with flushed displaced STOPs
   // instead of waiting behind the entire flush queue.
