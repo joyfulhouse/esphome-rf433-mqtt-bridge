@@ -140,6 +140,19 @@ mqtt:
             return;
           }
 
+          // QoS-1 broker redelivery of an already-admitted command replays
+          // the original lifecycle statuses idempotently. Rejecting the
+          // duplicate would tell a controller whose `accepted` was lost in
+          // an MQTT hiccup that the command failed, although its RF already
+          // moved the motor.
+          const int replay = rf433::tx_scheduler(${repeat_gap_ms}).replay_state(command_id);
+          if (replay > 0) {
+            publish_status("accepted", "");
+            if (replay == 2)
+              publish_status("started", "");
+            return;
+          }
+
           if (!x["repeats"].isNull() && !x["repeats"].is<int>()) {
             reject("repeats must be an integer");
             return;

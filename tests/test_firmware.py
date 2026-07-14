@@ -292,6 +292,60 @@ int main() {
   assert(budget3.schedule("cw2", "e1e1e1:05:1", big20, "", 1, 0, "", 11,
                           displaced, reason));
   assert(displaced.size() == 1 && displaced[0] == "cx");
+
+  // Displaced-STOP fairness: two displaced timed commands' owed STOPs rotate,
+  // so the second motor's FIRST stop lands within two pacing gaps instead of
+  // waiting out the first motor's whole repeat train.
+  TargetScheduler fair(35);
+  assert(fair.schedule("fa", "aabbcc:22:1", "FA", "", 3, 60000, "S1", 0,
+                       displaced, reason));
+  assert(fair.schedule("fb", "aabbcc:22:2", "FB", "", 3, 60000, "S2", 0,
+                       displaced, reason));
+  raw = fair.next(0, started);
+  assert(raw && *raw == "FA");
+  raw = fair.next(35, started);
+  assert(raw && *raw == "FB");
+  assert(fair.schedule("fc", "aabbcc:22:1,2", "FC", "", 1, 0, "", 70,
+                       displaced, reason));
+  assert(displaced.size() == 2);
+  const char *fair_expected[] = {"S1", "S2", "S1", "S2", "S1", "S2", "FC"};
+  for (int index = 0; index < 7; index++) {
+    raw = fair.next(static_cast<uint32_t>(70 + 35 * index), started);
+    assert(raw && *raw == fair_expected[index]);
+  }
+
+  // Duplicate-redelivery lifecycle memory: admitted commands are remembered
+  // with their RF-start state so a QoS-1 replay can answer idempotently.
+  assert(fair.replay_state("fa") == 2);
+  assert(fair.replay_state("fc") == 2);
+  assert(fair.replay_state("unknown-id") == 0);
+  TargetScheduler rep(35);
+  assert(rep.schedule("r1", "aabbcc:33:1", "R1", "", 1, 0, "", 0, displaced, reason));
+  assert(rep.replay_state("r1") == 1);  // admitted, RF not yet started
+  raw = rep.next(0, started);
+  assert(raw && *raw == "R1" && started == "r1");
+  assert(rep.replay_state("r1") == 2);  // admitted and started
+
+  // A due scheduled fail-safe STOP alternates with flushed displaced STOPs
+  // instead of waiting behind the entire flush queue.
+  TargetScheduler alt(35);
+  assert(alt.schedule("g1", "aabbcc:44:1", "G1", "", 4, 50, "SG1", 0,
+                      displaced, reason));
+  assert(alt.schedule("g2", "aabbcc:44:2", "G2", "", 4, 10000, "SG2", 0,
+                      displaced, reason));
+  raw = alt.next(0, started);
+  assert(raw && *raw == "G1");  // deadline armed at 50
+  raw = alt.next(35, started);
+  assert(raw && *raw == "G2");
+  assert(alt.schedule("g3", "aabbcc:44:2", "G3", "", 1, 0, "", 40,
+                      displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "g2");
+  raw = alt.next(70, started);
+  assert(raw && *raw == "SG2");  // flush frame first
+  raw = alt.next(105, started);
+  assert(raw && *raw == "SG1");  // due scheduled STOP takes the next tick
+  raw = alt.next(140, started);
+  assert(raw && *raw == "SG2");  // back to the flush queue
   return 0;
 }
 """

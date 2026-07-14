@@ -267,6 +267,20 @@ class TargetScheduler {
     return true;
   }
 
+  // Remembered lifecycle of a recently admitted command_id, for answering
+  // QoS-1 broker redeliveries idempotently: 0 = unknown (not a duplicate),
+  // 1 = admitted but RF not yet started, 2 = admitted and RF started. Only
+  // admitted commands are remembered; a redelivered command that was
+  // originally rejected re-validates identically, which is already
+  // idempotent.
+  int replay_state(const std::string &command_id) const {
+    for (const RecentCommand &recent : this->recent_ids_) {
+      if (recent.command_id == command_id)
+        return recent.started ? 2 : 1;
+    }
+    return 0;
+  }
+
   std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id) {
     started_command_id.clear();
     // Age-based pacing-gate reset, run every tick regardless of queue state. A
@@ -287,16 +301,8 @@ class TargetScheduler {
     if (this->next_rf_at_.has_value() && !due_(now_ms, *this->next_rf_at_))
       return std::nullopt;
 
-    // Fail-safe STOPs of displaced commands go on air before anything else.
-    if (!this->flush_stops_.empty()) {
-      FlushStop &entry = this->flush_stops_.front();
-      const std::string raw = entry.raw;
-      if (--entry.remaining <= 0)
-        this->flush_stops_.erase(this->flush_stops_.begin());
-      this->next_rf_at_ = now_ms + this->repeat_gap_ms_;
-      return raw;
-    }
-
+    // Arm due fail-safe STOPs before the flush branch so displaced-STOP
+    // flushing can alternate fairly with them.
     for (const std::string &target : this->order_) {
       Command &command = this->commands_.at(target);
       if (command.deadline_armed && command.phase != Phase::STOP &&
@@ -305,6 +311,32 @@ class TargetScheduler {
         command.remaining = command.repeats;
         command.next_at = now_ms;
       }
+    }
+
+    // Fail-safe STOPs of displaced commands go on air ahead of actions, but
+    // ROTATE among flush entries and ALTERNATE with due scheduled STOPs: one
+    // displaced command's full repeat train must not delay every other
+    // motor's FIRST stop copy (with N owed stops, each first copy lands
+    // within ~N pacing gaps instead of repeats * gaps).
+    if (!this->flush_stops_.empty()) {
+      bool scheduled_stop_due = false;
+      for (const auto &item : this->commands_) {
+        if (item.second.phase == Phase::STOP && due_(now_ms, item.second.next_at)) {
+          scheduled_stop_due = true;
+          break;
+        }
+      }
+      if (!(this->flush_last_ && scheduled_stop_due)) {
+        FlushStop entry = std::move(this->flush_stops_.front());
+        this->flush_stops_.erase(this->flush_stops_.begin());
+        const std::string raw = entry.raw;
+        if (--entry.remaining > 0)
+          this->flush_stops_.push_back(std::move(entry));
+        this->next_rf_at_ = now_ms + this->repeat_gap_ms_;
+        this->flush_last_ = true;
+        return raw;
+      }
+      this->flush_last_ = false;
     }
 
     const size_t count = this->order_.size();
@@ -322,17 +354,19 @@ class TargetScheduler {
         if (command.phase == Phase::ACTION && !command.started) {
           command.started = true;
           started_command_id = command.command_id;
+          this->mark_started_(command.command_id);
           if (command.stop_after_ms > 0) {
             command.deadline_armed = true;
             command.deadline_at = now_ms + command.stop_after_ms;
           }
         }
         command.remaining--;
-        const bool complete = command.remaining == 0 && this->advance_(command, now_ms);
+        const bool complete = command.remaining == 0 && this->advance_(command);
         if (command.remaining > 0)
           command.next_at = now_ms + this->repeat_gap_ms_;
 
         this->next_rf_at_ = now_ms + this->repeat_gap_ms_;
+        this->flush_last_ = false;
         this->cursor_ = (index + 1) % count;
         if (complete)
           this->erase_(target);
@@ -402,13 +436,25 @@ class TargetScheduler {
   }
 
   bool seen_recently_(const std::string &command_id) const {
-    return std::find(this->recent_ids_.begin(), this->recent_ids_.end(), command_id) !=
-           this->recent_ids_.end();
+    for (const RecentCommand &recent : this->recent_ids_) {
+      if (recent.command_id == command_id)
+        return true;
+    }
+    return false;
   }
 
   void remember_(const std::string &command_id) {
-    this->recent_ids_[this->recent_cursor_] = command_id;
+    this->recent_ids_[this->recent_cursor_] = RecentCommand{command_id, false};
     this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
+  }
+
+  void mark_started_(const std::string &command_id) {
+    for (RecentCommand &recent : this->recent_ids_) {
+      if (recent.command_id == command_id) {
+        recent.started = true;
+        return;
+      }
+    }
   }
 
   static bool due_(uint32_t now_ms, uint32_t deadline_ms) {
@@ -423,17 +469,18 @@ class TargetScheduler {
     return command.raw;
   }
 
-  bool advance_(Command &command, uint32_t now_ms) {
+  // Phase transitions leave next_at alone: the caller re-arms pacing for any
+  // command with remaining repeats, and WAIT_STOP is gated purely by its
+  // armed deadline (the dispatch loop skips the phase regardless of next_at).
+  bool advance_(Command &command) {
     if (command.phase == Phase::ACTION && !command.trailer_raw.empty()) {
       command.phase = Phase::TRAILER;
       command.remaining = command.repeats;
-      command.next_at = now_ms + this->repeat_gap_ms_;
       return false;
     }
     if ((command.phase == Phase::ACTION || command.phase == Phase::TRAILER) && command.stop_after_ms > 0) {
       command.phase = Phase::WAIT_STOP;
       command.remaining = command.repeats;
-      command.next_at = command.deadline_at;
       return false;
     }
     return true;
@@ -455,13 +502,21 @@ class TargetScheduler {
     }
   }
 
+  // One admitted command's remembered lifecycle, used to answer QoS-1 broker
+  // redeliveries idempotently instead of rejecting the duplicate.
+  struct RecentCommand {
+    std::string command_id;
+    bool started{false};
+  };
+
   uint32_t repeat_gap_ms_;
   std::optional<uint32_t> next_rf_at_;
   size_t cursor_{0};
+  bool flush_last_{false};
   std::map<std::string, Command> commands_;
   std::vector<std::string> order_;
   std::vector<FlushStop> flush_stops_;
-  std::array<std::string, COMMAND_ID_RING_SIZE> recent_ids_{};
+  std::array<RecentCommand, COMMAND_ID_RING_SIZE> recent_ids_{};
   size_t recent_cursor_{0};
 };
 
