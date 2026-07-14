@@ -195,6 +195,24 @@ mqtt:
           publish_status("accepted", "");
 
 interval:
+  # Self-healing retained info: the on_connect publish above has been observed
+  # to be dropped in the field (fleet-wide, ESPHome 2026.6.5 — the client is
+  # not yet ready to publish when the trigger fires), which silently degrades
+  # controllers' area-aware bridge selection. Republishing retained metadata
+  # once a minute costs nothing and guarantees eventual consistency.
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            mqtt.connected:
+          then:
+            - mqtt.publish:
+                topic: rf433/${bridge_id}/info
+                payload: >-
+                  {"bridge":"${bridge_id}","area":"${bridge_area}","default":${default_bridge}}
+                qos: 0
+                retain: true
+
   - interval: 5ms
     then:
       - lambda: |-
