@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <map>
@@ -11,7 +12,15 @@
 namespace rf433 {
 
 constexpr size_t MAX_B0_FRAME_BYTES = 260;
-constexpr size_t MAX_TARGETS = 32;
+constexpr size_t MAX_TARGETS = 16;
+// Upper bound on the sum of all stored frame strings (raw + trailer + stop
+// across every scheduled target). The ESP8285 has roughly 30-40 KB of free
+// heap after WiFi/MQTT; without this budget, MAX_TARGETS maximum-size timed
+// commands could exhaust it through perfectly valid input.
+constexpr size_t MAX_TOTAL_FRAME_BYTES = 16384;
+// Recently admitted command IDs, used to drop QoS-1 broker redeliveries and
+// accidentally retained commands replayed on reconnect.
+constexpr size_t COMMAND_ID_RING_SIZE = 8;
 
 inline int hex_value(char value) {
   if (value >= '0' && value <= '9')
@@ -90,16 +99,25 @@ inline bool valid_key(const std::string &value) {
   });
 }
 
-inline bool valid_target_key(const std::string &value) {
-  // Canonical HA target: six prefix hex digits, two remote-ID hex digits,
-  // then a strictly increasing, comma-separated channel set in 1..16.
+// Canonical HA target: six prefix hex digits, two remote-ID hex digits, then a
+// strictly increasing, comma-separated channel set in 1..16. Parses the target
+// in one pass into its case-normalized remote identity plus a channel bitmask,
+// so validation, equality, and overlap checks share one representation.
+inline bool parse_target(const std::string &value, std::string &identity, uint16_t &mask) {
+  identity.clear();
+  mask = 0;
   if (value.size() < 11 || value.size() > 53 || value[6] != ':' || value[9] != ':')
     return false;
+  identity.reserve(9);
   for (size_t index = 0; index < 9; index++) {
-    if (index == 6)
+    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(value[index])));
+    if (index == 6) {
+      identity.push_back(':');
       continue;
-    if (hex_value(static_cast<char>(std::toupper(static_cast<unsigned char>(value[index])))) < 0)
+    }
+    if (hex_value(upper) < 0)
       return false;
+    identity.push_back(upper);
   }
 
   size_t cursor = 10;
@@ -114,6 +132,7 @@ inline bool valid_target_key(const std::string &value) {
     if (cursor == start || channel < 1 || channel > 16 || channel <= previous)
       return false;
     previous = channel;
+    mask = static_cast<uint16_t>(mask | (1u << (channel - 1)));
     if (cursor == value.size())
       return true;
     if (value[cursor] != ',')
@@ -123,23 +142,64 @@ inline bool valid_target_key(const std::string &value) {
   return false;
 }
 
+inline bool valid_target_key(const std::string &value) {
+  std::string identity;
+  uint16_t mask = 0;
+  return parse_target(value, identity, mask);
+}
+
 class TargetScheduler {
  public:
   explicit TargetScheduler(uint32_t repeat_gap_ms) : repeat_gap_ms_(repeat_gap_ms) {}
 
+  // Admits one command. Latest command wins: any already-scheduled target on
+  // the same remote whose channels intersect the new target (including the
+  // exact same target) is displaced. A displaced command that already started
+  // RF with an armed-but-unfinished fail-safe STOP gets its stop frame
+  // flushed on air before the new command's first dispatch, and its
+  // command_id is appended to displaced_ids so the controller can retire its
+  // motion model.
   bool schedule(const std::string &command_id, const std::string &target, const std::string &raw,
                 const std::string &trailer_raw, int repeats, uint32_t stop_after_ms,
-                const std::string &stop_raw, uint32_t now_ms) {
-    if (!valid_key(command_id) || !valid_target_key(target) || raw.empty() || repeats < 1 || repeats > 20)
+                const std::string &stop_raw, uint32_t now_ms,
+                std::vector<std::string> &displaced_ids, std::string &reason) {
+    displaced_ids.clear();
+    std::string identity;
+    uint16_t mask = 0;
+    if (!valid_key(command_id) || !parse_target(target, identity, mask) || raw.empty() ||
+        repeats < 1 || repeats > 20) {
+      reason = "command_id or canonical target key is invalid";
       return false;
-    const bool new_target = this->commands_.find(target) == this->commands_.end();
-    if (new_target && this->commands_.size() >= MAX_TARGETS)
+    }
+    if (this->seen_recently_(command_id)) {
+      reason = "duplicate command_id";
       return false;
-    if (new_target && this->overlaps_existing_(target))
+    }
+
+    const size_t command_bytes = raw.size() + trailer_raw.size() + stop_raw.size();
+    size_t retained_bytes = 0;
+    size_t retained_targets = 0;
+    for (const auto &item : this->commands_) {
+      if (item.second.identity == identity && (item.second.mask & mask) != 0)
+        continue;  // displaced below, does not count against the budget
+      retained_bytes += item.second.stored_bytes();
+      retained_targets++;
+    }
+    if (retained_targets >= MAX_TARGETS) {
+      reason = "target scheduler is full";
       return false;
+    }
+    if (retained_bytes + command_bytes > MAX_TOTAL_FRAME_BYTES) {
+      reason = "scheduler frame storage budget exceeded";
+      return false;
+    }
+
+    this->displace_overlapping_(identity, mask, displaced_ids);
 
     Command command;
     command.command_id = command_id;
+    command.identity = identity;
+    command.mask = mask;
     command.raw = raw;
     command.trailer_raw = trailer_raw;
     command.stop_raw = stop_raw;
@@ -150,16 +210,32 @@ class TargetScheduler {
     command.next_at = now_ms;
     command.phase = Phase::ACTION;
     this->commands_[target] = std::move(command);
-    if (new_target)
-      this->order_.push_back(target);
+    this->order_.push_back(target);
+    this->remember_(command_id);
+    reason.clear();
     return true;
   }
 
   std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id) {
     started_command_id.clear();
-    if (this->commands_.empty() ||
-        (this->next_rf_at_.has_value() && !due_(now_ms, *this->next_rf_at_)))
+    if (this->commands_.empty() && this->flush_stops_.empty()) {
+      // Reset the pacing gate whenever the scheduler is drained. A stale
+      // dispatch timestamp here blocked ALL transmission for up to ~24.9 days
+      // once millis() wrapped past the signed comparison horizon (observed:
+      // a bridge idle >2^31 ms accepted commands but never transmitted).
+      this->next_rf_at_.reset();
       return std::nullopt;
+    }
+    if (this->next_rf_at_.has_value() && !due_(now_ms, *this->next_rf_at_))
+      return std::nullopt;
+
+    // Fail-safe STOPs of displaced commands go on air before anything else.
+    if (!this->flush_stops_.empty()) {
+      const std::string raw = this->flush_stops_.front();
+      this->flush_stops_.erase(this->flush_stops_.begin());
+      this->next_rf_at_ = now_ms + this->repeat_gap_ms_;
+      return raw;
+    }
 
     for (const std::string &target : this->order_) {
       Command &command = this->commands_.at(target);
@@ -211,6 +287,8 @@ class TargetScheduler {
 
   struct Command {
     std::string command_id;
+    std::string identity;
+    uint16_t mask{0};
     std::string raw;
     std::string trailer_raw;
     std::string stop_raw;
@@ -222,44 +300,40 @@ class TargetScheduler {
     Phase phase{Phase::ACTION};
     bool started{false};
     bool deadline_armed{false};
+
+    size_t stored_bytes() const { return raw.size() + trailer_raw.size() + stop_raw.size(); }
+
+    // A displaced command still owes the motor a STOP if its RF already
+    // started and its armed fail-safe STOP has not yet been fully sent.
+    bool owes_stop() const {
+      return started && stop_after_ms > 0 && !stop_raw.empty() && phase != Phase::STOP;
+    }
   };
 
-  static std::vector<int> channels_(const std::string &target) {
-    std::vector<int> channels;
-    size_t cursor = 10;
-    while (cursor < target.size()) {
-      int channel = 0;
-      while (cursor < target.size() && target[cursor] >= '0' && target[cursor] <= '9') {
-        channel = channel * 10 + (target[cursor] - '0');
-        cursor++;
-      }
-      channels.push_back(channel);
-      if (cursor < target.size())
-        cursor++;
+  void displace_overlapping_(const std::string &identity, uint16_t mask,
+                             std::vector<std::string> &displaced_ids) {
+    std::vector<std::string> displaced_targets;
+    for (const auto &item : this->commands_) {
+      if (item.second.identity == identity && (item.second.mask & mask) != 0)
+        displaced_targets.push_back(item.first);
     }
-    return channels;
+    for (const std::string &target : displaced_targets) {
+      Command &command = this->commands_.at(target);
+      if (command.owes_stop())
+        this->flush_stops_.push_back(command.stop_raw);
+      displaced_ids.push_back(command.command_id);
+      this->erase_(target);
+    }
   }
 
-  static bool overlaps_(const std::string &left, const std::string &right) {
-    for (size_t index = 0; index < 10; index++) {
-      const auto left_byte = static_cast<unsigned char>(left[index]);
-      const auto right_byte = static_cast<unsigned char>(right[index]);
-      if (std::toupper(left_byte) != std::toupper(right_byte))
-        return false;
-    }
-    const std::vector<int> left_channels = channels_(left);
-    const std::vector<int> right_channels = channels_(right);
-    for (const int channel : left_channels) {
-      if (std::find(right_channels.begin(), right_channels.end(), channel) != right_channels.end())
-        return true;
-    }
-    return false;
+  bool seen_recently_(const std::string &command_id) const {
+    return std::find(this->recent_ids_.begin(), this->recent_ids_.end(), command_id) !=
+           this->recent_ids_.end();
   }
 
-  bool overlaps_existing_(const std::string &target) const {
-    return std::any_of(this->commands_.begin(), this->commands_.end(), [&](const auto &item) {
-      return overlaps_(target, item.first);
-    });
+  void remember_(const std::string &command_id) {
+    this->recent_ids_[this->recent_cursor_] = command_id;
+    this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
   }
 
   static bool due_(uint32_t now_ms, uint32_t deadline_ms) {
@@ -311,6 +385,9 @@ class TargetScheduler {
   size_t cursor_{0};
   std::map<std::string, Command> commands_;
   std::vector<std::string> order_;
+  std::vector<std::string> flush_stops_;
+  std::array<std::string, COMMAND_ID_RING_SIZE> recent_ids_{};
+  size_t recent_cursor_{0};
 };
 
 // ESPHome emits the globals pstorage that references TargetScheduler BEFORE it

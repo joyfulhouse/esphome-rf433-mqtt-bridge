@@ -21,6 +21,12 @@ validates, schedules, and transmits Portisch **B0** raw frames.
 - **Per-target scheduling** — one RF frame on air at a time, while each target keeps its own
   repeat phase and an **absolute monotonic STOP deadline** (`stop_after_ms` + `stop_raw`) so a
   partial movement is stopped by the bridge itself even if the controller disappears.
+- **Latest command wins** — a new command whose channels overlap an active target on the same
+  remote displaces it: the displaced command's pending fail-safe STOP is flushed on air first,
+  and a `displaced` status with its `command_id` tells the controller to retire its motion model.
+- **Duplicate suppression** — a ring of recent `command_id`s rejects QoS-1 broker redeliveries
+  and accidentally retained commands replayed on reconnect. Never publish retained `tx` commands.
+- **Bounded memory** — admission enforces a total stored-frame budget sized for the ESP8285 heap.
 - **Retained discovery** — the beacon publishes retained `availability` (birth/will) and `info`
   (area, default flag) so controllers can discover online bridges and prefer one in the same area.
 - **Strict input validation** — B0 frames, target keys, repeat counts, and stop deadlines are
@@ -38,6 +44,9 @@ All topics live under the fixed `rf433/` root:
 | `rf433/<bridge_id>/info` | bridge → broker (retained) | `{"bridge","area","default"}` |
 | `rf433/<bridge_id>/tx` | controller → bridge | JSON command (below) |
 | `rf433/<bridge_id>/status` | bridge → controller | `{"status","command_id"[,"reason"]}` |
+
+`status` is `accepted`, `rejected` (with `reason`), `started` (first RF dispatch), or `displaced`
+(a newer overlapping command replaced this one — see below).
 
 Command body on `tx`:
 

@@ -186,11 +186,24 @@ mqtt:
             return;
           }
 
+          // Latest command wins: overlapping active targets on the same
+          // remote are displaced (their pending fail-safe STOPs are flushed
+          // on air first). Each displaced command_id is reported so the
+          // controller can retire its motion model.
+          std::vector<std::string> displaced_ids;
+          std::string schedule_reason;
           if (!rf433::tx_scheduler(${repeat_gap_ms})
                    .schedule(command_id, target, raw, trailer_raw, repeats,
-                             static_cast<uint32_t>(stop_after_ms), stop_raw, millis())) {
-            reject("target scheduler is full, overlaps active work, or command fields are invalid");
+                             static_cast<uint32_t>(stop_after_ms), stop_raw, millis(),
+                             displaced_ids, schedule_reason)) {
+            reject(schedule_reason);
             return;
+          }
+          for (const std::string &displaced_id : displaced_ids) {
+            id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
+              root["status"] = "displaced";
+              root["command_id"] = displaced_id;
+            }, 1, false);
           }
           publish_status("accepted", "");
 
