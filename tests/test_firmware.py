@@ -50,6 +50,15 @@ int main() {
   assert(!rf433::normalize_b0(ff_frame, normalized, reason));
   assert(reason == "frame embedded repeat count out of range");
 
+  // Requested airtime is bounded: one maximum-duration bucket (0xFFFF us),
+  // two pulses, and the maximum embedded repeat of 16 request ~2.1 s of
+  // exclusive coprocessor time -- just over the 2 s ceiling -- and are
+  // rejected even though the frame is structurally valid.
+  assert(!rf433::normalize_b0("AAB0050110FFFF0855", normalized, reason));
+  assert(reason == "frame requested airtime exceeds limit");
+  // The same frame at the controller's embedded repeat of 8 (~1 s) passes.
+  assert(rf433::normalize_b0("AAB0050108FFFF0855", normalized, reason));
+
   assert(rf433::valid_target_key("a1b2c3:42:1,2,16"));
   assert(!rf433::valid_target_key("target-a"));
   assert(!rf433::valid_target_key("a1b2c3:42:2,1"));
@@ -219,9 +228,9 @@ int main() {
   assert(raw && *raw == "SQ");  // owed STOP flushed despite zero pre-displacement sends
   assert(started.empty());
 
-  // The admission budget counts bytes already parked in flush_stops_, not just
-  // commands_: displacing a started timed command parks repeats * stop_raw
-  // bytes for flush that must be charged against the heap budget too.
+  // The admission budget counts bytes parked in flush_stops_, not just
+  // commands_. Each flush entry stores its frame ONCE with a send count, so
+  // displacing a repeats=20 timed command charges 510 bytes -- not 10200.
   TargetScheduler budget2(35);
   const std::string half(510, 'A');
   assert(budget2.schedule("bx", "d1d1d1:05:1,2", half, "", 20, 3600000, half, 0,
@@ -229,21 +238,60 @@ int main() {
   raw = budget2.next(0, started);  // start bx so its fail-safe STOP is owed
   assert(raw && *raw == half);
   assert(started == "bx");
-  for (int index = 0; index < 4; index++) {
-    const std::string target = "d1d1d1:0" + std::to_string(index + 1) + ":1";
+  // Fill to 10 * 1530 = 15300 retained bytes alongside bx's 1020.
+  for (int index = 0; index < 10; index++) {
+    const std::string target = "d1d1d1:" + std::to_string(50 + index) + ":1";
     assert(budget2.schedule("bfill-" + std::to_string(index), target, half, half, 1,
                             3600000, half, static_cast<uint32_t>(1 + index),
                             displaced, reason));
   }
-  // Displace bx: 20 copies of its 510-byte STOP (10200B) are parked for flush.
-  assert(budget2.schedule("by", "d1d1d1:05:2", "Y", "", 1, 0, "", 5,
+  // Displace bx: its 510-byte STOP is parked for flush (once, remaining=20).
+  assert(budget2.schedule("by", "d1d1d1:05:2", "Y", "", 1, 0, "", 15,
                           displaced, reason));
   assert(displaced.size() == 1 && displaced[0] == "bx");
-  // Z fits under budget against commands_ alone (4*1530 + 1 + 1530 = 7651) but
-  // not once the 10200B of parked flush STOPs are counted -> rejected.
-  assert(!budget2.schedule("bz", "d1d1d1:06:1", half, half, 1, 3600000, half, 6,
+  // bz fits against commands_ alone (15301 + 1000 = 16301 <= 16384) but not
+  // once the 510 parked flush bytes are charged -> rejected.
+  const std::string kilo(1000, 'B');
+  assert(!budget2.schedule("bz", "d1d1d1:61:1", kilo, "", 1, 0, "", 16,
                            displaced, reason));
   assert(reason == "scheduler frame storage budget exceeded");
+  // A smaller command clears the budget with the flush bytes still parked.
+  const std::string mid(500, 'C');
+  assert(budget2.schedule("bz2", "d1d1d1:61:1", mid, "", 1, 0, "", 17,
+                          displaced, reason));
+  // All 20 owed STOP copies still go on air, one per pacing gap.
+  for (int index = 0; index < 20; index++) {
+    raw = budget2.next(static_cast<uint32_t>(35 + index * 35), started);
+    assert(raw && *raw == half);
+    assert(started.empty());
+  }
+
+  // Admission also charges the flush bytes the CURRENT displacement creates:
+  // bw fits against the retained commands alone (13770 + 2500 = 16270) but not
+  // once the displaced command's owed 510-byte STOP is counted -> rejected,
+  // and the displaced command stays scheduled.
+  TargetScheduler budget3(35);
+  assert(budget3.schedule("cx", "e1e1e1:05:1", half, "", 20, 3600000, half, 0,
+                          displaced, reason));
+  raw = budget3.next(0, started);
+  assert(raw && *raw == half);
+  assert(started == "cx");
+  for (int index = 0; index < 9; index++) {
+    const std::string target = "e1e1e1:" + std::to_string(50 + index) + ":1";
+    assert(budget3.schedule("cfill-" + std::to_string(index), target, half, half, 1,
+                            3600000, half, static_cast<uint32_t>(1 + index),
+                            displaced, reason));
+  }
+  const std::string big25(2500, 'D');
+  assert(!budget3.schedule("cw", "e1e1e1:05:1", big25, "", 1, 0, "", 10,
+                           displaced, reason));
+  assert(reason == "scheduler frame storage budget exceeded");
+  assert(displaced.empty());
+  // The same displacement with a smaller replacement is admitted.
+  const std::string big20(2000, 'E');
+  assert(budget3.schedule("cw2", "e1e1e1:05:1", big20, "", 1, 0, "", 11,
+                          displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "cx");
   return 0;
 }
 """

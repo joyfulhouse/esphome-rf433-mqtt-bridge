@@ -18,6 +18,13 @@ constexpr size_t MAX_TARGETS = 16;
 // heap after WiFi/MQTT; without this budget, MAX_TARGETS maximum-size timed
 // commands could exhaust it through perfectly valid input.
 constexpr size_t MAX_TOTAL_FRAME_BYTES = 16384;
+// Upper bound on the RF airtime one B0 frame may request (bucket durations are
+// 16-bit microseconds and every data nibble spends one bucket, multiplied by
+// the embedded hardware repeat). A structurally valid frame could otherwise
+// request minutes of exclusive EFM8BB1 time, starving every queued fail-safe
+// STOP. A real AOK frame runs ~550 ms at the controller's embedded repeat of
+// 8; two seconds admits the full legal repeat range with margin.
+constexpr uint64_t MAX_FRAME_AIRTIME_US = 2000000;
 // Recently admitted command IDs, used to drop QoS-1 broker redeliveries and
 // same-boot retained replays. The ring lives in RAM, so it cannot suppress a
 // retained command replayed after a reboot -- retained tx publishes are
@@ -92,11 +99,25 @@ inline bool normalize_b0(const std::string &input, std::string &output, std::str
     reason = "frame bucket table is truncated";
     return false;
   }
+  std::array<uint32_t, 8> bucket_us{};
+  for (size_t bucket = 0; bucket < bucket_count; bucket++) {
+    for (size_t nibble = 0; nibble < 4; nibble++) {
+      bucket_us[bucket] = (bucket_us[bucket] << 4) |
+                          static_cast<uint32_t>(hex_value(output[10 + bucket * 4 + nibble]));
+    }
+  }
+  uint64_t airtime_us = 0;
   for (size_t index = data_start; index < body_end; index++) {
-    if (static_cast<size_t>(hex_value(output[index]) & 0x07) >= bucket_count) {
+    const size_t bucket = static_cast<size_t>(hex_value(output[index]) & 0x07);
+    if (bucket >= bucket_count) {
       reason = "frame references an undefined bucket";
       return false;
     }
+    airtime_us += bucket_us[bucket];
+  }
+  if (airtime_us * embedded_repeat > MAX_FRAME_AIRTIME_US) {
+    reason = "frame requested airtime exceeds limit";
+    return false;
   }
   reason.clear();
   return true;
@@ -198,17 +219,23 @@ class TargetScheduler {
     size_t retained_bytes = 0;
     size_t retained_targets = 0;
     for (const auto &item : this->commands_) {
-      if (item.second.identity == identity && (item.second.mask & mask) != 0)
-        continue;  // displaced below, does not count against the budget
+      if (item.second.identity == identity && (item.second.mask & mask) != 0) {
+        // Displaced below: its command storage is released, but if it still
+        // owes a fail-safe STOP that frame moves to the flush queue and keeps
+        // holding heap, so it stays in the admission budget.
+        if (item.second.owes_stop())
+          retained_bytes += item.second.stop_raw.size();
+        continue;
+      }
       retained_bytes += item.second.stored_bytes();
       retained_targets++;
     }
-    // Fail-safe STOPs already queued for flush hold heap too: displacing many
-    // started timed commands can park up to MAX_TARGETS * repeats * 260B on top
-    // of commands_, so count them in the admission budget.
+    // Fail-safe STOPs already queued for flush hold heap too. Each entry
+    // stores its frame once with a send count, so this stays bounded by the
+    // number of displacements rather than displaced_repeats * frame size.
     size_t flush_bytes = 0;
-    for (const std::string &frame : this->flush_stops_)
-      flush_bytes += frame.size();
+    for (const FlushStop &entry : this->flush_stops_)
+      flush_bytes += entry.raw.size();
     if (retained_targets >= MAX_TARGETS) {
       reason = "target scheduler is full";
       return false;
@@ -262,8 +289,10 @@ class TargetScheduler {
 
     // Fail-safe STOPs of displaced commands go on air before anything else.
     if (!this->flush_stops_.empty()) {
-      const std::string raw = this->flush_stops_.front();
-      this->flush_stops_.erase(this->flush_stops_.begin());
+      FlushStop &entry = this->flush_stops_.front();
+      const std::string raw = entry.raw;
+      if (--entry.remaining <= 0)
+        this->flush_stops_.erase(this->flush_stops_.begin());
       this->next_rf_at_ = now_ms + this->repeat_gap_ms_;
       return raw;
     }
@@ -316,6 +345,13 @@ class TargetScheduler {
  protected:
   enum class Phase { ACTION, TRAILER, WAIT_STOP, STOP };
 
+  // One displaced command's owed fail-safe STOP: the frame stored once plus
+  // how many copies still need to go on air.
+  struct FlushStop {
+    std::string raw;
+    int remaining{0};
+  };
+
   struct Command {
     std::string command_id;
     std::string identity;
@@ -355,10 +391,10 @@ class TargetScheduler {
       if (command.owes_stop()) {
         // Flush every STOP copy still owed: the full repeat count if the STOP
         // had not begun dispatching, or just the remaining copies if it was
-        // displaced mid-STOP. They go on air one per pacing gap.
+        // displaced mid-STOP. They go on air one per pacing gap; the frame is
+        // stored once with its send count.
         const int copies = command.phase == Phase::STOP ? command.remaining : command.repeats;
-        for (int index = 0; index < copies; index++)
-          this->flush_stops_.push_back(command.stop_raw);
+        this->flush_stops_.push_back(FlushStop{command.stop_raw, copies});
       }
       displaced_ids.push_back(command.command_id);
       this->erase_(target);
@@ -424,7 +460,7 @@ class TargetScheduler {
   size_t cursor_{0};
   std::map<std::string, Command> commands_;
   std::vector<std::string> order_;
-  std::vector<std::string> flush_stops_;
+  std::vector<FlushStop> flush_stops_;
   std::array<std::string, COMMAND_ID_RING_SIZE> recent_ids_{};
   size_t recent_cursor_{0};
 };
