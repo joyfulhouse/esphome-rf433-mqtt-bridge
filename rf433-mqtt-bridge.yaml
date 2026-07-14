@@ -131,15 +131,15 @@ mqtt:
             publish_status("rejected", reason);
           };
 
-          if (!rf433::valid_key(command_id) || !rf433::valid_target_key(target)) {
-            reject("command_id or canonical target key is invalid");
+          // command_id and target are fully validated (parsed) inside
+          // schedule(), which rejects on its own; only a cheap command_id shape
+          // check is worth doing here before the costlier frame normalization
+          // below. Re-parsing the target here would just waste cycles.
+          if (!rf433::valid_key(command_id)) {
+            reject("command_id is invalid");
             return;
           }
 
-          if (!x["raw"].is<const char *>()) {
-            reject("raw must be a B0 string");
-            return;
-          }
           if (!x["repeats"].isNull() && !x["repeats"].is<int>()) {
             reject("repeats must be an integer");
             return;
@@ -163,26 +163,38 @@ mqtt:
           std::string trailer_raw;
           std::string stop_raw;
           std::string reason;
-          if (!rf433::normalize_b0(x["raw"].as<std::string>(), raw, reason)) {
-            reject(std::string("invalid raw: ") + reason);
+          // Read, type-check, and normalize one B0 frame field. raw is
+          // required; trailer_raw and stop_raw are optional (absent -> empty).
+          auto read_frame = [&](const char *key, bool required, std::string &out) -> bool {
+            if (x[key].isNull()) {
+              if (required)
+                reject(std::string(key) + " must be a B0 string");
+              return !required;
+            }
+            if (!x[key].is<const char *>()) {
+              reject(std::string(key) + " must be a B0 string");
+              return false;
+            }
+            if (!rf433::normalize_b0(x[key].as<std::string>(), out, reason)) {
+              reject(std::string("invalid ") + key + ": " + reason);
+              return false;
+            }
+            return true;
+          };
+          if (!read_frame("raw", true, raw))
             return;
-          }
-          if (!x["trailer_raw"].isNull()) {
-            if (!x["trailer_raw"].is<const char *>() ||
-                !rf433::normalize_b0(x["trailer_raw"].as<std::string>(), trailer_raw, reason)) {
-              reject(std::string("invalid trailer_raw: ") + reason);
-              return;
-            }
-          }
-          if (!x["stop_raw"].isNull()) {
-            if (!x["stop_raw"].is<const char *>() ||
-                !rf433::normalize_b0(x["stop_raw"].as<std::string>(), stop_raw, reason)) {
-              reject(std::string("invalid stop_raw: ") + reason);
-              return;
-            }
-          }
+          if (!read_frame("trailer_raw", false, trailer_raw))
+            return;
+          if (!read_frame("stop_raw", false, stop_raw))
+            return;
           if (stop_after_ms > 0 && stop_raw.empty()) {
             reject("timed command requires stop_raw");
+            return;
+          }
+          if (!stop_raw.empty() && stop_after_ms == 0) {
+            // An armed-looking STOP the caller cannot trigger: reject rather
+            // than silently accept a stop_raw that will never fire.
+            reject("stop_raw requires stop_after_ms");
             return;
           }
 
@@ -199,6 +211,11 @@ mqtt:
             reject(schedule_reason);
             return;
           }
+          // `displaced` is published now, at admission of the replacing
+          // command, but the displaced command's flushed fail-safe STOP
+          // physically transmits over the next pacing gap(s) (~${repeat_gap_ms}
+          // ms each). A controller that freezes its motion model at
+          // displaced-time is within one pacing gap of the physical truth.
           for (const std::string &displaced_id : displaced_ids) {
             id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
               root["status"] = "displaced";
@@ -242,6 +259,9 @@ interval:
               root["command_id"] = command_id;
             }, 1, false);
           };
+          // `started` means this frame was handed to the RF coprocessor over
+          // UART. ESPHome's rf_bridge send_raw does not wait for an EFM8BB1
+          // ack, so `started` is proof of dispatch, not of RF emission.
           publish_status("started", started_command_id);
 
 button:

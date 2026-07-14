@@ -19,8 +19,10 @@ constexpr size_t MAX_TARGETS = 16;
 // commands could exhaust it through perfectly valid input.
 constexpr size_t MAX_TOTAL_FRAME_BYTES = 16384;
 // Recently admitted command IDs, used to drop QoS-1 broker redeliveries and
-// accidentally retained commands replayed on reconnect.
-constexpr size_t COMMAND_ID_RING_SIZE = 8;
+// same-boot retained replays. The ring lives in RAM, so it cannot suppress a
+// retained command replayed after a reboot -- retained tx publishes are
+// unsupported (see README). Sized to comfortably span an in-flight burst.
+constexpr size_t COMMAND_ID_RING_SIZE = 32;
 
 inline int hex_value(char value) {
   if (value >= '0' && value <= '9')
@@ -72,6 +74,17 @@ inline bool normalize_b0(const std::string &input, std::string &output, std::str
   const size_t bucket_count = static_cast<size_t>((count_high << 4) | count_low);
   if (bucket_count < 1 || bucket_count > 8) {
     reason = "bucket count must be in the range 1..8";
+    return false;
+  }
+  // Portisch embeds a per-packet hardware repeat count at byte index 4 (hex
+  // chars 8..9), after the AAB0 + length + bucket-count header. The controller
+  // always sends 08; a crafted value (for example FF) would monopolize the RF
+  // coprocessor, so bound it to a sane 1..16.
+  const int repeat_high = hex_value(output[8]);
+  const int repeat_low = hex_value(output[9]);
+  const size_t embedded_repeat = static_cast<size_t>((repeat_high << 4) | repeat_low);
+  if (embedded_repeat < 1 || embedded_repeat > 0x10) {
+    reason = "frame embedded repeat count out of range";
     return false;
   }
   const size_t data_start = 10 + bucket_count * 4;
@@ -127,6 +140,11 @@ inline bool parse_target(const std::string &value, std::string &identity, uint16
     const size_t start = cursor;
     while (cursor < value.size() && value[cursor] >= '0' && value[cursor] <= '9') {
       channel = channel * 10 + (value[cursor] - '0');
+      // Bound the accumulator mid-parse: a long digit run (up to 43 digits
+      // inside the 53-char cap) would overflow the signed int before the range
+      // check below -- undefined behavior. 16 is the largest valid channel.
+      if (channel > 16)
+        return false;
       cursor++;
     }
     if (cursor == start || channel < 1 || channel > 16 || channel <= previous)
@@ -185,11 +203,17 @@ class TargetScheduler {
       retained_bytes += item.second.stored_bytes();
       retained_targets++;
     }
+    // Fail-safe STOPs already queued for flush hold heap too: displacing many
+    // started timed commands can park up to MAX_TARGETS * repeats * 260B on top
+    // of commands_, so count them in the admission budget.
+    size_t flush_bytes = 0;
+    for (const std::string &frame : this->flush_stops_)
+      flush_bytes += frame.size();
     if (retained_targets >= MAX_TARGETS) {
       reason = "target scheduler is full";
       return false;
     }
-    if (retained_bytes + command_bytes > MAX_TOTAL_FRAME_BYTES) {
+    if (retained_bytes + flush_bytes + command_bytes > MAX_TOTAL_FRAME_BYTES) {
       reason = "scheduler frame storage budget exceeded";
       return false;
     }
@@ -218,14 +242,21 @@ class TargetScheduler {
 
   std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id) {
     started_command_id.clear();
-    if (this->commands_.empty() && this->flush_stops_.empty()) {
-      // Reset the pacing gate whenever the scheduler is drained. A stale
-      // dispatch timestamp here blocked ALL transmission for up to ~24.9 days
-      // once millis() wrapped past the signed comparison horizon (observed:
-      // a bridge idle >2^31 ms accepted commands but never transmitted).
+    // Age-based pacing-gate reset, run every tick regardless of queue state. A
+    // stale gate once blocked ALL transmission for up to ~24.9 days after
+    // millis() wrapped past the signed comparison horizon (observed: a bridge
+    // idle >2^31 ms accepted commands but never transmitted). Resetting only
+    // when the gate is more than 60s stale preserves the short-term spacing
+    // owed to the just-dispatched frame -- an unconditional drain-reset erased
+    // it, letting a command that arrived right after the queue drained transmit
+    // with <repeat_gap_ms spacing while the EFM8BB1 was still transmitting. The
+    // 5ms interval tick carries the gate through this >60s window long before
+    // now-gate could wrap negative at 2^31 ms, so the rollover fix is kept.
+    if (this->next_rf_at_.has_value() &&
+        static_cast<int32_t>(now_ms - *this->next_rf_at_) > 60000)
       this->next_rf_at_.reset();
+    if (this->commands_.empty() && this->flush_stops_.empty())
       return std::nullopt;
-    }
     if (this->next_rf_at_.has_value() && !due_(now_ms, *this->next_rf_at_))
       return std::nullopt;
 
@@ -303,10 +334,12 @@ class TargetScheduler {
 
     size_t stored_bytes() const { return raw.size() + trailer_raw.size() + stop_raw.size(); }
 
-    // A displaced command still owes the motor a STOP if its RF already
-    // started and its armed fail-safe STOP has not yet been fully sent.
+    // A displaced command still owes the motor a STOP if its RF already started
+    // and its armed fail-safe STOP has not been fully sent: either it has not
+    // reached the STOP phase yet, or it is mid-STOP with copies remaining.
     bool owes_stop() const {
-      return started && stop_after_ms > 0 && !stop_raw.empty() && phase != Phase::STOP;
+      return started && stop_after_ms > 0 && !stop_raw.empty() &&
+             (phase != Phase::STOP || remaining > 0);
     }
   };
 
@@ -319,8 +352,14 @@ class TargetScheduler {
     }
     for (const std::string &target : displaced_targets) {
       Command &command = this->commands_.at(target);
-      if (command.owes_stop())
-        this->flush_stops_.push_back(command.stop_raw);
+      if (command.owes_stop()) {
+        // Flush every STOP copy still owed: the full repeat count if the STOP
+        // had not begun dispatching, or just the remaining copies if it was
+        // displaced mid-STOP. They go on air one per pacing gap.
+        const int copies = command.phase == Phase::STOP ? command.remaining : command.repeats;
+        for (int index = 0; index < copies; index++)
+          this->flush_stops_.push_back(command.stop_raw);
+      }
       displaced_ids.push_back(command.command_id);
       this->erase_(target);
     }

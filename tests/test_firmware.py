@@ -41,11 +41,23 @@ int main() {
   assert(!rf433::normalize_b0("AAB0GG55", normalized, reason));
   assert(!rf433::normalize_b0("AAB0010055", normalized, reason));
   assert(!rf433::normalize_b0("AAB005010000011155", normalized, reason));
+
+  // The Portisch per-packet hardware repeat byte (hex chars 8..9) is validated:
+  // force the valid frame's 08 repeat byte to FF and it is rejected.
+  std::string ff_frame = frame;
+  ff_frame[8] = 'F';
+  ff_frame[9] = 'F';
+  assert(!rf433::normalize_b0(ff_frame, normalized, reason));
+  assert(reason == "frame embedded repeat count out of range");
+
   assert(rf433::valid_target_key("a1b2c3:42:1,2,16"));
   assert(!rf433::valid_target_key("target-a"));
   assert(!rf433::valid_target_key("a1b2c3:42:2,1"));
   assert(!rf433::valid_target_key("a1b2c3:42:0"));
   assert(!rf433::valid_target_key("a1b2c3:42:17"));
+  // A long digit run is rejected as the channel accumulator crosses 16, before
+  // it can overflow the signed int (would otherwise be undefined behavior).
+  assert(!rf433::valid_target_key("a1b2c3:42:99999999999999999999"));
 
   TargetScheduler scheduler(35);
   const std::string target_a = "a1b2c3:42:1";
@@ -92,8 +104,9 @@ int main() {
   assert(raw && *raw == "SD");
   assert(started.empty());
 
-  // Latest command wins: an overlapping target displaces the old one, its
-  // command_id is reported, and its pending fail-safe STOP is flushed first.
+  // Latest command wins: an overlapping target displaces a STARTED timed
+  // command, and ALL 'repeats' copies of its fail-safe STOP are flushed on air
+  // (one per pacing gap) before the replacement's first dispatch.
   assert(scheduler.schedule("command-d2", target_d, "D2", "", 5, 4000, "SD2", 380,
                             displaced, reason));
   assert(displaced.empty());
@@ -103,15 +116,17 @@ int main() {
   assert(scheduler.schedule("command-e", "A1B2C3:42:4,5", "E", "", 1, 0, "", 400,
                             displaced, reason));
   assert(displaced.size() == 1 && displaced[0] == "command-d2");
-  raw = scheduler.next(415, started);
-  assert(raw && *raw == "SD2");  // flushed fail-safe STOP of the displaced move
-  assert(started.empty());
-  raw = scheduler.next(450, started);
+  for (int index = 0; index < 5; index++) {
+    raw = scheduler.next(415 + index * 35, started);
+    assert(raw && *raw == "SD2");  // repeats (=5) flushed fail-safe STOP copies
+    assert(started.empty());
+  }
+  raw = scheduler.next(590, started);
   assert(raw && *raw == "E");
   assert(started == "command-e");
 
   // Duplicate command_id (QoS-1 redelivery / retained replay) is rejected.
-  assert(!scheduler.schedule("command-e", "a1b2c3:42:6", "X", "", 1, 0, "", 460,
+  assert(!scheduler.schedule("command-e", "a1b2c3:42:6", "X", "", 1, 0, "", 595,
                              displaced, reason));
   assert(reason == "duplicate command_id");
 
@@ -131,20 +146,104 @@ int main() {
   }
   assert(budget_hit);
 
-  // Idle-rollover regression: drain a fresh scheduler, jump past the signed
-  // uint32 comparison horizon, and confirm a new command still transmits.
+  // Post-drain spacing is preserved: after a frame dispatches and the queue
+  // drains, a command arriving within the pacing gap still waits out the gap
+  // owed to the just-sent frame (the gate is no longer reset on drain).
   TargetScheduler idle_scheduler(35);
   assert(idle_scheduler.schedule("wrap-1", target_a, "W1", "", 1, 0, "", 35,
                                  displaced, reason));
   raw = idle_scheduler.next(35, started);
-  assert(raw && *raw == "W1");
-  assert(!idle_scheduler.next(36, started));  // drained tick resets the pacing gate
-  const uint32_t after_idle = 35u + 2147500000u;  // > 2^31 ms later, wrapped domain
+  assert(raw && *raw == "W1");  // pacing gate now owes until 70
+  assert(idle_scheduler.schedule("wrap-1b", target_a, "W1B", "", 1, 0, "", 60,
+                                 displaced, reason));
+  assert(!idle_scheduler.next(60, started));  // gap owed to W1 not yet elapsed
+  raw = idle_scheduler.next(70, started);
+  assert(raw && *raw == "W1B");
+  assert(started == "wrap-1b");  // gate owes until 105
+
+  // Idle-rollover regression: a single idle tick more than 60s after the last
+  // dispatch resets the stale gate (the 5ms interval guarantees such a tick
+  // before now-gate could wrap negative at 2^31 ms). A command admitted after
+  // the reset -- even across the signed-uint32 wrap -- still transmits.
+  assert(!idle_scheduler.next(105u + 60001u, started));  // >60s idle -> gate reset
+  const uint32_t after_idle = 105u + 2147500000u;  // > 2^31 ms later, wrapped domain
   assert(idle_scheduler.schedule("wrap-2", target_a, "W2", "", 1, 0, "", after_idle,
                                  displaced, reason));
   raw = idle_scheduler.next(after_idle, started);
   assert(raw && *raw == "W2");
   assert(started == "wrap-2");
+
+  // A STOP displaced mid-dispatch (phase STOP, remaining > 0) flushes exactly
+  // its remaining copies -- not the full repeat count, and never zero.
+  TargetScheduler stop_mid(35);
+  assert(stop_mid.schedule("mid-1", "aabbcc:11:1", "M", "", 3, 10, "SM", 0,
+                           displaced, reason));
+  raw = stop_mid.next(0, started);   // M action; deadline armed at 10
+  assert(raw && *raw == "M");
+  assert(started == "mid-1");
+  raw = stop_mid.next(35, started);  // deadline due: phase->STOP, dispatch SM (2 left)
+  assert(raw && *raw == "SM");
+  assert(started.empty());
+  raw = stop_mid.next(70, started);  // SM again (1 left)
+  assert(raw && *raw == "SM");
+  assert(stop_mid.schedule("mid-2", "aabbcc:11:1", "M2", "", 1, 0, "", 105,
+                           displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "mid-1");
+  raw = stop_mid.next(105, started);  // exactly one remaining STOP flushed
+  assert(raw && *raw == "SM");
+  assert(started.empty());
+  raw = stop_mid.next(140, started);
+  assert(raw && *raw == "M2");        // not another SM: only 'remaining' (=1) was flushed
+  assert(started == "mid-2");
+  assert(!stop_mid.next(175, started));
+
+  // Worst case: a STOP marked due but displaced before its FIRST dispatch (a
+  // sibling STOP won the tick) must still flush its owed copy -- never zero.
+  TargetScheduler zero_win(35);
+  assert(zero_win.schedule("zw-p", "aabbcc:11:1", "P", "", 1, 1000, "SP", 0,
+                           displaced, reason));
+  assert(zero_win.schedule("zw-q", "aabbcc:11:2", "Q", "", 1, 1000, "SQ", 0,
+                           displaced, reason));
+  raw = zero_win.next(0, started);   // P action, deadline 1000
+  assert(raw && *raw == "P");
+  raw = zero_win.next(35, started);  // Q action, deadline 1035
+  assert(raw && *raw == "Q");
+  raw = zero_win.next(1035, started);  // both deadlines due; P's STOP wins the tick
+  assert(raw && *raw == "SP");
+  assert(started.empty());
+  // Q is now phase STOP with zero STOP frames dispatched. Displace it.
+  assert(zero_win.schedule("zw-r", "aabbcc:11:2", "R", "", 1, 0, "", 1040,
+                           displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "zw-q");
+  raw = zero_win.next(1070, started);
+  assert(raw && *raw == "SQ");  // owed STOP flushed despite zero pre-displacement sends
+  assert(started.empty());
+
+  // The admission budget counts bytes already parked in flush_stops_, not just
+  // commands_: displacing a started timed command parks repeats * stop_raw
+  // bytes for flush that must be charged against the heap budget too.
+  TargetScheduler budget2(35);
+  const std::string half(510, 'A');
+  assert(budget2.schedule("bx", "d1d1d1:05:1,2", half, "", 20, 3600000, half, 0,
+                          displaced, reason));
+  raw = budget2.next(0, started);  // start bx so its fail-safe STOP is owed
+  assert(raw && *raw == half);
+  assert(started == "bx");
+  for (int index = 0; index < 4; index++) {
+    const std::string target = "d1d1d1:0" + std::to_string(index + 1) + ":1";
+    assert(budget2.schedule("bfill-" + std::to_string(index), target, half, half, 1,
+                            3600000, half, static_cast<uint32_t>(1 + index),
+                            displaced, reason));
+  }
+  // Displace bx: 20 copies of its 510-byte STOP (10200B) are parked for flush.
+  assert(budget2.schedule("by", "d1d1d1:05:2", "Y", "", 1, 0, "", 5,
+                          displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "bx");
+  // Z fits under budget against commands_ alone (4*1530 + 1 + 1530 = 7651) but
+  // not once the 10200B of parked flush STOPs are counted -> rejected.
+  assert(!budget2.schedule("bz", "d1d1d1:06:1", half, half, 1, 3600000, half, 6,
+                           displaced, reason));
+  assert(reason == "scheduler frame storage budget exceeded");
   return 0;
 }
 """
@@ -180,8 +279,9 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     assert "rf433::tx_scheduler" in package
     assert 'x["command_id"]' in package
     assert 'x["target"]' in package
-    assert 'x["stop_raw"]' in package
-    assert 'x["trailer_raw"]' in package
+    assert '"stop_raw"' in package
+    assert '"trailer_raw"' in package
+    assert "stop_raw requires stop_after_ms" in package
     assert 'root["command_id"]' in package
     assert 'root["status"]' in package
     assert 'root["target"]' not in package

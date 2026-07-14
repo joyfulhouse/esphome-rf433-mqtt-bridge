@@ -19,8 +19,10 @@ substitutions:
   api_encryption_key: !secret rf433_bridge_living_room_api_key
   ota_password: !secret rf433_bridge_living_room_ota_password
 
+# This file must sit in the same directory as rf433-mqtt-bridge.yaml and
+# rf433_scheduler.h (see README install step 1); the include is same-dir.
 packages:
-  rf433_bridge: !include ../rf433-mqtt-bridge.yaml
+  rf433_bridge: !include rf433-mqtt-bridge.yaml
 
 # wifi:
 #   manual_ip:

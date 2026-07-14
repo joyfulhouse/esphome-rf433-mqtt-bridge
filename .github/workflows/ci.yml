@@ -32,5 +32,4 @@ jobs:
         run: |
           cp secrets.example.yaml secrets.yaml
           cp examples/living-room.yaml .
-          sed -i 's|!include ../rf433-mqtt-bridge.yaml|!include rf433-mqtt-bridge.yaml|' living-room.yaml
           uvx --from "esphome==2026.6.5" esphome config living-room.yaml

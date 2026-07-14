@@ -17,15 +17,21 @@ integration for AOK/Zemismart roller blinds — publishes correlated JSON comman
 validates, schedules, and transmits Portisch **B0** raw frames.
 
 - **Correlated acknowledgements** — every command carries a `command_id`; the bridge answers
-  `accepted`/`rejected` on admission and `started` on the first actual RF dispatch.
+  `accepted`/`rejected` on admission and `started` on the first actual RF dispatch. `started`
+  means the frame was handed to the RF coprocessor over UART (ESPHome's `send_raw` does not wait
+  for an EFM8BB1 ack); it is proof of dispatch, not of RF emission.
 - **Per-target scheduling** — one RF frame on air at a time, while each target keeps its own
   repeat phase and an **absolute monotonic STOP deadline** (`stop_after_ms` + `stop_raw`) so a
   partial movement is stopped by the bridge itself even if the controller disappears.
 - **Latest command wins** — a new command whose channels overlap an active target on the same
   remote displaces it: the displaced command's pending fail-safe STOP is flushed on air first,
   and a `displaced` status with its `command_id` tells the controller to retire its motion model.
-- **Duplicate suppression** — a ring of recent `command_id`s rejects QoS-1 broker redeliveries
-  and accidentally retained commands replayed on reconnect. Never publish retained `tx` commands.
+  `displaced` is published at admission of the replacing command, while the flushed STOP physically
+  transmits within the next pacing gap(s); a controller that freezes the model at displaced-time is
+  within one pacing gap of physical truth.
+- **Duplicate suppression** — a ring of recent `command_id`s suppresses QoS-1 broker redeliveries
+  and same-boot retained replays. The ring lives in RAM, so a retained `tx` command *can* replay
+  after a reboot: **retained `tx` publishes are unsupported and dangerous — never publish them.**
 - **Bounded memory** — admission enforces a total stored-frame budget sized for the ESP8285 heap.
 - **Retained discovery** — the beacon publishes retained `availability` (birth/will) and `info`
   (area, default flag) so controllers can discover online bridges and prefer one in the same area.
