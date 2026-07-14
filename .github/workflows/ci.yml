@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Native scheduler + package contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Test
+        run: uv run pytest -q
+
+  esphome-config:
+    name: ESPHome config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Validate example configuration
+        run: |
+          cp secrets.example.yaml secrets.yaml
+          cp secrets.example.yaml examples/secrets.yaml
+          uvx --from "esphome==2026.6.5" esphome config examples/living-room.yaml

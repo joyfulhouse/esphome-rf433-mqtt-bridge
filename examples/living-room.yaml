@@ -1,0 +1,30 @@
+# Example per-device file for one Sonoff RF Bridge R2.
+# Copy this next to rf433-mqtt-bridge.yaml and rf433_scheduler.h, adjust the
+# substitutions, then flash:
+#
+#   esphome run living-room.yaml
+#
+# Networking uses DHCP by default. To pin a static IP instead, uncomment the
+# wifi: block below (RFC 5737 documentation addresses shown — use your own).
+
+substitutions:
+  bridge_id: rf433-bridge-living-room
+  friendly_name: Living Room RF Bridge
+  bridge_area: living_room     # Home Assistant area ID, not its display name
+  default_bridge: "true"       # "true" on exactly one bridge in your home
+  # With Home Assistant's Mosquitto add-on, the broker is your HA host.
+  mqtt_broker: homeassistant.local
+  mqtt_username: !secret mqtt_username
+  mqtt_password: !secret mqtt_password
+  api_encryption_key: !secret rf433_bridge_living_room_api_key
+  ota_password: !secret rf433_bridge_living_room_ota_password
+
+packages:
+  rf433_bridge: !include ../rf433-mqtt-bridge.yaml
+
+# wifi:
+#   manual_ip:
+#     static_ip: 192.0.2.50
+#     gateway: 192.0.2.1
+#     subnet: 255.255.255.0
+#     dns1: 192.0.2.1

@@ -1,0 +1,240 @@
+# Reusable Sonoff RF Bridge R2/Portisch MQTT beacon package.
+#
+# The bridge is a deliberately dumb MQTT-to-433.92 MHz beacon: it contains no
+# device codes and no cover entities. A controller (for example the
+# joyfulhouse/zemismart-blinds Home Assistant integration) publishes correlated
+# JSON commands to rf433/<bridge_id>/tx; the beacon validates, schedules, and
+# transmits Portisch B0 frames, acknowledging on rf433/<bridge_id>/status.
+#
+# Include this file from one small per-bridge YAML and override at least:
+#   bridge_id, friendly_name, bridge_area, api_encryption_key, ota_password,
+#   and your MQTT broker settings. Set default_bridge to "true" on exactly one
+# beacon. See examples/living-room.yaml.
+#
+# Networking defaults to DHCP. To pin a static IP, add a wifi: block with
+# manual_ip in your per-device YAML — ESPHome merges it over this package.
+#
+# MQTT is provider-agnostic: any broker works. With Home Assistant's Mosquitto
+# add-on (the common core-mqtt setup) the broker is your HA host; a dedicated
+# broker works the same way. Leave mqtt_username empty for anonymous brokers.
+
+substitutions:
+  bridge_id: rf433-bridge
+  friendly_name: RF433 MQTT Bridge
+  bridge_area: unassigned
+  default_bridge: "false"
+  mqtt_broker: homeassistant.local
+  mqtt_port: "1883"
+  mqtt_username: ""
+  mqtt_password: ""
+  default_repeats: "5"
+  repeat_gap_ms: "35"
+  api_encryption_key: REPLACE_WITH_32_BYTE_BASE64_KEY
+  ota_password: REPLACE_WITH_OTA_PASSWORD
+
+esphome:
+  name: ${bridge_id}
+  friendly_name: ${friendly_name}
+  includes:
+    - rf433_scheduler.h
+
+esp8266:
+  board: esp01_1m
+  restore_from_flash: false
+
+logger:
+  # GPIO1/GPIO3 belong exclusively to the EFM8BB1 RF coprocessor.
+  baud_rate: 0
+
+uart:
+  id: rf_uart
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 19200
+
+rf_bridge:
+  id: portisch_rf_bridge
+  uart_id: rf_uart
+
+# The per-bridge scheduler lives as a function-local static in
+# rf433_scheduler.h (rf433::tx_scheduler), NOT an ESPHome `globals:` entry:
+# ESPHome emits the globals pstorage before the `includes:` header, so a
+# custom-typed global fails to compile. It keeps one state map per bridge and
+# emits one RF frame at a time globally while preserving each target's repeat
+# phase and absolute monotonic STOP deadline.
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: ${api_encryption_key}
+
+ota:
+  - platform: esphome
+    password: ${ota_password}
+
+mqtt:
+  id: mqtt_client
+  broker: ${mqtt_broker}
+  port: ${mqtt_port}
+  username: ${mqtt_username}
+  password: ${mqtt_password}
+  discovery: false
+  reboot_timeout: 0s
+  birth_message:
+    topic: rf433/${bridge_id}/availability
+    payload: online
+    qos: 0
+    retain: true
+  will_message:
+    topic: rf433/${bridge_id}/availability
+    payload: offline
+    qos: 0
+    retain: true
+  shutdown_message:
+    topic: rf433/${bridge_id}/availability
+    payload: offline
+    qos: 0
+    retain: true
+  on_connect:
+    - mqtt.publish:
+        topic: rf433/${bridge_id}/info
+        payload: >-
+          {"bridge":"${bridge_id}","area":"${bridge_area}","default":${default_bridge}}
+        qos: 0
+        retain: true
+  on_json_message:
+    topic: rf433/${bridge_id}/tx
+    qos: 1
+    then:
+      - lambda: |-
+          const std::string command_id = x["command_id"].is<const char *>()
+                                             ? x["command_id"].as<std::string>()
+                                             : std::string();
+          const std::string target = x["target"].is<const char *>()
+                                         ? x["target"].as<std::string>()
+                                         : std::string();
+          auto publish_status = [&](const char *status, const std::string &reason) {
+            id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
+              root["status"] = status;
+              root["command_id"] = command_id;
+              if (!reason.empty())
+                root["reason"] = reason;
+            }, 1, false);
+          };
+          auto reject = [&](const std::string &reason) {
+            ESP_LOGW("rf433", "Rejected command %s for %s: %s", command_id.c_str(),
+                     target.c_str(), reason.c_str());
+            publish_status("rejected", reason);
+          };
+
+          if (!rf433::valid_key(command_id) || !rf433::valid_target_key(target)) {
+            reject("command_id or canonical target key is invalid");
+            return;
+          }
+
+          if (!x["raw"].is<const char *>()) {
+            reject("raw must be a B0 string");
+            return;
+          }
+          if (!x["repeats"].isNull() && !x["repeats"].is<int>()) {
+            reject("repeats must be an integer");
+            return;
+          }
+          const int repeats = x["repeats"] | ${default_repeats};
+          if (repeats < 1 || repeats > 20) {
+            reject("repeats must be in the range 1..20");
+            return;
+          }
+          if (!x["stop_after_ms"].isNull() && !x["stop_after_ms"].is<int>()) {
+            reject("stop_after_ms must be an integer");
+            return;
+          }
+          const int stop_after_ms = x["stop_after_ms"] | 0;
+          if (stop_after_ms < 0 || stop_after_ms > 3600000) {
+            reject("stop_after_ms must be in the range 0..3600000");
+            return;
+          }
+
+          std::string raw;
+          std::string trailer_raw;
+          std::string stop_raw;
+          std::string reason;
+          if (!rf433::normalize_b0(x["raw"].as<std::string>(), raw, reason)) {
+            reject(std::string("invalid raw: ") + reason);
+            return;
+          }
+          if (!x["trailer_raw"].isNull()) {
+            if (!x["trailer_raw"].is<const char *>() ||
+                !rf433::normalize_b0(x["trailer_raw"].as<std::string>(), trailer_raw, reason)) {
+              reject(std::string("invalid trailer_raw: ") + reason);
+              return;
+            }
+          }
+          if (!x["stop_raw"].isNull()) {
+            if (!x["stop_raw"].is<const char *>() ||
+                !rf433::normalize_b0(x["stop_raw"].as<std::string>(), stop_raw, reason)) {
+              reject(std::string("invalid stop_raw: ") + reason);
+              return;
+            }
+          }
+          if (stop_after_ms > 0 && stop_raw.empty()) {
+            reject("timed command requires stop_raw");
+            return;
+          }
+
+          if (!rf433::tx_scheduler(${repeat_gap_ms})
+                   .schedule(command_id, target, raw, trailer_raw, repeats,
+                             static_cast<uint32_t>(stop_after_ms), stop_raw, millis())) {
+            reject("target scheduler is full, overlaps active work, or command fields are invalid");
+            return;
+          }
+          publish_status("accepted", "");
+
+interval:
+  - interval: 5ms
+    then:
+      - lambda: |-
+          std::string started_command_id;
+          const auto raw = rf433::tx_scheduler(${repeat_gap_ms}).next(millis(), started_command_id);
+          if (!raw.has_value())
+            return;
+          id(portisch_rf_bridge).send_raw(*raw);
+          if (started_command_id.empty())
+            return;
+          auto publish_status = [&](const char *status, const std::string &command_id) {
+            id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
+              root["status"] = status;
+              root["command_id"] = command_id;
+            }, 1, false);
+          };
+          publish_status("started", started_command_id);
+
+button:
+  - platform: template
+    name: Start advanced sniffing
+    icon: mdi:radio-tower
+    entity_category: diagnostic
+    on_press:
+      - rf_bridge.start_advanced_sniffing
+
+  - platform: template
+    name: Start bucket sniffing
+    icon: mdi:waveform
+    entity_category: diagnostic
+    on_press:
+      - rf_bridge.start_bucket_sniffing
+
+  - platform: template
+    name: Stop advanced sniffing
+    icon: mdi:stop-circle-outline
+    entity_category: diagnostic
+    on_press:
+      - rf_bridge.stop_advanced_sniffing
+
+# PHASE 2 TODO: stock ESPHome logs B1 bucket frames but exposes no
+# on_bucket_received/on_raw_received trigger. Add the planned external rf_bridge
+# component before publishing rf433/${bridge_id}/rx. Do not infer RX from TX.

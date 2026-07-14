@@ -1,0 +1,28 @@
+[project]
+name = "esphome-rf433-mqtt-bridge"
+version = "1.0.0"
+description = "ESPHome MQTT beacon firmware for the Sonoff RF Bridge R2 (Portisch) — correlated, scheduled 433.92 MHz B0 transmission"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "ruff>=0.15",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "S101",    # pytest asserts
+    "S603",    # subprocess without shell is the point of the native test
+    "COM812",  # formatter-managed
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
