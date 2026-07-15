@@ -83,6 +83,14 @@ mqtt:
   username: ${mqtt_username}
   password: ${mqtt_password}
   discovery: false
+  # The bridge speaks ONLY the documented rf433/ contract: no ESPHome IP
+  # discovery metadata, no retained debug log topic (it would leak the last
+  # complete RF identity), and no auto component state/command topics (the
+  # sniffing buttons stay reachable through the native API alone -- an MQTT
+  # command topic would let any broker client toggle sniffing).
+  discover_ip: false
+  log_topic:
+  topic_prefix:
   reboot_timeout: 0s
   birth_message:
     topic: rf433/${bridge_id}/availability
@@ -153,6 +161,12 @@ mqtt:
               rf433::tx_scheduler(${repeat_gap_ms}).replay_state(command_id, millis(), started_age_ms);
           if (replay == 3) {
             reject("duplicate command_id (previously rejected)");
+            return;
+          }
+          if (replay == 4) {
+            // The original command was displaced after admission; replaying
+            // accepted would let the controller rebuild a retired motion.
+            publish_status("displaced", "");
             return;
           }
           if (replay > 0) {
@@ -258,6 +272,11 @@ mqtt:
           }
           publish_status("accepted", "");
 
+globals:
+  - id: info_synced
+    type: bool
+    initial_value: "false"
+
 interval:
   # Self-healing retained info: the on_connect publish above has been observed
   # to be dropped in the field (fleet-wide, ESPHome 2026.6.5 — the client is
@@ -280,6 +299,22 @@ interval:
   - interval: 5ms
     then:
       - lambda: |-
+          // Publish retained info the moment the client is actually ready:
+          // the on_connect publish has been observed to drop (client not yet
+          // writable when the trigger fires), and waiting for the 60s
+          // republish would leave the bridge online-but-arealess, letting
+          // controllers route this area's commands through a fallback
+          // bridge. One boolean gate keeps this branch effectively free.
+          if (id(mqtt_client)->is_connected()) {
+            if (!id(info_synced)) {
+              id(mqtt_client)->publish("rf433/${bridge_id}/info",
+                  "{\"bridge\":\"${bridge_id}\",\"area\":\"${bridge_area}\",\"default\":${default_bridge}}",
+                  0, true);
+              id(info_synced) = true;
+            }
+          } else {
+            id(info_synced) = false;
+          }
           std::string started_command_id;
           const auto raw = rf433::tx_scheduler(${repeat_gap_ms}).next(millis(), started_command_id);
           if (!raw.has_value())

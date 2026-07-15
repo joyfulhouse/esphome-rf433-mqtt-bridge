@@ -318,8 +318,10 @@ int main() {
   // with their RF-start state and timestamp so a QoS-1 replay can answer
   // idempotently and report how old the original start is.
   uint32_t age = 0;
-  assert(fair.replay_state("fa", 500, age) == 2);
-  assert(age == 500);  // fa started at 0
+  // fa and fb were displaced by fc: their memory replays "displaced", never
+  // "accepted" (a controller must not rebuild a retired motion).
+  assert(fair.replay_state("fa", 500, age) == 4);
+  assert(fair.replay_state("fb", 500, age) == 4);
   assert(fair.replay_state("fc", 500, age) == 2);
   assert(fair.replay_state("unknown-id", 500, age) == 0);
   TargetScheduler rep(35);

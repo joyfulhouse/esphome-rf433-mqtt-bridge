@@ -282,8 +282,10 @@ class TargetScheduler {
   // but RF not yet started, 2 = admitted and RF started (started_age_ms is
   // set to how long ago), 3 = rejected by a STATE-DEPENDENT check (scheduler
   // full / storage budget) whose outcome must not silently flip on a later
-  // redelivery. Deterministic validation rejections are not remembered --
-  // a redelivery re-validates identically, which is already idempotent.
+  // redelivery, 4 = displaced after admission (replaying accepted would let
+  // the controller rebuild a retired motion). Deterministic validation
+  // rejections are not remembered -- a redelivery re-validates identically,
+  // which is already idempotent.
   int replay_state(const std::string &command_id, uint32_t now_ms,
                    uint32_t &started_age_ms) const {
     started_age_ms = 0;
@@ -400,6 +402,7 @@ class TargetScheduler {
   struct FlushStop {
     std::string raw;
     int remaining{0};
+    std::string command_id;
   };
 
   struct Command {
@@ -444,8 +447,9 @@ class TargetScheduler {
         // displaced mid-STOP. They go on air one per pacing gap; the frame is
         // stored once with its send count.
         const int copies = command.phase == Phase::STOP ? command.remaining : command.repeats;
-        this->flush_stops_.push_back(FlushStop{command.stop_raw, copies});
+        this->flush_stops_.push_back(FlushStop{command.stop_raw, copies, command.command_id});
       }
+      this->mark_displaced_(command.command_id);
       displaced_ids.push_back(command.command_id);
       this->erase_(target);
     }
@@ -464,6 +468,12 @@ class TargetScheduler {
       return false;
     for (const auto &item : this->commands_) {
       if (item.second.command_id == command_id)
+        return true;
+    }
+    // A displaced command still draining its fail-safe STOPs is active too:
+    // evicting its memory would let a duplicate re-run it mid-flush.
+    for (const FlushStop &entry : this->flush_stops_) {
+      if (entry.command_id == command_id)
         return true;
     }
     return false;
@@ -485,6 +495,15 @@ class TargetScheduler {
     }
     this->recent_ids_[this->recent_cursor_] = RecentCommand{command_id, state, 0};
     this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
+  }
+
+  void mark_displaced_(const std::string &command_id) {
+    for (RecentCommand &recent : this->recent_ids_) {
+      if (recent.command_id == command_id) {
+        recent.state = 4;
+        return;
+      }
+    }
   }
 
   void mark_started_(const std::string &command_id, uint32_t now_ms) {
