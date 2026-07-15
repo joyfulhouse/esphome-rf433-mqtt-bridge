@@ -107,13 +107,10 @@ mqtt:
     payload: offline
     qos: 0
     retain: true
-  on_connect:
-    - mqtt.publish:
-        topic: rf433/${bridge_id}/info
-        payload: >-
-          {"bridge":"${bridge_id}","area":"${bridge_area}","default":${default_bridge}}
-        qos: 0
-        retain: true
+  # Retained info is published by the 5 ms dispatch tick the moment the client
+  # is connected (see the interval lambda below), which also self-heals across
+  # reconnects; a separate on_connect action and a periodic republish would
+  # only duplicate that.
   on_json_message:
     topic: rf433/${bridge_id}/tx
     qos: 1
@@ -278,35 +275,18 @@ globals:
     initial_value: "false"
 
 interval:
-  # Self-healing retained info: the on_connect publish above has been observed
-  # to be dropped in the field (fleet-wide, ESPHome 2026.6.5 — the client is
-  # not yet ready to publish when the trigger fires), which silently degrades
-  # controllers' area-aware bridge selection. Republishing retained metadata
-  # once a minute costs nothing and guarantees eventual consistency.
-  - interval: 60s
-    then:
-      - if:
-          condition:
-            mqtt.connected:
-          then:
-            - mqtt.publish:
-                topic: rf433/${bridge_id}/info
-                payload: >-
-                  {"bridge":"${bridge_id}","area":"${bridge_area}","default":${default_bridge}}
-                qos: 0
-                retain: true
-
   - interval: 5ms
     then:
       - lambda: |-
-          // Publish retained info the moment the client is actually ready:
-          // the on_connect publish has been observed to drop (client not yet
-          // writable when the trigger fires), and waiting for the 60s
-          // republish would leave the bridge online-but-arealess, letting
-          // controllers route this area's commands through a fallback
-          // bridge. The gate is armed only when publish() actually succeeds,
-          // so transient MQTT backpressure retries on the next 5 ms tick
-          // instead of suppressing the sync for up to a minute.
+          // Publish retained info the moment the client is actually ready.
+          // A plain on_connect publish has been observed to drop in the field
+          // (fleet-wide, ESPHome 2026.6.5 — the client is not yet writable
+          // when that trigger fires), which silently degrades controllers'
+          // area-aware bridge selection. This one-shot gate self-heals across
+          // reconnects and retries on transient backpressure, subsuming both
+          // the on_connect action and a periodic republish. The gate is armed
+          // only when publish() actually succeeds, so a failed publish retries
+          // on the next 5 ms tick instead of being suppressed.
           if (id(mqtt_client).is_connected()) {
             if (!id(info_synced) &&
                 id(mqtt_client).publish("rf433/${bridge_id}/info",

@@ -500,11 +500,13 @@ class TargetScheduler {
   }
 
   void remember_(const std::string &command_id, uint8_t state) {
-    // Never evict the memory of a command still scheduled (a timed command
-    // can sit in WAIT_STOP up to an hour): forgetting it would let a QoS-1
-    // redelivery displace and physically re-run its own live command. The
-    // ring (32) is larger than MAX_TARGETS (16), so a free slot always
-    // exists within one sweep; the fallback is unreachable but safe.
+    // Prefer to evict an inactive slot. If flush_stops_ ever pushes the
+    // active-id count past the ring size, the fallback overwrites the oldest
+    // slot even if it is active -- which is safe because re-run protection no
+    // longer depends on the ring: replay_state() and schedule()'s dedup both
+    // consult live scheduler state (commands_/flush_stops_) authoritatively,
+    // so an evicted active id is still recognized as a duplicate. The ring
+    // only shortens the dedup window for already-completed command ids.
     for (size_t probe = 0; probe < COMMAND_ID_RING_SIZE; probe++) {
       RecentCommand &slot = this->recent_ids_[this->recent_cursor_];
       this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
