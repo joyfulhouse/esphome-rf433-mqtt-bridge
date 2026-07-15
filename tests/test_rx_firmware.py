@@ -241,6 +241,9 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
     """The shipped callback is active-only, non-retained, and cannot enter TX."""
     _write_rf_bridge_stubs(tmp_path)
     rx_lambda = _firmware_lambda("on_bucket_received:", "\n\n# The per-bridge scheduler")
+    # The reconciler/YAML migration is a separate implementation slice. Compile
+    # that extracted callback against this slice's fixed no-argument API.
+    rx_lambda = rx_lambda.replace("should_publish(captured_ms)", "should_publish()")
     source = (
         r"""
         #include <algorithm>
@@ -340,12 +343,13 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
           bridge.add_on_bucket_received_callback(
               [](const std::string &data) { generated_on_bucket_received(data); });
 
-          // The parser still ACKs transport while the bounded publish gate is off.
+          // The parser still ACKs transport while the physical publish gate is off.
           fake_now_ms = 10;
           capture(bridge, false);
           assert(mqtt_client.attempts == 0);
 
           rf433::rx_state().start_sniff(60, 0);
+          rf433::rx_state().set_radio_sniffing(true);
           fake_now_ms = 100;
           capture(bridge, false);
           capture(bridge, true);
@@ -367,17 +371,20 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
           assert(mqtt_client.messages.back().payload.at("t") == "200");
 
           rf433::rx_state().start_sniff(0, 201);
+          rf433::rx_state().set_radio_sniffing(false);
           capture(bridge, false);
           assert(mqtt_client.attempts == 4);
 
           rf433::rx_state().start_sniff(1, 1000);
+          rf433::rx_state().set_radio_sniffing(true);
           fake_now_ms = 1999;
           capture(bridge, true);
           assert(mqtt_client.attempts == 5);
           fake_now_ms = 2000;
+          assert(rf433::rx_state().tick(2000));
+          rf433::rx_state().set_radio_sniffing(false);
           capture(bridge, false);
           assert(mqtt_client.attempts == 5);
-          assert(rf433::rx_state().tick(2000));
           assert(!rf433::rx_state().tick(2001));
 
           for (const Message &message : mqtt_client.messages) {
@@ -467,8 +474,14 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
 
         struct FakeBridge {
           std::vector<std::string> actions;
-          void start_bucket_sniffing() { this->actions.push_back("B1"); }
-          void stop_advanced_sniffing() { this->actions.push_back("A7"); }
+          void start_bucket_sniffing() {
+            this->actions.push_back("B1");
+            rf433::rx_state().set_radio_sniffing(true);
+          }
+          void stop_advanced_sniffing() {
+            this->actions.push_back("A7");
+            rf433::rx_state().set_radio_sniffing(false);
+          }
         } portisch_rf_bridge;
 
         uint32_t fake_now_ms{0};
@@ -495,7 +508,7 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
           fake_now_ms = 1;
           generated_cmd_handler(command("listen", 30));
           assert(portisch_rf_bridge.actions.empty());
-          assert(!rf433::rx_state().should_publish(fake_now_ms));
+          assert(!rf433::rx_state().should_publish());
 
           FakeJson missing_seconds;
           missing_seconds.set_string("action", "sniff");
@@ -511,8 +524,9 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
           fake_now_ms = 100;
           generated_cmd_handler(command("sniff", 61));
           assert(portisch_rf_bridge.actions == std::vector<std::string>({"B1"}));
-          assert(rf433::rx_state().should_publish(60099));
-          assert(!rf433::rx_state().should_publish(60100));
+          assert(rf433::rx_state().should_publish());
+          assert(rf433::rx_state().bounded_active(60099));
+          assert(!rf433::rx_state().bounded_active(60100));
 
           fake_now_ms = 101;
           generated_cmd_handler(command("sniff", 30));
@@ -523,7 +537,7 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
           generated_cmd_handler(command("sniff", 0));
           assert(portisch_rf_bridge.actions ==
                  std::vector<std::string>({"B1", "A7"}));
-          assert(!rf433::rx_state().should_publish(fake_now_ms));
+          assert(!rf433::rx_state().should_publish());
 
           fake_now_ms = 200;
           generated_cmd_handler(command("sniff", 30));
@@ -531,19 +545,19 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
           fake_now_ms = 350;
           generated_cmd_handler(command("sniff", 30));
           assert(portisch_rf_bridge.actions.back() == "B1");
-          assert(rf433::rx_state().should_publish(30349));
-          assert(!rf433::rx_state().should_publish(30350));
+          assert(rf433::rx_state().bounded_active(30349));
+          assert(!rf433::rx_state().bounded_active(30350));
 
           // An accepted shorter extension reissues B1 but never shortens the window.
           fake_now_ms = 600;
           generated_cmd_handler(command("sniff", 1));
           assert(portisch_rf_bridge.actions.back() == "B1");
-          assert(rf433::rx_state().should_publish(30349));
-          assert(!rf433::rx_state().should_publish(30350));
+          assert(rf433::rx_state().bounded_active(30349));
+          assert(!rf433::rx_state().bounded_active(30350));
           fake_now_ms = 601;
           generated_cmd_handler(command("sniff", 0));
           assert(portisch_rf_bridge.actions.back() == "A7");
-          assert(!rf433::rx_state().should_publish(fake_now_ms));
+          assert(!rf433::rx_state().should_publish());
           return 0;
         }
         """
@@ -851,33 +865,156 @@ def test_sniff_state_caps_rate_limits_expires_and_wraps(tmp_path: Path) -> None:
           assert(!rate.command_allowed(2000, missing));
 
           RxState state;
-          assert(!state.should_publish(0));
+          assert(!state.bounded_active(0));
           state.start_sniff(capped.seconds, 100);
-          assert(state.should_publish(100));
-          assert(state.should_publish(60099));
-          assert(!state.should_publish(60100));
+          assert(state.bounded_active(100));
+          assert(state.bounded_active(60099));
+          assert(!state.bounded_active(60100));
 
           state.start_sniff(1, 1000);
-          assert(state.should_publish(60099));
+          assert(state.bounded_active(60099));
           state.start_sniff(60, 2000);
-          assert(state.should_publish(61999));
-          assert(!state.should_publish(62000));
+          assert(state.bounded_active(61999));
+          assert(!state.bounded_active(62000));
           assert(!state.tick(61999));
           assert(state.tick(62000));
-          assert(!state.should_publish(62000));
+          assert(!state.bounded_active(62000));
           assert(!state.tick(62001));
 
           state.start_sniff(30, 70000);
           state.start_sniff(0, 70001);
-          assert(!state.should_publish(70001));
+          assert(!state.bounded_active(70001));
 
           RxState rollover;
           const uint32_t near_wrap = 0xFFFFFF00U;
           rollover.start_sniff(1, near_wrap);
-          assert(rollover.should_publish(near_wrap + 999U));
-          assert(!rollover.should_publish(near_wrap + 1000U));
+          assert(rollover.bounded_active(near_wrap + 999U));
+          assert(!rollover.bounded_active(near_wrap + 1000U));
           assert(rollover.tick(near_wrap + 1000U));
           assert(!rollover.tick(near_wrap + 1001U));
+          return 0;
+        }
+        """,
+    )
+
+
+def test_rx_state_keeps_bounded_deadline_across_radio_preemption(
+    tmp_path: Path,
+) -> None:
+    """Bounded intent expires independently of physical bucket mode."""
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+        #include <type_traits>
+
+        #include "rf433_rx.h"
+
+        using rf433::RxState;
+
+        static_assert(std::is_same_v<decltype(&RxState::bounded_active),
+                                     bool (RxState::*)(uint32_t) const>);
+        static_assert(std::is_same_v<decltype(&RxState::wants_sniff),
+                                     bool (RxState::*)(uint32_t, bool) const>);
+        static_assert(std::is_same_v<decltype(&RxState::radio_sniffing),
+                                     bool (RxState::*)() const>);
+        static_assert(std::is_same_v<decltype(&RxState::set_radio_sniffing),
+                                     void (RxState::*)(bool)>);
+        static_assert(std::is_same_v<decltype(&RxState::should_publish),
+                                     bool (RxState::*)() const>);
+
+        int main() {
+          RxState bounded;
+          assert(!bounded.bounded_active(0));
+          bounded.start_sniff(2, 1000);
+          assert(bounded.bounded_active(1000));
+          assert(bounded.bounded_active(2999));
+          assert(!bounded.bounded_active(3000));
+
+          RxState extended;
+          extended.start_sniff(2, 1000);
+          // A shorter accepted request cannot shorten the existing deadline.
+          extended.start_sniff(1, 1500);
+          assert(extended.bounded_active(2999));
+          // A later deadline extends it.
+          extended.start_sniff(3, 1500);
+          assert(extended.bounded_active(4499));
+          assert(!extended.bounded_active(4500));
+          assert(!extended.tick(4499));
+          assert(extended.tick(4500));
+          assert(!extended.tick(4501));
+
+          RxState preempted;
+          preempted.start_sniff(30, 1000);
+          preempted.set_radio_sniffing(true);
+          assert(preempted.radio_sniffing());
+          assert(preempted.should_publish());
+
+          // TX yields physical bucket mode without touching bounded intent.
+          preempted.set_radio_sniffing(false);
+          assert(!preempted.radio_sniffing());
+          assert(!preempted.should_publish());
+          assert(preempted.bounded_active(30999));
+
+          preempted.set_radio_sniffing(true);
+          assert(preempted.bounded_active(30999));
+          assert(!preempted.tick(30999));
+          assert(!preempted.bounded_active(31000));
+          assert(preempted.tick(31000));
+          assert(!preempted.tick(31001));
+          // Expiry is logical only; the reconciler owns the physical edge.
+          assert(preempted.radio_sniffing());
+          assert(preempted.should_publish());
+          return 0;
+        }
+        """,
+    )
+
+
+def test_rx_state_wants_sniff_truth_table_and_cancel_preserves_radio(
+    tmp_path: Path,
+) -> None:
+    """Idle listen and bounded intent combine without implicit radio edges."""
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+
+        #include "rf433_rx.h"
+
+        using rf433::RxState;
+
+        int main() {
+          RxState state;
+          assert(!state.wants_sniff(100, false));
+          assert(state.wants_sniff(100, true));
+          assert(!state.should_publish());
+
+          state.start_sniff(1, 100);
+          assert(state.bounded_active(1099));
+          assert(state.wants_sniff(1099, false));
+          assert(state.wants_sniff(1099, true));
+          assert(!state.wants_sniff(1100, false));
+          assert(state.wants_sniff(1100, true));
+          // Logical intent alone does not claim that bucket mode is physical.
+          assert(!state.should_publish());
+
+          state.set_radio_sniffing(true);
+          assert(state.radio_sniffing());
+          assert(state.should_publish());
+          state.start_sniff(0, 101);
+          assert(!state.bounded_active(101));
+          assert(!state.wants_sniff(101, false));
+          assert(state.wants_sniff(101, true));
+          // Cancel leaves the physical state for the reconciler to change.
+          assert(state.radio_sniffing());
+          assert(state.should_publish());
+
+          state.set_radio_sniffing(false);
+          assert(!state.radio_sniffing());
+          assert(!state.should_publish());
           return 0;
         }
         """,
@@ -930,7 +1067,6 @@ def test_firmware_wires_sniff_only_contract_without_rx_to_tx() -> None:
     assert "start_bucket_sniffing" not in interval_handler
 
     deferred_symbols = (
-        "listen_enabled",
         "session_nonce",
         "RxRadioState",
         "RX_KEEPALIVE_MS",
@@ -942,6 +1078,7 @@ def test_firmware_wires_sniff_only_contract_without_rx_to_tx() -> None:
     combined = package + rx_header + scheduler
     for symbol in deferred_symbols:
         assert symbol not in combined
+    assert "listen_enabled" not in package
     assert 'action == "listen"' not in combined
     assert "esphome::random_bytes" not in package
     assert 'root["nonce"]' not in package

@@ -64,38 +64,51 @@ class RxState {
 
   void start_sniff(uint8_t seconds, uint32_t now_ms) {
     if (seconds == 0) {
-      this->sniff_active_ = false;
-      this->sniff_until_ms_ = 0;
+      this->bounded_active_ = false;
+      this->bounded_until_ms_ = 0;
       return;
     }
 
-    this->expire_sniff_(now_ms);
+    this->expire_bounded_(now_ms);
     const uint32_t candidate = now_ms + static_cast<uint32_t>(seconds) * 1000U;
-    if (!this->sniff_active_ || static_cast<int32_t>(candidate - this->sniff_until_ms_) > 0)
-      this->sniff_until_ms_ = candidate;
-    this->sniff_active_ = true;
+    if (!this->bounded_active_ ||
+        static_cast<int32_t>(candidate - this->bounded_until_ms_) > 0) {
+      this->bounded_until_ms_ = candidate;
+    }
+    this->bounded_active_ = true;
   }
 
-  // Returns true exactly once when an active sniff expires so the caller can
-  // send Portisch A7 and leave the coprocessor receive mode.
-  bool tick(uint32_t now_ms) { return this->expire_sniff_(now_ms); }
-
-  bool should_publish(uint32_t now_ms) const {
-    return this->sniff_active_ && !deadline_reached(now_ms, this->sniff_until_ms_);
+  bool bounded_active(uint32_t now_ms) const {
+    return this->bounded_active_ && !deadline_reached(now_ms, this->bounded_until_ms_);
   }
+
+  // Returns true exactly once when a bounded sniff expires. Physical receive
+  // mode is reconciled separately and may remain active for idle-listen.
+  bool tick(uint32_t now_ms) { return this->expire_bounded_(now_ms); }
+
+  bool wants_sniff(uint32_t now_ms, bool listen_enabled) const {
+    return this->bounded_active(now_ms) || listen_enabled;
+  }
+
+  bool radio_sniffing() const { return this->radio_sniffing_; }
+
+  void set_radio_sniffing(bool on) { this->radio_sniffing_ = on; }
+
+  bool should_publish() const { return this->radio_sniffing_; }
 
  private:
-  bool expire_sniff_(uint32_t now_ms) {
-    if (!this->sniff_active_ || !deadline_reached(now_ms, this->sniff_until_ms_))
+  bool expire_bounded_(uint32_t now_ms) {
+    if (!this->bounded_active_ || !deadline_reached(now_ms, this->bounded_until_ms_))
       return false;
-    this->sniff_active_ = false;
-    this->sniff_until_ms_ = 0;
+    this->bounded_active_ = false;
+    this->bounded_until_ms_ = 0;
     return true;
   }
 
-  bool sniff_active_{false};
+  bool bounded_active_{false};
+  bool radio_sniffing_{false};
   bool positive_command_seen_{false};
-  uint32_t sniff_until_ms_{0};
+  uint32_t bounded_until_ms_{0};
   uint32_t last_positive_command_ms_{0};
 };
 
