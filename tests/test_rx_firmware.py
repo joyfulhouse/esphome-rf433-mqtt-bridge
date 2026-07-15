@@ -1066,13 +1066,15 @@ def test_firmware_wires_sniff_only_contract_without_rx_to_tx() -> None:
     assert "stop_advanced_sniffing" in interval_handler
     assert "start_bucket_sniffing" not in interval_handler
 
+    # State-sync (docs/design/2026-07-15-state-sync-firmware-design.md) intentionally
+    # lands the scheduler air-clear gate (rf_air_clear/rf_busy_until_), so those
+    # tripwires are retired. The symbols below remain surface we deliberately do NOT
+    # build (integration-central design), so they stay guarded.
     deferred_symbols = (
         "session_nonce",
         "RxRadioState",
         "RX_KEEPALIVE_MS",
-        "air_clear",
         "record_frame_sent",
-        "rf_busy_until_ms_",
         "completed_command_id",
     )
     combined = package + rx_header + scheduler
