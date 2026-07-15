@@ -304,12 +304,14 @@ interval:
           // writable when the trigger fires), and waiting for the 60s
           // republish would leave the bridge online-but-arealess, letting
           // controllers route this area's commands through a fallback
-          // bridge. One boolean gate keeps this branch effectively free.
-          if (id(mqtt_client)->is_connected()) {
-            if (!id(info_synced)) {
-              id(mqtt_client)->publish("rf433/${bridge_id}/info",
-                  "{\"bridge\":\"${bridge_id}\",\"area\":\"${bridge_area}\",\"default\":${default_bridge}}",
-                  0, true);
+          // bridge. The gate is armed only when publish() actually succeeds,
+          // so transient MQTT backpressure retries on the next 5 ms tick
+          // instead of suppressing the sync for up to a minute.
+          if (id(mqtt_client).is_connected()) {
+            if (!id(info_synced) &&
+                id(mqtt_client).publish("rf433/${bridge_id}/info",
+                    "{\"bridge\":\"${bridge_id}\",\"area\":\"${bridge_area}\",\"default\":${default_bridge}}",
+                    0, true)) {
               id(info_synced) = true;
             }
           } else {

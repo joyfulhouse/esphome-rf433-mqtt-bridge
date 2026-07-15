@@ -187,12 +187,6 @@ inline bool parse_target(const std::string &value, std::string &identity, uint16
   return false;
 }
 
-inline bool valid_target_key(const std::string &value) {
-  std::string identity;
-  uint16_t mask = 0;
-  return parse_target(value, identity, mask);
-}
-
 class TargetScheduler {
  public:
   explicit TargetScheduler(uint32_t repeat_gap_ms) : repeat_gap_ms_(repeat_gap_ms) {}
@@ -216,7 +210,11 @@ class TargetScheduler {
       reason = "command_id or canonical target key is invalid";
       return false;
     }
-    if (this->seen_recently_(command_id)) {
+    // A command still active (scheduled, or displaced and draining STOPs) or
+    // recently completed (ring) is a duplicate. Checking live state as well
+    // as the ring means a redelivery of a still-active command whose ring
+    // slot was evicted cannot be re-admitted and physically re-run.
+    if (this->seen_recently_(command_id) || this->is_active_(command_id)) {
       reason = "duplicate command_id";
       return false;
     }
@@ -289,6 +287,26 @@ class TargetScheduler {
   int replay_state(const std::string &command_id, uint32_t now_ms,
                    uint32_t &started_age_ms) const {
     started_age_ms = 0;
+    // Live scheduler state is authoritative for a still-active command and
+    // survives ring eviction: a currently scheduled command answers from
+    // commands_, and a displaced command still draining its fail-safe STOPs
+    // answers "displaced" from flush_stops_. Only once a command has fully
+    // left the scheduler does the RAM dedup ring supply its remembered
+    // outcome. This is why ring eviction of an active id's stale slot is
+    // harmless -- the ring is never the source of truth for an active id.
+    for (const auto &item : this->commands_) {
+      if (item.second.command_id == command_id) {
+        if (item.second.started) {
+          started_age_ms = now_ms - item.second.started_at_ms;
+          return 2;
+        }
+        return 1;
+      }
+    }
+    for (const FlushStop &entry : this->flush_stops_) {
+      if (entry.command_id == command_id)
+        return 4;
+    }
     for (const RecentCommand &recent : this->recent_ids_) {
       if (recent.command_id == command_id) {
         if (recent.state == 2)
@@ -371,6 +389,7 @@ class TargetScheduler {
         const std::string raw = this->phase_raw_(command);
         if (command.phase == Phase::ACTION && !command.started) {
           command.started = true;
+          command.started_at_ms = now_ms;
           started_command_id = command.command_id;
           this->mark_started_(command.command_id, now_ms);
           if (command.stop_after_ms > 0) {
@@ -417,6 +436,7 @@ class TargetScheduler {
     uint32_t stop_after_ms{0};
     uint32_t deadline_at{0};
     uint32_t next_at{0};
+    uint32_t started_at_ms{0};
     Phase phase{Phase::ACTION};
     bool started{false};
     bool deadline_armed{false};

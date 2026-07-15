@@ -30,6 +30,13 @@ def test_native_scheduler_keeps_per_target_timed_stops_and_frame_order(tmp_path:
 
 using rf433::TargetScheduler;
 
+// Test-only predicate: exercise the parser through its bool result.
+static bool valid_target_key(const std::string &value) {
+  std::string identity;
+  uint16_t mask = 0;
+  return rf433::parse_target(value, identity, mask);
+}
+
 int main() {
   const std::string frame =
       "AAB04D04081414026C01181414381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
@@ -59,14 +66,14 @@ int main() {
   // The same frame at the controller's embedded repeat of 8 (~1 s) passes.
   assert(rf433::normalize_b0("AAB0050108FFFF0855", normalized, reason));
 
-  assert(rf433::valid_target_key("a1b2c3:42:1,2,16"));
-  assert(!rf433::valid_target_key("target-a"));
-  assert(!rf433::valid_target_key("a1b2c3:42:2,1"));
-  assert(!rf433::valid_target_key("a1b2c3:42:0"));
-  assert(!rf433::valid_target_key("a1b2c3:42:17"));
+  assert(valid_target_key("a1b2c3:42:1,2,16"));
+  assert(!valid_target_key("target-a"));
+  assert(!valid_target_key("a1b2c3:42:2,1"));
+  assert(!valid_target_key("a1b2c3:42:0"));
+  assert(!valid_target_key("a1b2c3:42:17"));
   // A long digit run is rejected as the channel accumulator crosses 16, before
   // it can overflow the signed int (would otherwise be undefined behavior).
-  assert(!rf433::valid_target_key("a1b2c3:42:99999999999999999999"));
+  assert(!valid_target_key("a1b2c3:42:99999999999999999999"));
 
   TargetScheduler scheduler(35);
   const std::string target_a = "a1b2c3:42:1";
@@ -337,6 +344,38 @@ int main() {
   // remembered, so a redelivery after capacity drains is NOT silently
   // admitted. bz was budget-rejected in the flush-accounting block above.
   assert(budget2.replay_state("bz", 100, age) == 3);
+
+  // Live scheduler state is authoritative for replay and survives ring
+  // churn: an active timed command keeps answering "started" (never 0)
+  // even after enough admissions/rejections to sweep the whole dedup ring,
+  // so a QoS-1 redelivery can never re-run it. (This closes the ring-
+  // eviction re-run hole for a still-scheduled command.)
+  TargetScheduler live(35);
+  assert(live.schedule("live-1", "c0ffee:01:1", "L", "", 1, 3600000, "SL", 0,
+                       displaced, reason));
+  raw = live.next(0, started);
+  assert(raw && *raw == "L" && started == "live-1");
+  assert(live.replay_state("live-1", 100, age) == 2);  // started, from commands_
+  // 40 distinct valid admissions/rejections sweep the whole 32-slot ring
+  // (each varies the 6-hex prefix, so the targets are structurally valid;
+  // once the scheduler is full the surplus become remembered state-3
+  // rejections). live-1 stays active throughout.
+  const char *hexits = "0123456789abcdef";
+  for (int index = 0; index < 40; index++) {
+    std::string prefix = "c0ff";
+    prefix.push_back(hexits[(index >> 4) & 0xF]);
+    prefix.push_back(hexits[index & 0xF]);
+    const std::string target = prefix + ":02:1";
+    live.schedule("churn-" + std::to_string(index), target, "C", "", 1, 0, "",
+                  static_cast<uint32_t>(100 + index), displaced, reason);
+  }
+  assert(live.replay_state("live-1", 5000, age) == 2);  // still started
+  assert(age == 5000);
+  // A redelivery of the still-active command is rejected as a duplicate,
+  // never re-admitted (and re-run), regardless of ring occupancy.
+  assert(!live.schedule("live-1", "c0ffee:01:1", "L", "", 1, 3600000, "SL", 5000,
+                        displaced, reason));
+  assert(reason == "duplicate command_id");
 
   // A due scheduled fail-safe STOP alternates with flushed displaced STOPs
   // instead of waiting behind the entire flush queue.
