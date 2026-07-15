@@ -24,7 +24,7 @@ void RFBridgeComponent::finish_bucket_capture_(bool publish) {
   this->ack_();
   if (publish) {
     const std::string str = compact_hex(this->rx_buffer_);
-    ESP_LOGI(TAG, "Received RFBridge Bucket: %s", str.c_str());
+    ESP_LOGD(TAG, "Received RFBridge Bucket: %s", str.c_str());
     this->bucket_data_callback_.call(str);
   } else {
     ESP_LOGD(TAG, "Rejected non-AOK RFBridge Bucket frame");

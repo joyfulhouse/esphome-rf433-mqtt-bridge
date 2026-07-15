@@ -19,6 +19,7 @@ substitutions:
   friendly_name: Living Room RF Bridge
   bridge_area: living_room     # Home Assistant area ID, not its display name
   default_bridge: "true"       # "true" on exactly one bridge in your home
+  listen_enabled: "false"
   # With Home Assistant's Mosquitto add-on, the broker is your HA host.
   mqtt_broker: homeassistant.local
   mqtt_username: !secret mqtt_username
