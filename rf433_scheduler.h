@@ -12,6 +12,11 @@
 namespace rf433 {
 
 constexpr size_t MAX_B0_FRAME_BYTES = 260;
+// A valid frame is at most MAX_B0_FRAME_BYTES*2 hex chars (no whitespace); this
+// generous 4x input cap tolerates hand-entered spacing while rejecting a hostile
+// whitespace-padded /tx field BEFORE normalize_b0 reserves its length, so it
+// cannot force a multi-kilobyte transient heap allocation on the ESP8285.
+constexpr size_t MAX_B0_INPUT_CHARS = MAX_B0_FRAME_BYTES * 4;
 constexpr size_t MAX_TARGETS = 16;
 // Upper bound on the sum of all stored frame strings (raw + trailer + stop
 // across every scheduled target). The ESP8285 has roughly 30-40 KB of free
@@ -47,6 +52,12 @@ inline int hex_value(char value) {
 
 inline bool normalize_b0(const std::string &input, std::string &output, std::string &reason) {
   output.clear();
+  if (input.size() > MAX_B0_INPUT_CHARS) {
+    // Reject before reserving: the normalized frame can only be shorter, so a
+    // valid frame never trips this, but a padded hostile input is bounded here.
+    reason = "frame exceeds maximum size";
+    return false;
+  }
   output.reserve(input.size());
   for (const char value : input) {
     if (std::isspace(static_cast<unsigned char>(value)))

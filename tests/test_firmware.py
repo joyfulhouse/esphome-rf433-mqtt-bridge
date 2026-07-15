@@ -48,6 +48,11 @@ int main() {
   assert(!rf433::normalize_b0("AAB0GG55", normalized, reason));
   assert(!rf433::normalize_b0("AAB0010055", normalized, reason));
   assert(!rf433::normalize_b0("AAB005010000011155", normalized, reason));
+  // A whitespace-padded input beyond MAX_B0_INPUT_CHARS is rejected BEFORE its
+  // length is reserved, so a hostile /tx field cannot force a large transient
+  // heap allocation on the ESP8285.
+  assert(!rf433::normalize_b0(std::string(rf433::MAX_B0_INPUT_CHARS + 1, ' '), normalized, reason));
+  assert(reason == "frame exceeds maximum size");
 
   // The Portisch per-packet hardware repeat byte (hex chars 8..9) is validated:
   // force the valid frame's 08 repeat byte to FF and it is rejected.
