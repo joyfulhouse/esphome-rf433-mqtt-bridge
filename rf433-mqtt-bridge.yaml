@@ -242,7 +242,16 @@ mqtt:
               reject(std::string(key) + " must be a B0 string");
               return false;
             }
-            const std::string value = x[key].as<std::string>();
+            const char *raw_value = x[key].as<const char *>();
+            if (strlen(raw_value) > rf433::MAX_B0_INPUT_CHARS) {
+              // Bound the untrusted field length BEFORE materializing it as an
+              // owning std::string, so a padded hostile value cannot force a
+              // large pre-validation heap copy on the ESP8285 (normalize_b0's
+              // own guard only bounds its reserve, after this copy would exist).
+              reject(std::string(key) + " exceeds the maximum size");
+              return false;
+            }
+            const std::string value = raw_value;
             if (value.empty()) {
               // An explicitly empty optional field means "absent".
               if (required)
