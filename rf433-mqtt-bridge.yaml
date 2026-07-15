@@ -1,10 +1,12 @@
 # Reusable Sonoff RF Bridge R2/Portisch MQTT beacon package.
 #
-# The bridge is a deliberately dumb MQTT-to-433.92 MHz beacon: it contains no
+# The bridge is a deliberately dumb MQTT/433.92 MHz adapter: it contains no
 # device codes and no cover entities. A controller (for example the
 # joyfulhouse/zemismart-blinds Home Assistant integration) publishes correlated
 # JSON commands to rf433/<bridge_id>/tx; the beacon validates, schedules, and
-# transmits Portisch B0 frames, acknowledging on rf433/<bridge_id>/status.
+# transmits Portisch B0 frames, acknowledging on rf433/<bridge_id>/status. A
+# bounded onboarding sniff publishes accepted Portisch B1 captures to
+# rf433/<bridge_id>/rx without ever feeding them into TX.
 #
 # Include this file from one small per-bridge YAML and override at least:
 #   bridge_id, friendly_name, bridge_area, api_encryption_key, ota_password,
@@ -36,7 +38,15 @@ esphome:
   name: ${bridge_id}
   friendly_name: ${friendly_name}
   includes:
+    - rf433_rx.h
     - rf433_scheduler.h
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components:
+      - rf_bridge
 
 esp8266:
   board: esp01_1m
@@ -55,6 +65,20 @@ uart:
 rf_bridge:
   id: portisch_rf_bridge
   uart_id: rf_uart
+  on_bucket_received:
+    then:
+      - lambda: |-
+          const uint32_t captured_ms = millis();
+          if (!rf433::rx_state().should_publish(captured_ms))
+            return;
+          // An RX observation is controller input only. It never enters the
+          // scheduler, invokes the transmitter, or proves motor movement.
+          if (!id(mqtt_client).publish_json("rf433/${bridge_id}/rx", [=](JsonObject root) {
+                root["frame"] = data;
+                root["t"] = captured_ms;
+              }, 1, false)) {
+            ESP_LOGW("rf433", "Failed to enqueue RX observation");
+          }
 
 # The per-bridge scheduler lives as a function-local static in
 # rf433_scheduler.h (rf433::tx_scheduler), NOT an ESPHome `globals:` entry:
@@ -91,9 +115,8 @@ mqtt:
   discovery: false
   # The bridge speaks ONLY the documented rf433/ contract: no ESPHome IP
   # discovery metadata, no retained debug log topic (it would leak the last
-  # complete RF identity), and no auto component state/command topics (the
-  # sniffing buttons stay reachable through the native API alone -- an MQTT
-  # command topic would let any broker client toggle sniffing).
+  # complete RF identity), and no auto component state/command topics. The only
+  # broker-side RX control is the bounded /cmd sniff contract below.
   discover_ip: false
   log_topic:
   topic_prefix:
@@ -118,7 +141,7 @@ mqtt:
   # reconnects; a separate on_connect action and a periodic republish would
   # only duplicate that.
   on_json_message:
-    topic: rf433/${bridge_id}/tx
+  - topic: rf433/${bridge_id}/tx
     qos: 1
     then:
       - lambda: |-
@@ -275,6 +298,37 @@ mqtt:
           }
           publish_status("accepted", "");
 
+  - topic: rf433/${bridge_id}/cmd
+    qos: 1
+    then:
+      - lambda: |-
+          if (!x["action"].is<const char *>()) {
+            ESP_LOGW("rf433", "Rejected RX command: action must be a string");
+            return;
+          }
+          const std::string action = x["action"].as<std::string>();
+          const bool seconds_is_integer = x["seconds"].is<int>();
+          const auto command = rf433::validate_rx_command(
+              action, seconds_is_integer, seconds_is_integer ? x["seconds"].as<int>() : 0);
+          if (command.action == rf433::RxCommandAction::INVALID) {
+            ESP_LOGW("rf433", "Rejected RX command %s: %s", action.c_str(), command.error);
+            return;
+          }
+
+          const uint32_t now_ms = millis();
+          if (!rf433::rx_state().command_allowed(now_ms, command)) {
+            ESP_LOGW("rf433", "Rejected rate-limited RX command");
+            return;
+          }
+          rf433::rx_state().start_sniff(command.seconds, now_ms);
+          if (command.seconds == 0) {
+            id(portisch_rf_bridge).stop_advanced_sniffing();
+            ESP_LOGI("rf433", "Bucket sniffing cancelled");
+          } else {
+            id(portisch_rf_bridge).start_bucket_sniffing();
+            ESP_LOGI("rf433", "Bucket sniffing active for up to %u seconds", command.seconds);
+          }
+
 globals:
   - id: next_info_ms
     type: uint32_t
@@ -295,13 +349,17 @@ interval:
           // advanced only when publish() succeeds, so a failed publish retries
           // on the next tick rather than being suppressed for a minute.
           const uint32_t now_ms = millis();
+          if (rf433::rx_state().tick(now_ms))
+            id(portisch_rf_bridge).stop_advanced_sniffing();
           if (!id(mqtt_client).is_connected()) {
             // Hold the timer due so the first tick after a reconnect
             // republishes retained info immediately.
             id(next_info_ms) = now_ms;
           } else if (static_cast<int32_t>(now_ms - id(next_info_ms)) >= 0 &&
-                     id(mqtt_client).publish("rf433/${bridge_id}/info",
-                         "{\"bridge\":\"${bridge_id}\",\"area\":\"${bridge_area}\",\"default\":${default_bridge}}",
+                     id(mqtt_client).publish(
+                         std::string("rf433/${bridge_id}/info"),
+                         std::string(
+                             "{\"bridge\":\"${bridge_id}\",\"area\":\"${bridge_area}\",\"default\":${default_bridge}}"),
                          0, true)) {
             id(next_info_ms) = now_ms + 60000;
           }
@@ -322,29 +380,3 @@ interval:
           // UART. ESPHome's rf_bridge send_raw does not wait for an EFM8BB1
           // ack, so `started` is proof of dispatch, not of RF emission.
           publish_status("started", started_command_id);
-
-button:
-  - platform: template
-    name: Start advanced sniffing
-    icon: mdi:radio-tower
-    entity_category: diagnostic
-    on_press:
-      - rf_bridge.start_advanced_sniffing
-
-  - platform: template
-    name: Start bucket sniffing
-    icon: mdi:waveform
-    entity_category: diagnostic
-    on_press:
-      - rf_bridge.start_bucket_sniffing
-
-  - platform: template
-    name: Stop advanced sniffing
-    icon: mdi:stop-circle-outline
-    entity_category: diagnostic
-    on_press:
-      - rf_bridge.stop_advanced_sniffing
-
-# PHASE 2 TODO: stock ESPHome logs B1 bucket frames but exposes no
-# on_bucket_received/on_raw_received trigger. Add the planned external rf_bridge
-# component before publishing rf433/${bridge_id}/rx. Do not infer RX from TX.

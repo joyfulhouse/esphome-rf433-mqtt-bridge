@@ -1,7 +1,8 @@
 # ESPHome RF433 MQTT Bridge
 
-ESPHome beacon firmware that turns a **Sonoff RF Bridge R2** (Portisch) into a dumb, reliable
-MQTT-to-433.92 MHz transmitter with correlated acknowledgements and per-target scheduling.
+ESPHome firmware that turns a **Sonoff RF Bridge R2** (Portisch) into a dumb, reliable
+MQTT-to-433.92 MHz transmitter with correlated acknowledgements, per-target scheduling, and
+time-boxed RF capture for onboarding.
 
 [![License][license-shield]](LICENSE)
 [![CI][ci-shield]][ci]
@@ -34,11 +35,13 @@ validates, schedules, and transmits Portisch **B0** raw frames.
   after a reboot: **retained `tx` publishes are unsupported and dangerous — never publish them.**
 - **Bounded memory** — admission enforces a total stored-frame budget sized for the ESP8285 heap.
 - **Retained discovery** — the beacon publishes retained `availability` (birth/will) and `info`
-  (area, default flag) so controllers can discover online bridges and prefer one in the same area.
+  (area and default flag) so controllers can discover online bridges and prefer one in the same
+  area.
 - **Strict input validation** — B0 frames, target keys, repeat counts, and stop deadlines are
   validated on-device before anything reaches the RF coprocessor.
-- **Diagnostics** — Portisch advanced/bucket sniffing exposed as diagnostic buttons for protocol
-  capture work.
+- **Time-boxed onboarding capture** — validated Portisch **B1** raw-bucket captures are published
+  for controller-side decoding only during an active sniff of at most 60 seconds. Receive is off by
+  default on every boot.
 
 ## MQTT topic contract
 
@@ -46,10 +49,12 @@ All topics live under the fixed `rf433/` root:
 
 | Topic | Direction | Payload |
 |---|---|---|
-| `rf433/<bridge_id>/availability` | bridge → broker (retained) | `online` / `offline` |
-| `rf433/<bridge_id>/info` | bridge → broker (retained) | `{"bridge","area","default"}` |
-| `rf433/<bridge_id>/tx` | controller → bridge | JSON command (below) |
-| `rf433/<bridge_id>/status` | bridge → controller | `{"status","command_id"[,"reason"][,"age_ms"]}` |
+| `rf433/<bridge_id>/availability` | bridge → broker (QoS 0, retained) | `online` / `offline` |
+| `rf433/<bridge_id>/info` | bridge → broker (QoS 0, retained) | `{"bridge":"rf433-bridge","area":"living_room","default":false}` |
+| `rf433/<bridge_id>/tx` | controller → bridge (QoS 1, non-retained) | JSON transmit command (below) |
+| `rf433/<bridge_id>/status` | bridge → controller (QoS 1, non-retained) | `{"status","command_id"[,"reason"][,"age_ms"]}` |
+| `rf433/<bridge_id>/rx` | bridge → broker (QoS 1, non-retained) | `{"frame":"AAB1...55","t":123456}` |
+| `rf433/<bridge_id>/cmd` | controller → bridge (QoS 1, non-retained) | `{"action":"sniff","seconds":30}` or `{"action":"sniff","seconds":0}` |
 
 `status` is `accepted`, `rejected` (with `reason`), `started` (first RF dispatch), or `displaced`
 (a newer overlapping command replaced this one — see below).
@@ -78,6 +83,37 @@ Command body on `tx`:
 `target` is `prefix:remote_id:channels` (lowercase hex, strictly increasing channels 1..16).
 `trailer_raw`, `stop_after_ms`, and `stop_raw` are optional; a timed command requires `stop_raw`.
 
+### Time-boxed onboarding sniff
+
+Receive is **default OFF** on every boot. This is a privacy boundary: ambient 433 MHz traffic can
+identify nearby remotes and activity. On startup the bridge unconditionally sends Portisch
+stop-sniff (A7) and clears any partial B1 capture, including after an ESP-only restart where the
+independently running EFM8BB1 may still be sniffing.
+
+`/cmd` accepts exactly one action. Publish `{"action":"sniff","seconds":30}` at QoS 1 with retain
+disabled to start or extend a bucket sniff. Integer values from 1 through 60 select the window;
+larger integers are hard-capped at 60, and another positive command never shortens an active
+window. Positive commands are limited to one every 250 ms.
+`{"action":"sniff","seconds":0}` immediately cancels the sniff, clears its bounded state, and sends
+A7. Cancellation is exempt from the rate limiter. A replayed retained positive command is benign
+because every sniff auto-expires, but controllers must still publish `/cmd` with retain disabled.
+
+Only while that sniff is active, every accepted AOK-prefiltered B1 capture is forwarded to `/rx`
+as QoS 1, non-retained JSON. `frame` is the compact uppercase Portisch frame, including `AAB1` and
+the final `55`; `t` is the bridge's plain `millis()` value when the callback runs. A failed MQTT
+enqueue is logged.
+
+RX is observation only, not motor feedback. The receive handler never calls `send_raw`, enters the
+TX scheduler, or otherwise triggers TX. Continuous listen, post-TX receive re-arm, keepalive, and
+live state-sync are not included in this slice; they are planned follow-up work.
+
+> **TODO — HARDWARE-VALIDATION:** The current host AOK fixtures are synthesized from parser
+> assumptions; no real OEM-captured golden `AAB1…55` sample exists in this repository. The hardware
+> spike must add UP/DOWN/STOP captures across identities and channels, including timing jitter.
+> Before fleet use, also verify that cancellation A7 cleanly exits an in-flight B1 capture, real
+> captures contain the OEM `[1, 0]` trailer required by the filter, and ACKing accepted, rejected,
+> short, and timed-out B1 transport frames is benign. These physical checks remain deferred.
+
 ## Hardware
 
 - **Sonoff RF Bridge R2** with the EFM8BB1 RF coprocessor flashed to
@@ -91,8 +127,22 @@ Command body on `tx`:
 Any MQTT broker works — with Home Assistant's Mosquitto add-on (the common setup), the broker is
 simply your HA host; a standalone broker works identically.
 
-1. Copy `rf433-mqtt-bridge.yaml`, `rf433_scheduler.h`, and `examples/living-room.yaml` into one
-   directory, renaming the example for your device.
+1. Copy the package, both headers, the complete local component directory, and an example renamed
+   for your device while preserving this layout:
+
+   ```text
+   your-esphome-config/
+   ├── living-room.yaml
+   ├── rf433-mqtt-bridge.yaml
+   ├── rf433_scheduler.h
+   ├── rf433_rx.h
+   └── components/
+       └── rf_bridge/
+   ```
+
+   `rf433-mqtt-bridge.yaml` loads `components/rf_bridge/` as a local external component. Keep that
+   directory intact rather than flattening it. It is vendored from ESPHome 2026.6.5's
+   `esphome/components/rf_bridge` and extended with the B1 receive callback used by this package.
 2. Create `secrets.yaml` from `secrets.example.yaml`.
 3. Adjust the substitutions (bridge id, area, broker, credentials). Set `default_bridge: "true"`
    on exactly one bridge in your home. Networking is DHCP by default; a commented `manual_ip`
@@ -100,7 +150,7 @@ simply your HA host; a standalone broker works identically.
 4. Validate and flash with the hardware-tested ESPHome release:
 
 ```shell
-uvx --from "esphome==2026.6.5" esphome config living-room.yaml
+uvx --from "esphome==2026.6.5" esphome compile living-room.yaml
 uvx --from "esphome==2026.6.5" esphome run living-room.yaml
 ```
 
@@ -112,16 +162,19 @@ The C++ target scheduler and the package contract are tested on the host:
 
 ```shell
 uv sync
+uv run ruff check .
+uv run ruff format --check .
 uv run pytest
-uv run ruff check . && uv run ruff format --check .
 ```
+
+CI stages `secrets.example.yaml` as `secrets.yaml`, copies `examples/living-room.yaml` beside the
+package, headers, and `components/`, and performs the same full
+`esphome compile living-room.yaml` build.
 
 ## Roadmap
 
-- **RX/listen (Phase 2):** stock ESPHome logs Portisch B1 raw-bucket captures but exposes no
-  `on_bucket_received` trigger. A planned external `rf_bridge` component will publish B1 data to
-  `rf433/<bridge_id>/rx` for controller-side decode. RX is not motor feedback and must never
-  trigger TX.
+- **Continuous listen/live state-sync:** planned follow-up after the bounded Learn/onboarding
+  capture path has real OEM hardware fixtures.
 
 ## Support Development
 

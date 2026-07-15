@@ -1,7 +1,7 @@
 [project]
 name = "esphome-rf433-mqtt-bridge"
 version = "1.0.0"
-description = "ESPHome MQTT beacon firmware for the Sonoff RF Bridge R2 (Portisch) — correlated, scheduled 433.92 MHz B0 transmission"
+description = "ESPHome MQTT firmware for scheduled RF433 transmission and opt-in AOK reception"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
