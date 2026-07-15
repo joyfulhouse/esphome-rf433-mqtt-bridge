@@ -66,6 +66,12 @@ rf_bridge:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # A Wi-Fi-loss reboot would drop the scheduler's RAM-held fail-safe STOPs: a
+  # long timed move (stop_after_ms up to 3_600_000) can outlive the default
+  # 15 min reboot_timeout, and the 5 ms tick dispatches STOPs over UART with no
+  # need for connectivity. Disable the reboot to match api/mqtt so a transient
+  # Wi-Fi drop never strands a blind mid-travel with its STOP unsent.
+  reboot_timeout: 0s
 
 api:
   reboot_timeout: 0s

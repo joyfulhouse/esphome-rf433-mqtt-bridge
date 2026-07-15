@@ -356,12 +356,14 @@ int main() {
   raw = live.next(0, started);
   assert(raw && *raw == "L" && started == "live-1");
   assert(live.replay_state("live-1", 100, age) == 2);  // started, from commands_
-  // 40 distinct valid admissions/rejections sweep the whole 32-slot ring
+  // 80 distinct valid admissions/rejections sweep the whole 64-slot ring
   // (each varies the 6-hex prefix, so the targets are structurally valid;
   // once the scheduler is full the surplus become remembered state-3
-  // rejections). live-1 stays active throughout.
+  // rejections). 80 > COMMAND_ID_RING_SIZE, so live-1's own ring slot is
+  // evicted mid-churn, yet live-1 stays active (answered from commands_)
+  // throughout — proving live state, not the ring, gates the redelivery.
   const char *hexits = "0123456789abcdef";
-  for (int index = 0; index < 40; index++) {
+  for (int index = 0; index < 80; index++) {
     std::string prefix = "c0ff";
     prefix.push_back(hexits[(index >> 4) & 0xF]);
     prefix.push_back(hexits[index & 0xF]);
