@@ -429,6 +429,163 @@ int main() {
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
+def test_native_scheduler_idle_air_clear_and_atomic_disarm(tmp_path: Path) -> None:
+    """Exercise idle-listen gates and physical-takeover cancellation."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
+    source = tmp_path / "scheduler_state_sync_test.cpp"
+    binary = tmp_path / "scheduler_state_sync_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+#include "rf433_scheduler.h"
+
+using rf433::TargetScheduler;
+
+int main() {
+  const std::string target_a = "a1b2c3:42:1";
+  const std::string target_b = "a1b2c3:42:2";
+  std::string started;
+  std::string reason;
+  std::vector<std::string> displaced;
+
+  // A fresh scheduler is logically idle and physically air-clear. A command
+  // makes it non-idle until its final frame is handed off.
+  TargetScheduler idle_scheduler(35);
+  assert(idle_scheduler.idle());
+  assert(idle_scheduler.rf_air_clear(0));
+  assert(idle_scheduler.schedule("idle-command", target_a, "A", "", 1, 0, "", 0,
+                                 displaced, reason));
+  assert(!idle_scheduler.idle());
+  auto raw = idle_scheduler.next(0, started);
+  assert(raw && *raw == "A");
+  assert(idle_scheduler.idle());
+
+  // A displaced fail-safe STOP alone also keeps the scheduler non-idle.
+  TargetScheduler flush_idle(35);
+  assert(flush_idle.schedule("flush-original", target_a, "A", "", 1, 1000, "SA", 0,
+                             displaced, reason));
+  raw = flush_idle.next(0, started);
+  assert(raw && *raw == "A");
+  assert(flush_idle.schedule("flush-replacement", target_a, "B", "", 1, 0, "", 1,
+                             displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "flush-original");
+  flush_idle.disarm("flush-replacement");
+  assert(!flush_idle.idle());
+  raw = flush_idle.next(35, started);
+  assert(raw && *raw == "SA");
+  assert(flush_idle.idle());
+
+  // This existing synthetic B0 fixture has 1,048,560 us of on-air time:
+  // two 0xFFFF-us pulses repeated eight times. Millisecond ceiling plus the
+  // 5 ms handoff margin makes it air-clear 1,054 ms after dispatch.
+  const std::string airtime_frame = "AAB0050108FFFF0855";
+  TargetScheduler air_scheduler(35);
+  assert(air_scheduler.rf_air_clear(100));
+  assert(air_scheduler.schedule("air-command", target_a, airtime_frame, "", 1, 0, "", 100,
+                                displaced, reason));
+  raw = air_scheduler.next(100, started);
+  assert(raw && *raw == airtime_frame);
+  assert(!air_scheduler.rf_air_clear(100));
+  assert(!air_scheduler.rf_air_clear(1153));
+  assert(air_scheduler.rf_air_clear(1154));
+
+  // The same signed serial-number comparison remains correct when the busy
+  // deadline wraps through UINT32_MAX.
+  TargetScheduler wrap_scheduler(35);
+  const uint32_t wrap_start = std::numeric_limits<uint32_t>::max() - 500U;
+  const uint32_t wrap_clear_at = wrap_start + 1054U;
+  assert(wrap_clear_at == 553U);
+  assert(wrap_scheduler.rf_air_clear(wrap_start));
+  assert(wrap_scheduler.schedule("wrap-air", target_b, airtime_frame, "", 1, 0, "",
+                                 wrap_start, displaced, reason));
+  raw = wrap_scheduler.next(wrap_start, started);
+  assert(raw && *raw == airtime_frame);
+  assert(!wrap_scheduler.rf_air_clear(wrap_start));
+  assert(!wrap_scheduler.rf_air_clear(wrap_clear_at - 1U));
+  assert(wrap_scheduler.rf_air_clear(wrap_clear_at));
+
+  // Disarming a live command atomically removes its remaining ACTION,
+  // TRAILER, and fail-safe STOP frames without disturbing a concurrent target.
+  TargetScheduler concurrent(35);
+  assert(concurrent.schedule("command-a", target_a, "A", "TA", 2, 100, "SA", 0,
+                             displaced, reason));
+  assert(concurrent.schedule("command-b", target_b, "B", "", 2, 0, "", 0,
+                             displaced, reason));
+  raw = concurrent.next(0, started);
+  assert(raw && *raw == "A" && started == "command-a");
+  raw = concurrent.next(35, started);
+  assert(raw && *raw == "B" && started == "command-b");
+  concurrent.disarm("command-a");
+  uint32_t age = 0;
+  assert(concurrent.replay_state("command-a", 40, age) == 4);
+  raw = concurrent.next(70, started);
+  assert(raw && *raw == "B" && started.empty());
+  assert(!concurrent.next(105, started));
+  assert(!concurrent.next(1000, started));
+  assert(concurrent.idle());
+
+  // Disarming a displaced command purges every owed STOP copy parked in the
+  // flush queue, allowing its replacement to run normally.
+  TargetScheduler purge(35);
+  assert(purge.schedule("purge-original", target_a, "A", "", 3, 1000, "SA", 0,
+                        displaced, reason));
+  raw = purge.next(0, started);
+  assert(raw && *raw == "A");
+  assert(purge.schedule("purge-replacement", target_a, "B", "", 1, 0, "", 1,
+                        displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "purge-original");
+  purge.disarm("purge-original");
+  purge.disarm("purge-original");
+  assert(purge.replay_state("purge-original", 2, age) == 4);
+  raw = purge.next(35, started);
+  assert(raw && *raw == "B" && started == "purge-replacement");
+  assert(!purge.next(70, started));
+
+  // A disarm may arrive before its /tx. The unconditional terminal tombstone
+  // makes repeated disarms emission-free and forces the reordered original
+  // command to resolve as the existing terminal/displaced no-op state.
+  TargetScheduler reordered(35);
+  reordered.disarm("reordered-command");
+  reordered.disarm("reordered-command");
+  assert(reordered.idle());
+  assert(!reordered.next(0, started));
+  assert(reordered.replay_state("reordered-command", 0, age) == 4);
+  assert(!reordered.schedule("reordered-command", target_a, "A", "", 1, 1000, "SA", 0,
+                             displaced, reason));
+  assert(reason == "duplicate command_id");
+  assert(reordered.replay_state("reordered-command", 0, age) == 4);
+  assert(!reordered.next(1000, started));
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
 def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     """Firmware reports admission plus the first actual RF ACTION dispatch."""
     package = BRIDGE_YAML.read_text()

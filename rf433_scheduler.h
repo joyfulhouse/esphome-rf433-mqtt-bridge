@@ -50,8 +50,10 @@ inline int hex_value(char value) {
   return -1;
 }
 
-inline bool normalize_b0(const std::string &input, std::string &output, std::string &reason) {
+inline bool normalize_b0_with_airtime(const std::string &input, std::string &output,
+                                      std::string &reason, uint64_t &frame_airtime_us) {
   output.clear();
+  frame_airtime_us = 0;
   if (input.size() > MAX_B0_INPUT_CHARS) {
     // Reject before reserving: the normalized frame can only be shorter, so a
     // valid frame never trips this, but a padded hostile input is bounded here.
@@ -138,12 +140,19 @@ inline bool normalize_b0(const std::string &input, std::string &output, std::str
     }
     airtime_us += bucket_us[bucket];
   }
-  if (airtime_us * embedded_repeat > MAX_FRAME_AIRTIME_US) {
+  const uint64_t total_airtime_us = airtime_us * embedded_repeat;
+  if (total_airtime_us > MAX_FRAME_AIRTIME_US) {
     reason = "frame requested airtime exceeds limit";
     return false;
   }
+  frame_airtime_us = total_airtime_us;
   reason.clear();
   return true;
+}
+
+inline bool normalize_b0(const std::string &input, std::string &output, std::string &reason) {
+  uint64_t frame_airtime_us = 0;
+  return normalize_b0_with_airtime(input, output, reason, frame_airtime_us);
 }
 
 inline bool valid_key(const std::string &value) {
@@ -207,6 +216,31 @@ inline bool parse_target(const std::string &value, std::string &identity, uint16
 class TargetScheduler {
  public:
   explicit TargetScheduler(uint32_t repeat_gap_ms) : repeat_gap_ms_(repeat_gap_ms) {}
+
+  bool idle() const { return this->commands_.empty() && this->flush_stops_.empty(); }
+
+  bool rf_air_clear(uint32_t now_ms) const {
+    return !this->rf_dispatched_ || due_(now_ms, this->rf_busy_until_);
+  }
+
+  // Abort every future frame for this id and retain the same terminal state
+  // used by displacement so a reordered original command cannot be admitted.
+  void disarm(const std::string &command_id) {
+    std::string target;
+    for (const auto &item : this->commands_) {
+      if (item.second.command_id == command_id) {
+        target = item.first;
+        break;
+      }
+    }
+    if (!target.empty())
+      this->erase_(target);
+    this->flush_stops_.erase(
+        std::remove_if(this->flush_stops_.begin(), this->flush_stops_.end(),
+                       [&command_id](const FlushStop &entry) { return entry.command_id == command_id; }),
+        this->flush_stops_.end());
+    this->remember_(command_id, 4);
+  }
 
   // Admits one command. Latest command wins: any already-scheduled target on
   // the same remote whose channels intersect the new target (including the
@@ -279,6 +313,9 @@ class TargetScheduler {
     command.raw = raw;
     command.trailer_raw = trailer_raw;
     command.stop_raw = stop_raw;
+    command.raw_airtime_ms = frame_airtime_ms_(raw);
+    command.trailer_airtime_ms = frame_airtime_ms_(trailer_raw);
+    command.stop_airtime_ms = frame_airtime_ms_(stop_raw);
     command.repeats = repeats;
     command.remaining = repeats;
     command.stop_after_ms = stop_after_ms;
@@ -383,10 +420,12 @@ class TargetScheduler {
         FlushStop entry = std::move(this->flush_stops_.front());
         this->flush_stops_.erase(this->flush_stops_.begin());
         const std::string raw = entry.raw;
+        const uint32_t airtime_ms = entry.airtime_ms;
         if (--entry.remaining > 0)
           this->flush_stops_.push_back(std::move(entry));
         this->next_rf_at_ = now_ms + this->repeat_gap_ms_;
         this->flush_last_ = true;
+        this->record_dispatch_(now_ms, airtime_ms);
         return raw;
       }
       this->flush_last_ = false;
@@ -404,6 +443,7 @@ class TargetScheduler {
           continue;
 
         const std::string raw = this->phase_raw_(command);
+        const uint32_t airtime_ms = this->phase_airtime_ms_(command);
         if (command.phase == Phase::ACTION && !command.started) {
           command.started = true;
           command.started_at_ms = now_ms;
@@ -424,6 +464,7 @@ class TargetScheduler {
         this->cursor_ = (index + 1) % count;
         if (complete)
           this->erase_(target);
+        this->record_dispatch_(now_ms, airtime_ms);
         return raw;
       }
     }
@@ -439,6 +480,7 @@ class TargetScheduler {
     std::string raw;
     int remaining{0};
     std::string command_id;
+    uint32_t airtime_ms{0};
   };
 
   struct Command {
@@ -448,6 +490,9 @@ class TargetScheduler {
     std::string raw;
     std::string trailer_raw;
     std::string stop_raw;
+    uint32_t raw_airtime_ms{0};
+    uint32_t trailer_airtime_ms{0};
+    uint32_t stop_airtime_ms{0};
     int repeats{1};
     int remaining{1};
     uint32_t stop_after_ms{0};
@@ -484,7 +529,8 @@ class TargetScheduler {
         // displaced mid-STOP. They go on air one per pacing gap; the frame is
         // stored once with its send count.
         const int copies = command.phase == Phase::STOP ? command.remaining : command.repeats;
-        this->flush_stops_.push_back(FlushStop{command.stop_raw, copies, command.command_id});
+        this->flush_stops_.push_back(
+            FlushStop{command.stop_raw, copies, command.command_id, command.stop_airtime_ms});
       }
       this->mark_displaced_(command.command_id);
       displaced_ids.push_back(command.command_id);
@@ -524,6 +570,12 @@ class TargetScheduler {
     // consult live scheduler state (commands_/flush_stops_) authoritatively,
     // so an evicted active id is still recognized as a duplicate. The ring
     // only shortens the dedup window for already-completed command ids.
+    for (RecentCommand &recent : this->recent_ids_) {
+      if (recent.command_id == command_id) {
+        recent = RecentCommand{command_id, state, 0};
+        return;
+      }
+    }
     for (size_t probe = 0; probe < COMMAND_ID_RING_SIZE; probe++) {
       RecentCommand &slot = this->recent_ids_[this->recent_cursor_];
       this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
@@ -559,12 +611,38 @@ class TargetScheduler {
     return static_cast<int32_t>(now_ms - deadline_ms) >= 0;
   }
 
+  static uint32_t frame_airtime_ms_(const std::string &raw) {
+    if (raw.empty())
+      return 0;
+    std::string normalized;
+    std::string reason;
+    uint64_t airtime_us = 0;
+    // MQTT admission supplies validated frames. Keep direct callers that
+    // bypass it conservative without duplicating the B0 bucket parser.
+    if (!normalize_b0_with_airtime(raw, normalized, reason, airtime_us))
+      airtime_us = MAX_FRAME_AIRTIME_US;
+    return static_cast<uint32_t>((airtime_us + 999U) / 1000U);
+  }
+
+  void record_dispatch_(uint32_t now_ms, uint32_t airtime_ms) {
+    this->rf_busy_until_ = now_ms + airtime_ms + RF_AIRTIME_MARGIN_MS;
+    this->rf_dispatched_ = true;
+  }
+
   const std::string &phase_raw_(const Command &command) const {
     if (command.phase == Phase::TRAILER)
       return command.trailer_raw;
     if (command.phase == Phase::STOP)
       return command.stop_raw;
     return command.raw;
+  }
+
+  uint32_t phase_airtime_ms_(const Command &command) const {
+    if (command.phase == Phase::TRAILER)
+      return command.trailer_airtime_ms;
+    if (command.phase == Phase::STOP)
+      return command.stop_airtime_ms;
+    return command.raw_airtime_ms;
   }
 
   // Phase transitions leave next_at alone: the caller re-arms pacing for any
@@ -603,16 +681,20 @@ class TargetScheduler {
   // One recent command's remembered lifecycle, used to answer QoS-1 broker
   // redeliveries idempotently instead of rejecting (or re-running) the
   // duplicate. state: 1 admitted, 2 started (at started_at_ms), 3 rejected
-  // by a state-dependent admission check.
+  // by a state-dependent admission check, 4 displaced or disarmed (terminal).
   struct RecentCommand {
     std::string command_id;
     uint8_t state{0};
     uint32_t started_at_ms{0};
   };
 
+  // Keep one 5 ms scheduler tick beyond the ceiled frame airtime before RX.
+  static constexpr uint32_t RF_AIRTIME_MARGIN_MS = 5;
   uint32_t repeat_gap_ms_;
   std::optional<uint32_t> next_rf_at_;
+  uint32_t rf_busy_until_{0};
   size_t cursor_{0};
+  bool rf_dispatched_{false};
   bool flush_last_{false};
   std::map<std::string, Command> commands_;
   std::vector<std::string> order_;
