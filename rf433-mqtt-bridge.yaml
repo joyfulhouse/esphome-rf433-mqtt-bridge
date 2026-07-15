@@ -270,32 +270,34 @@ mqtt:
           publish_status("accepted", "");
 
 globals:
-  - id: info_synced
-    type: bool
-    initial_value: "false"
+  - id: next_info_ms
+    type: uint32_t
+    initial_value: "0"
 
 interval:
   - interval: 5ms
     then:
       - lambda: |-
-          // Publish retained info the moment the client is actually ready.
-          // A plain on_connect publish has been observed to drop in the field
+          // Publish retained info from the dispatch tick, in one place. A
+          // plain on_connect publish has been observed to drop in the field
           // (fleet-wide, ESPHome 2026.6.5 — the client is not yet writable
-          // when that trigger fires), which silently degrades controllers'
-          // area-aware bridge selection. This one-shot gate self-heals across
-          // reconnects and retries on transient backpressure, subsuming both
-          // the on_connect action and a periodic republish. The gate is armed
-          // only when publish() actually succeeds, so a failed publish retries
-          // on the next 5 ms tick instead of being suppressed.
-          if (id(mqtt_client).is_connected()) {
-            if (!id(info_synced) &&
-                id(mqtt_client).publish("rf433/${bridge_id}/info",
-                    "{\"bridge\":\"${bridge_id}\",\"area\":\"${bridge_area}\",\"default\":${default_bridge}}",
-                    0, true)) {
-              id(info_synced) = true;
-            }
-          } else {
-            id(info_synced) = false;
+          // when that trigger fires), silently degrading controllers'
+          // area-aware bridge selection. Publishing the moment the client is
+          // ready fixes that, and republishing at most once a minute repairs
+          // retained metadata lost while the connection stays up (a broker
+          // that drops retained state without disconnecting). next_info_ms is
+          // advanced only when publish() succeeds, so a failed publish retries
+          // on the next tick rather than being suppressed for a minute.
+          const uint32_t now_ms = millis();
+          if (!id(mqtt_client).is_connected()) {
+            // Hold the timer due so the first tick after a reconnect
+            // republishes retained info immediately.
+            id(next_info_ms) = now_ms;
+          } else if (static_cast<int32_t>(now_ms - id(next_info_ms)) >= 0 &&
+                     id(mqtt_client).publish("rf433/${bridge_id}/info",
+                         "{\"bridge\":\"${bridge_id}\",\"area\":\"${bridge_area}\",\"default\":${default_bridge}}",
+                         0, true)) {
+            id(next_info_ms) = now_ms + 60000;
           }
           std::string started_command_id;
           const auto raw = rf433::tx_scheduler(${repeat_gap_ms}).next(millis(), started_command_id);

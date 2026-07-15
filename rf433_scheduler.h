@@ -28,8 +28,14 @@ constexpr uint64_t MAX_FRAME_AIRTIME_US = 2000000;
 // Recently admitted command IDs, used to drop QoS-1 broker redeliveries and
 // same-boot retained replays. The ring lives in RAM, so it cannot suppress a
 // retained command replayed after a reboot -- retained tx publishes are
-// unsupported (see README). Sized to comfortably span an in-flight burst.
-constexpr size_t COMMAND_ID_RING_SIZE = 32;
+// unsupported (see README). Sized well above the maximum simultaneously
+// active id count (MAX_TARGETS scheduled + up to MAX_TARGETS displaced STOPs
+// draining in flush_stops_ = 32) so remember_ always finds an inactive slot
+// and never overwrites a live id, leaving a full dedup window for completed
+// ids. Re-run protection does not depend on this bound (replay_state and
+// schedule() dedup consult live scheduler state), but the headroom keeps the
+// completed-id window intact even at peak occupancy.
+constexpr size_t COMMAND_ID_RING_SIZE = 64;
 
 inline int hex_value(char value) {
   if (value >= '0' && value <= '9')
