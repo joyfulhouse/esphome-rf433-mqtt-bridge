@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    name: Native scheduler + package contract tests
+    name: Native firmware + package contract tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,17 +19,17 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
-  esphome-config:
-    name: ESPHome config validation
+  esphome-compile:
+    name: ESPHome firmware compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - name: Validate example configuration
-        # The install instructions place the package, scheduler header, and the
-        # per-device YAML in one directory; mirror that layout for validation
+      - name: Compile example firmware
+        # The install instructions place the package, both headers, local
+        # component, and per-device YAML in one directory; mirror that layout
         # (ESPHome resolves `includes:` relative to the device YAML).
         run: |
           cp secrets.example.yaml secrets.yaml
           cp examples/living-room.yaml .
-          uvx --from "esphome==2026.6.5" esphome config living-room.yaml
+          uvx --from "esphome==2026.6.5" esphome compile living-room.yaml
