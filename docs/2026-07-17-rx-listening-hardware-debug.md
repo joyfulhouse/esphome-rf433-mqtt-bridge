@@ -80,13 +80,32 @@ nothing):
 - HA consumer received the unconfigured `/rx` frames and dropped them silently (correlate-first);
   no zemismart errors in the core log.
 
+## Real-remote validation (2026-07-17, later the same day) — PASSED
+
+A physical **kitchen remote ALL-channels UP press** was heard by the Office bridge across the
+house and synced end-to-end with no MQTT command anywhere on the bus:
+
+- `15:50:49Z` Office log: `Received RFBridge Bucket: AAB104142802760122141E38192A192A1A1A19292A1929292A192A192A19292A19292A19292929292A1A192A1A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A19292A1A1A192929292A1A1955`
+  — **the first real OEM capture**; decodes to `prefix=0x5c8a92 remote=0x0d chans=[1..6]
+  cmd=0xf4e1` = the calibrated Kitchen ALL/UP reference command, byte-exact against the
+  Hubitat-era calibration.
+- `15:50:48.970Z` `cover.kitchen_shades` → `opening`, motion-modeled to `open/100` over its 61 s
+  travel; an MQTT subscription spanning the window shows **no `/tx` on any bridge** — the
+  transition came from the heard press. An earlier heard DOWN produced the matching full
+  `closing → closed` cycle.
+- Heard UP on a fully-open cover and heard STOP on an idle cover are deliberate model no-ops and
+  leave no visible trace — expected, observed.
+- Use this capture to replace/augment the synthesized AOK fixtures in `tests/`
+  (`TODO(hardware)` markers).
+
 ## Remaining before "synced blinds" is done
 
-1. **Real-remote validation**: press the physical Office remote and confirm the cover entity
-   mirrors the press (also yields the first real OEM golden captures for the test fixtures).
-2. The multi-bridge listen rollout still runs through per-bridge channel discovery
+1. The multi-bridge listen rollout still runs through per-bridge channel discovery
    (`zemismart-private/ROLLOUT-office.md`) — and `zemismart-private/bridge-deploy/` still holds
-   the OLD firmware; sync it with this fix before flashing other bridges.
+   the OLD firmware; sync it with this fix before flashing other bridges. (A 7th bridge,
+   `rf433-bridge-kitchen`, was enrolled separately the same day with `listen:false`.)
+2. Optional: direct-observation confirmation of the Office remote (`5cad7c:da`) via a
+   state-changing press (DOWN from open); the kitchen press already proves the identical path.
 
 ## Environment (for the record)
 
