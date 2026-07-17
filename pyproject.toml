@@ -1,6 +1,6 @@
 [project]
 name = "esphome-rf433-mqtt-bridge"
-version = "1.0.0"
+version = "1.1.0"
 description = "ESPHome MQTT firmware for scheduled RF433 transmission and opt-in AOK reception"
 readme = "README.md"
 license = "MIT"
