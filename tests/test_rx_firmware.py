@@ -774,6 +774,89 @@ def test_b1_parser_uses_aok_envelope_offsets_and_preserves_interior_stop_bytes(
     )
 
 
+def test_b1_parser_accepts_oem_truncated_trailer_capture(tmp_path: Path) -> None:
+    """A real OEM capture with 65 bit pairs is accepted end to end.
+
+    The office remote (5cad7c:da) transmits 64 payload bits plus a trailer
+    that captures as a single 0-read instead of the nominal [1, 0] — every
+    press was rejected until this tolerance (live-captured 2026-07-17, decodes
+    to the remote's calibrated ALL/UP command). Payload-only 64-pair frames
+    and a lone trailer 1-bit remain rejected: neither occurs on air.
+    """
+    _write_rf_bridge_stubs(tmp_path)
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstddef>
+        #include <cstdint>
+        #include <string>
+        #include <vector>
+
+        #include "components/rf_bridge/rf_bridge.cpp"
+
+        using esphome::App;
+        using esphome::rf_bridge::B1FrameStatus;
+        using esphome::rf_bridge::b1_frame_status;
+        using esphome::rf_bridge::RFBridgeComponent;
+        using esphome::rf_bridge::is_aok_bucket_frame;
+
+        static std::vector<uint8_t> from_hex(const std::string &hex) {
+          std::vector<uint8_t> raw;
+          for (size_t index = 0; index + 1 < hex.size(); index += 2)
+            raw.push_back(static_cast<uint8_t>(
+                std::stoul(hex.substr(index, 2), nullptr, 16)));
+          return raw;
+        }
+
+        int main() {
+          // Live OEM capture: office remote 5cad7c:da, ALL channels, UP
+          // (cmd f4bb) — 65 bit pairs, truncated trailer.
+          const std::string real =
+              "AAB10413EC026C012C143C38192A192A1A1A19292A192A192A1A192A192A1A1A"
+              "1A1A19292A1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A"
+              "192A19292A192A1A1A192A1A1955";
+          const std::vector<uint8_t> frame = from_hex(real);
+          assert(is_aok_bucket_frame(frame));
+          assert(b1_frame_status(frame) == B1FrameStatus::CANDIDATE);
+
+          RFBridgeComponent bridge;
+          size_t published = 0;
+          std::string last;
+          bridge.add_on_bucket_received_callback([&](const std::string &data) {
+            published++;
+            last = data;
+          });
+          App.set_loop_component_start_time(10);
+          bridge.feed_uart(frame);
+          bridge.loop();
+          assert(published == 0);  // CANDIDATE resolves only at UART quiet
+          App.set_loop_component_start_time(17);
+          bridge.loop();
+          assert(published == 1);
+          assert(last == real);
+
+          // Payload-only (64 pairs) stays rejected.
+          std::vector<uint8_t> no_trailer = frame;
+          no_trailer.erase(no_trailer.end() - 2);
+          assert(!is_aok_bucket_frame(no_trailer));
+          App.set_loop_component_start_time(100);
+          bridge.feed_uart(no_trailer);
+          bridge.loop();
+          App.set_loop_component_start_time(400);
+          bridge.loop();
+          assert(published == 1);
+
+          // A lone trailer 1-bit cannot terminate a capture: rejected.
+          std::vector<uint8_t> lone_one = frame;
+          lone_one[lone_one.size() - 2] = 0x1A;
+          assert(!is_aok_bucket_frame(lone_one));
+          return 0;
+        }
+        """,
+    )
+
+
 def test_vendored_parser_never_acks_received_frames_and_bounds_advanced(tmp_path: Path) -> None:
     """Received frames are never ACKed back to the EFM8BB1.
 

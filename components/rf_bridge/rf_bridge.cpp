@@ -23,7 +23,10 @@ void RFBridgeComponent::finish_bucket_capture_(bool publish) {
     ESP_LOGD(TAG, "Received RFBridge Bucket: %s", str.c_str());
     this->bucket_data_callback_.call(str);
   } else {
-    ESP_LOGD(TAG, "Rejected non-AOK RFBridge Bucket frame");
+    // Log the rejected capture so a real remote whose on-air shape trips the
+    // AOK envelope can be diagnosed from the log alone (frames never reach
+    // /rx from this path, so this is the only place the evidence exists).
+    ESP_LOGD(TAG, "Rejected non-AOK RFBridge Bucket frame: %s", compact_hex(this->rx_buffer_).c_str());
   }
   this->bucket_candidate_ = false;
 }

@@ -9,7 +9,10 @@ namespace esphome::rf_bridge {
 
 constexpr uint8_t B1_MIN_BUCKETS = 3;
 constexpr uint8_t B1_MAX_BUCKETS = 8;
-constexpr size_t B1_MIN_PULSE_BYTES = 67;
+// Shortest accepted capture: preamble byte + 65 bit-pair bytes. OEM remotes
+// nominally encode 66 pairs (64 payload + [1, 0] trailer), but the office
+// 5cad7c remote's trailer captures one pair short (live-captured 2026-07-17).
+constexpr size_t B1_MIN_PULSE_BYTES = 66;
 constexpr size_t B1_MAX_PULSE_BYTES = 69;
 constexpr uint32_t B1_CANDIDATE_QUIET_MS = 5;
 constexpr uint16_t AOK_SYNC_MIN_US = 1000;
@@ -91,37 +94,59 @@ inline bool is_aok_bucket_frame(const std::vector<uint8_t> &raw) {
   }
 
   const size_t encoded_start = sync_index + 2U;
-  const size_t encoded_pulses = (AOK_PAYLOAD_BITS + AOK_TRAILER_BITS) * 2U;
-  if (pulse_count < encoded_start + encoded_pulses)
-    return false;
-  const size_t trailing_start = encoded_start + encoded_pulses;
-  if (pulse_count - trailing_start > AOK_CAPTURE_PADDING_PULSES)
-    return false;
-  for (size_t index = trailing_start; index < pulse_count; index++) {
-    if (pulse_duration(index) < AOK_SYNC_MIN_US)
-      return false;
+  // OEM remotes nominally encode 64 payload bits plus a [1, 0] trailer, but
+  // some truncate the trailer on air so it captures as a single 0-read (the
+  // office 5cad7c remote, live-captured 2026-07-17; a lone 1-read cannot
+  // terminate a capture without its paired low). Accept the 66-pair nominal
+  // form and the 65-pair truncation, longest first — a full trailer's last
+  // pair can never be misread as padding because bit pulses fail the
+  // padding's AOK_SYNC_MIN_US floor.
+  for (size_t trailer_bits = AOK_TRAILER_BITS; trailer_bits + 1U >= AOK_TRAILER_BITS;
+       trailer_bits--) {
+    const size_t bit_count = AOK_PAYLOAD_BITS + trailer_bits;
+    const size_t trailing_start = encoded_start + bit_count * 2U;
+    if (pulse_count < trailing_start)
+      continue;
+    if (pulse_count - trailing_start > AOK_CAPTURE_PADDING_PULSES)
+      continue;
+    bool valid = true;
+    for (size_t index = trailing_start; valid && index < pulse_count; index++) {
+      if (pulse_duration(index) < AOK_SYNC_MIN_US)
+        valid = false;
+    }
+    uint8_t previous = 1;
+    for (size_t bit_index = 0; valid && bit_index < bit_count; bit_index++) {
+      const size_t low_index = encoded_start + bit_index * 2U;
+      const size_t high_index = low_index + 1U;
+      const uint16_t low_duration = pulse_duration(low_index);
+      const uint16_t high_duration = pulse_duration(high_index);
+      if (pulse_high(low_index) || !pulse_high(high_index) || low_duration >= AOK_BIT_MAX_US ||
+          high_duration >= AOK_BIT_MAX_US) {
+        valid = false;
+        break;
+      }
+      const uint8_t low_previous = low_duration < AOK_SHORT_MAX_US ? 0 : 1;
+      if (low_previous != previous) {
+        valid = false;
+        break;
+      }
+      const uint8_t bit = high_duration < AOK_SHORT_MAX_US ? 1 : 0;
+      // Trailer semantics per form: nominal [1, 0]; truncated single 0-read.
+      if (bit_index == AOK_PAYLOAD_BITS &&
+          bit != (trailer_bits == AOK_TRAILER_BITS ? 1 : 0)) {
+        valid = false;
+        break;
+      }
+      if (bit_index == AOK_PAYLOAD_BITS + 1U && bit != 0) {
+        valid = false;
+        break;
+      }
+      previous = bit;
+    }
+    if (valid)
+      return true;
   }
-
-  uint8_t previous = 1;
-  for (size_t bit_index = 0; bit_index < AOK_PAYLOAD_BITS + AOK_TRAILER_BITS; bit_index++) {
-    const size_t low_index = encoded_start + bit_index * 2U;
-    const size_t high_index = low_index + 1U;
-    const uint16_t low_duration = pulse_duration(low_index);
-    const uint16_t high_duration = pulse_duration(high_index);
-    if (pulse_high(low_index) || !pulse_high(high_index) || low_duration >= AOK_BIT_MAX_US ||
-        high_duration >= AOK_BIT_MAX_US)
-      return false;
-    const uint8_t low_previous = low_duration < AOK_SHORT_MAX_US ? 0 : 1;
-    if (low_previous != previous)
-      return false;
-    const uint8_t bit = high_duration < AOK_SHORT_MAX_US ? 1 : 0;
-    if (bit_index == AOK_PAYLOAD_BITS && bit != 1)
-      return false;
-    if (bit_index == AOK_PAYLOAD_BITS + 1U && bit != 0)
-      return false;
-    previous = bit;
-  }
-  return true;
+  return false;
 }
 
 inline B1FrameStatus b1_frame_status(const std::vector<uint8_t> &raw) {
@@ -156,9 +181,9 @@ inline B1FrameStatus b1_frame_status(const std::vector<uint8_t> &raw) {
   if (raw.size() > max_frame_size)
     return B1FrameStatus::INVALID;
   if (raw.back() == 0x55 && is_aok_bucket_frame(raw)) {
-    // B1 has no B0-style total-length byte. AOK's fixed 64-bit envelope plus
-    // bounded capture padding gives three derived candidate offsets. A 0x55
-    // at either shorter offset can itself be a legitimate padding pulse byte,
+    // B1 has no B0-style total-length byte. AOK's 65/66-pair envelope plus
+    // bounded capture padding gives four derived candidate offsets. A 0x55
+    // at any shorter offset can itself be a legitimate pulse or padding byte,
     // so only the maximum offset is unambiguous without an inter-byte quiet
     // boundary. The component defers shorter candidates until that boundary.
     return raw.size() == max_frame_size ? B1FrameStatus::COMPLETE : B1FrameStatus::CANDIDATE;
