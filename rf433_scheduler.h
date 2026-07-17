@@ -423,7 +423,7 @@ class TargetScheduler {
         const uint32_t airtime_ms = entry.airtime_ms;
         if (--entry.remaining > 0)
           this->flush_stops_.push_back(std::move(entry));
-        this->next_rf_at_ = now_ms + this->repeat_gap_ms_;
+        this->next_rf_at_ = now_ms + this->dispatch_hold_ms_(airtime_ms);
         this->flush_last_ = true;
         this->record_dispatch_(now_ms, airtime_ms);
         return raw;
@@ -459,7 +459,7 @@ class TargetScheduler {
         if (command.remaining > 0)
           command.next_at = now_ms + this->repeat_gap_ms_;
 
-        this->next_rf_at_ = now_ms + this->repeat_gap_ms_;
+        this->next_rf_at_ = now_ms + this->dispatch_hold_ms_(airtime_ms);
         this->flush_last_ = false;
         this->cursor_ = (index + 1) % count;
         if (complete)
@@ -612,13 +612,21 @@ class TargetScheduler {
   }
 
   static uint32_t frame_airtime_ms_(const std::string &raw) {
-    if (raw.empty())
+    // A string that is not even B0-shaped is never transmitted by the
+    // EFM8BB1 (its command parser ignores the bytes), so it occupies no air.
+    const bool b0_shaped = raw.size() >= 10 &&
+                           std::toupper(static_cast<unsigned char>(raw[0])) == 'A' &&
+                           std::toupper(static_cast<unsigned char>(raw[1])) == 'A' &&
+                           std::toupper(static_cast<unsigned char>(raw[2])) == 'B' && raw[3] == '0';
+    if (!b0_shaped)
       return 0;
     std::string normalized;
     std::string reason;
     uint64_t airtime_us = 0;
     // MQTT admission supplies validated frames. Keep direct callers that
-    // bypass it conservative without duplicating the B0 bucket parser.
+    // bypass it conservative without duplicating the B0 bucket parser: a
+    // B0-shaped frame with an underivable airtime holds both the receive
+    // re-arm and the next dispatch for the full ceiling.
     if (!normalize_b0_with_airtime(raw, normalized, reason, airtime_us))
       airtime_us = MAX_FRAME_AIRTIME_US;
     return static_cast<uint32_t>((airtime_us + 999U) / 1000U);
@@ -627,6 +635,15 @@ class TargetScheduler {
   void record_dispatch_(uint32_t now_ms, uint32_t airtime_ms) {
     this->rf_busy_until_ = now_ms + airtime_ms + RF_AIRTIME_MARGIN_MS;
     this->rf_dispatched_ = true;
+  }
+
+  // Hold the next UART handoff until this frame's air completes. The EFM8BB1
+  // transmits a B0 frame blocking (embedded repeats included) behind a
+  // ~64-byte UART ring, so a frame handed off mid-transmission corrupts in
+  // that ring instead of pacing (field-observed: 10 rapid dispatches, one
+  // completion ACK). Zero/unknown airtimes keep the plain repeat gap.
+  uint32_t dispatch_hold_ms_(uint32_t airtime_ms) const {
+    return std::max(this->repeat_gap_ms_, airtime_ms + RF_AIRTIME_MARGIN_MS);
   }
 
   const std::string &phase_raw_(const Command &command) const {

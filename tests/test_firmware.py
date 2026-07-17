@@ -586,6 +586,105 @@ int main() {
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
+def test_native_scheduler_paces_dispatch_by_frame_airtime(tmp_path: Path) -> None:
+    """Frames never hand off while the EFM8BB1 is still transmitting.
+
+    The coprocessor transmits a B0 frame blocking (embedded repeats included)
+    with only a ~64-byte UART ring; a frame dispatched during that window is
+    corrupted in the ring instead of paced (observed in the field: 10 rapid
+    dispatches produced a single completion ACK). The global pacing gate must
+    therefore wait max(repeat_gap, frame airtime + margin) after every
+    dispatch, computed from the same admission-time airtime used by
+    rf_air_clear.
+    """
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
+    source = tmp_path / "scheduler_airtime_test.cpp"
+    binary = tmp_path / "scheduler_airtime_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include "rf433_scheduler.h"
+
+using rf433::TargetScheduler;
+
+int main() {
+  // A real AOK-length frame with the production embedded repeat of 8: its
+  // airtime dominates the 35 ms repeat gap by more than an order of magnitude.
+  const std::string frame =
+      "AAB04D04081414026C0118141438192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A1A"
+      "192A1A192A192A1A1A1A1A1A1A192A1A1A1A1A1A1A1A1A1A192A1A1A1929292A192A192929292A1955";
+  std::string normalized;
+  std::string reason;
+  uint64_t airtime_us = 0;
+  assert(rf433::normalize_b0_with_airtime(frame, normalized, reason, airtime_us));
+  const uint32_t airtime_ms = static_cast<uint32_t>((airtime_us + 999U) / 1000U);
+  assert(airtime_ms > 100);  // realistic burst: far above the pacing gap
+
+  std::string started;
+  std::string reason2;
+  std::vector<std::string> displaced;
+  TargetScheduler scheduler(35);
+  assert(scheduler.schedule("cmd-air", "a1b2c3:42:1", frame, "", 3, 0, "", 1000,
+                            displaced, reason2));
+  auto raw = scheduler.next(1000, started);
+  assert(raw && *raw == frame);
+  assert(started == "cmd-air");
+
+  // The old gap-only gate would re-dispatch at +35 ms, mid-transmission.
+  assert(!scheduler.next(1035, started));
+  assert(!scheduler.next(1000 + airtime_ms, started));
+  // One margin tick after the air clears, the second repeat goes out.
+  const uint32_t clear_at = 1000 + airtime_ms + 5;
+  assert(!scheduler.next(clear_at - 1, started));
+  raw = scheduler.next(clear_at, started);
+  assert(raw && *raw == frame);
+  assert(started.empty());
+
+  // Same pacing applies between the final repeats.
+  assert(!scheduler.next(clear_at + 35, started));
+  raw = scheduler.next(clear_at + airtime_ms + 5, started);
+  assert(raw && *raw == frame);
+  assert(scheduler.idle());
+
+  // Tiny/zero-airtime frames (host tests, degenerate raws) keep gap pacing.
+  TargetScheduler gap_scheduler(35);
+  assert(gap_scheduler.schedule("cmd-gap", "a1b2c3:42:2", "A", "", 2, 0, "", 0,
+                                displaced, reason2));
+  raw = gap_scheduler.next(0, started);
+  assert(raw && *raw == "A");
+  assert(!gap_scheduler.next(34, started));
+  raw = gap_scheduler.next(35, started);
+  assert(raw && *raw == "A");
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
 def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     """Firmware reports admission plus the first actual RF ACTION dispatch."""
     package = BRIDGE_YAML.read_text()
