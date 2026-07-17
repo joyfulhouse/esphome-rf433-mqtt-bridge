@@ -12,8 +12,13 @@ methods intact. Its local changes are limited to:
 - declared-length B1 framing and AOK envelope filtering in `rf_bridge_protocol.h`, including
   CANDIDATE/quiet disambiguation so an interior `0x55` at any allowed boundary cannot truncate the
   capture;
-- immediate transport ACK/reset for INVALID B1 plus ACKs for every completed, overflow-, or
-  timeout-flushed capture, while only accepted AOK frames reach the callback;
+- **no ACKs are ever written for received frames** (upstream ACKs every completed non-ACK frame, a
+  leftover from the stock Itead protocol). On Portisch every delivery is fire-and-forget, and a
+  host ACK is consumed as `PCA0_DoSniffing(last_sniffing_command)` — which the `0xB1` command
+  handler leaves at `RF_CODE_RFIN` — so a single ACKed capture silently reverts the radio to
+  standard sniffing and ends bucket listening (root cause of the 2026-07-17 field failure where
+  the first ambient capture deafened continuous listen). A `receive_idle()` accessor lets the
+  bridge package's periodic B1 keepalive re-arm without clipping a frame mid-delivery;
 - exact declared-length framing and bounds checks for A6/AB advanced receive data;
 - a bounded 250 ms timeout for an in-progress B1 frame instead of the upstream 50 ms timeout; and
 - an unconditional startup A7 stop-sniff plus partial-capture reset for ESP-only restarts.

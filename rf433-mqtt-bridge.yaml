@@ -25,6 +25,7 @@ substitutions:
   friendly_name: RF433 MQTT Bridge
   bridge_area: unassigned
   default_bridge: "false"
+  listen_enabled: "false"
   mqtt_broker: homeassistant.local
   mqtt_port: "1883"
   mqtt_username: ""
@@ -40,6 +41,10 @@ esphome:
   includes:
     - rf433_rx.h
     - rf433_scheduler.h
+  on_boot:
+    then:
+      - lambda: |-
+          id(boot_id) = esphome::random_uint32();
 
 external_components:
   - source:
@@ -69,13 +74,14 @@ rf_bridge:
     then:
       - lambda: |-
           const uint32_t captured_ms = millis();
-          if (!rf433::rx_state().should_publish(captured_ms))
+          if (!rf433::rx_state().should_publish())
             return;
           // An RX observation is controller input only. It never enters the
           // scheduler, invokes the transmitter, or proves motor movement.
           if (!id(mqtt_client).publish_json("rf433/${bridge_id}/rx", [=](JsonObject root) {
                 root["frame"] = data;
                 root["t"] = captured_ms;
+                root["boot"] = id(boot_id);
               }, 1, false)) {
             ESP_LOGW("rf433", "Failed to enqueue RX observation");
           }
@@ -183,8 +189,10 @@ mqtt:
           // `started` carries age_ms so the controller anchors its motion
           // model at the ORIGINAL RF handoff, not the redelivery time.
           uint32_t started_age_ms = 0;
+          const uint32_t replay_ms = millis();
           const int replay =
-              rf433::tx_scheduler(${repeat_gap_ms}).replay_state(command_id, millis(), started_age_ms);
+              rf433::tx_scheduler(${repeat_gap_ms}).replay_state(command_id, replay_ms,
+                                                                 started_age_ms);
           if (replay == 3) {
             reject("duplicate command_id (previously rejected)");
             return;
@@ -202,6 +210,8 @@ mqtt:
                 root["status"] = "started";
                 root["command_id"] = command_id;
                 root["age_ms"] = started_age_ms;
+                root["t"] = replay_ms;
+                root["boot"] = id(boot_id);
               }, 1, false);
             }
             return;
@@ -316,6 +326,24 @@ mqtt:
             return;
           }
           const std::string action = x["action"].as<std::string>();
+          if (action == "disarm") {
+            const std::string command_id = x["command_id"].is<const char *>()
+                                               ? x["command_id"].as<std::string>()
+                                               : std::string();
+            if (!rf433::valid_key(command_id)) {
+              ESP_LOGW("rf433", "Rejected disarm command: command_id is invalid");
+              return;
+            }
+            rf433::tx_scheduler(${repeat_gap_ms}).disarm(command_id);
+            const uint32_t status_ms = millis();
+            id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
+              root["status"] = "disarmed";
+              root["command_id"] = command_id;
+              root["t"] = status_ms;
+              root["boot"] = id(boot_id);
+            }, 1, false);
+            return;
+          }
           const bool seconds_is_integer = x["seconds"].is<int>();
           const auto command = rf433::validate_rx_command(
               action, seconds_is_integer, seconds_is_integer ? x["seconds"].as<int>() : 0);
@@ -331,14 +359,15 @@ mqtt:
           }
           rf433::rx_state().start_sniff(command.seconds, now_ms);
           if (command.seconds == 0) {
-            id(portisch_rf_bridge).stop_advanced_sniffing();
             ESP_LOGI("rf433", "Bucket sniffing cancelled");
           } else {
-            id(portisch_rf_bridge).start_bucket_sniffing();
             ESP_LOGI("rf433", "Bucket sniffing active for up to %u seconds", command.seconds);
           }
 
 globals:
+  - id: boot_id
+    type: uint32_t
+    initial_value: "0"
   - id: next_info_ms
     type: uint32_t
     initial_value: "0"
@@ -358,34 +387,65 @@ interval:
           // advanced only when publish() succeeds, so a failed publish retries
           // on the next tick rather than being suppressed for a minute.
           const uint32_t now_ms = millis();
-          if (rf433::rx_state().tick(now_ms))
-            id(portisch_rf_bridge).stop_advanced_sniffing();
+          auto &sched = rf433::tx_scheduler(${repeat_gap_ms});
+          auto &rx = rf433::rx_state();
+          rx.tick(now_ms);
+          const bool busy = !sched.idle() || !sched.rf_air_clear(now_ms);
+          const bool desired = !busy && rx.wants_sniff(now_ms, ${listen_enabled});
+          if (desired != rx.radio_sniffing()) {
+            if (desired) {
+              id(portisch_rf_bridge).start_bucket_sniffing();
+              rx.note_radio_armed(now_ms);
+            } else {
+              id(portisch_rf_bridge).stop_advanced_sniffing();
+            }
+            rx.set_radio_sniffing(desired);
+          } else if (desired && rx.keepalive_due(now_ms) &&
+                     id(portisch_rf_bridge).receive_idle()) {
+            // Portisch silently reverts to standard sniffing when a host ACK
+            // or an EFM8 watchdog reset re-arms its stale
+            // last_sniffing_command (RF_CODE_RFIN after the B1 command
+            // handler). The vendored component no longer ACKs deliveries,
+            // and this idempotent B1 re-arm bounds any remaining silent
+            // fallback to one keepalive period. Gated on transport quiet so
+            // a capture mid-delivery is never clipped.
+            id(portisch_rf_bridge).start_bucket_sniffing();
+            rx.note_radio_armed(now_ms);
+          }
           if (!id(mqtt_client).is_connected()) {
             // Hold the timer due so the first tick after a reconnect
             // republishes retained info immediately.
             id(next_info_ms) = now_ms;
           } else if (static_cast<int32_t>(now_ms - id(next_info_ms)) >= 0 &&
-                     id(mqtt_client).publish(
-                         std::string("rf433/${bridge_id}/info"),
-                         std::string(
-                             "{\"bridge\":\"${bridge_id}\",\"area\":\"${bridge_area}\",\"default\":${default_bridge}}"),
-                         0, true)) {
+                     id(mqtt_client).publish_json("rf433/${bridge_id}/info", [=](JsonObject root) {
+                       root["bridge"] = "${bridge_id}";
+                       root["area"] = "${bridge_area}";
+                       root["default"] = ${default_bridge};
+                       root["boot"] = id(boot_id);
+                       root["listen"] = ${listen_enabled};
+                       root["v"] = 2;
+                     }, 0, true)) {
             id(next_info_ms) = now_ms + 60000;
           }
           std::string started_command_id;
-          const auto raw = rf433::tx_scheduler(${repeat_gap_ms}).next(millis(), started_command_id);
+          const uint32_t dispatch_ms = millis();
+          const auto raw = sched.next(dispatch_ms, started_command_id);
           if (!raw.has_value())
             return;
           id(portisch_rf_bridge).send_raw(*raw);
           if (started_command_id.empty())
             return;
+          // `started` means this frame was handed to the RF coprocessor over
+          // UART. ESPHome's rf_bridge send_raw does not wait for an EFM8BB1
+          // ack, so `started` is proof of dispatch, not of RF emission.
+          const uint32_t status_ms = millis();
           auto publish_status = [&](const char *status, const std::string &command_id) {
             id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
               root["status"] = status;
               root["command_id"] = command_id;
+              root["age_ms"] = status_ms - dispatch_ms;
+              root["t"] = status_ms;
+              root["boot"] = id(boot_id);
             }, 1, false);
           };
-          // `started` means this frame was handed to the RF coprocessor over
-          // UART. ESPHome's rf_bridge send_raw does not wait for an EFM8BB1
-          // ack, so `started` is proof of dispatch, not of RF emission.
           publish_status("started", started_command_id);

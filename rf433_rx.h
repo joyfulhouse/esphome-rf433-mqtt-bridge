@@ -10,6 +10,13 @@ constexpr uint8_t MAX_SNIFF_SECONDS = 60;
 // Positive sniff commands are cheap, but bounding accepted starts/extensions
 // keeps a noisy broker client from monopolizing the 5 ms dispatch loop.
 constexpr uint32_t CMD_RATE_LIMIT_MS = 250;
+// Portisch can leave bucket-sniffing mode without telling the host: its
+// RF_CODE_ACK handler re-arms PCA0_DoSniffing(last_sniffing_command), which
+// the B1 command handler leaves pointing at RF_CODE_RFIN, and an EFM8
+// watchdog reset boots into standard sniffing. Re-sending B1 is idempotent
+// but costs the EFM8 ~10 ms of capture blackout, so the cadence stays coarse:
+// deafness is bounded to one period without meaningfully clipping captures.
+constexpr uint32_t RX_KEEPALIVE_MS = 5000;
 
 enum class RxCommandAction : uint8_t {
   INVALID,
@@ -64,39 +71,60 @@ class RxState {
 
   void start_sniff(uint8_t seconds, uint32_t now_ms) {
     if (seconds == 0) {
-      this->sniff_active_ = false;
-      this->sniff_until_ms_ = 0;
+      this->bounded_active_ = false;
+      this->bounded_until_ms_ = 0;
       return;
     }
 
-    this->expire_sniff_(now_ms);
+    this->expire_bounded_(now_ms);
     const uint32_t candidate = now_ms + static_cast<uint32_t>(seconds) * 1000U;
-    if (!this->sniff_active_ || static_cast<int32_t>(candidate - this->sniff_until_ms_) > 0)
-      this->sniff_until_ms_ = candidate;
-    this->sniff_active_ = true;
+    if (!this->bounded_active_ ||
+        static_cast<int32_t>(candidate - this->bounded_until_ms_) > 0) {
+      this->bounded_until_ms_ = candidate;
+    }
+    this->bounded_active_ = true;
   }
 
-  // Returns true exactly once when an active sniff expires so the caller can
-  // send Portisch A7 and leave the coprocessor receive mode.
-  bool tick(uint32_t now_ms) { return this->expire_sniff_(now_ms); }
+  bool bounded_active(uint32_t now_ms) const {
+    return this->bounded_active_ && !deadline_reached(now_ms, this->bounded_until_ms_);
+  }
 
-  bool should_publish(uint32_t now_ms) const {
-    return this->sniff_active_ && !deadline_reached(now_ms, this->sniff_until_ms_);
+  // Returns true exactly once when a bounded sniff expires. Physical receive
+  // mode is reconciled separately and may remain active for idle-listen.
+  bool tick(uint32_t now_ms) { return this->expire_bounded_(now_ms); }
+
+  bool wants_sniff(uint32_t now_ms, bool listen_enabled) const {
+    return this->bounded_active(now_ms) || listen_enabled;
+  }
+
+  bool radio_sniffing() const { return this->radio_sniffing_; }
+
+  void set_radio_sniffing(bool on) { this->radio_sniffing_ = on; }
+
+  bool should_publish() const { return this->radio_sniffing_; }
+
+  // Stamped on every physical B1 arm (transition and keepalive alike).
+  void note_radio_armed(uint32_t now_ms) { this->last_arm_ms_ = now_ms; }
+
+  bool keepalive_due(uint32_t now_ms) const {
+    return this->radio_sniffing_ && now_ms - this->last_arm_ms_ >= RX_KEEPALIVE_MS;
   }
 
  private:
-  bool expire_sniff_(uint32_t now_ms) {
-    if (!this->sniff_active_ || !deadline_reached(now_ms, this->sniff_until_ms_))
+  bool expire_bounded_(uint32_t now_ms) {
+    if (!this->bounded_active_ || !deadline_reached(now_ms, this->bounded_until_ms_))
       return false;
-    this->sniff_active_ = false;
-    this->sniff_until_ms_ = 0;
+    this->bounded_active_ = false;
+    this->bounded_until_ms_ = 0;
     return true;
   }
 
-  bool sniff_active_{false};
+  bool bounded_active_{false};
+  bool radio_sniffing_{false};
   bool positive_command_seen_{false};
-  uint32_t sniff_until_ms_{0};
+  uint32_t bounded_until_ms_{0};
   uint32_t last_positive_command_ms_{0};
+  uint32_t last_arm_ms_{0};
 };
 
 inline RxState &rx_state() {

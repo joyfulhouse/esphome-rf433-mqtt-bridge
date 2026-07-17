@@ -238,7 +238,7 @@ def _firmware_lambda(section_start: str, section_end: str) -> str:
 def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
     tmp_path: Path,
 ) -> None:
-    """The shipped callback is active-only, non-retained, and cannot enter TX."""
+    """The shipped callback follows physical RX state and cannot enter TX."""
     _write_rf_bridge_stubs(tmp_path)
     rx_lambda = _firmware_lambda("on_bucket_received:", "\n\n# The per-bridge scheduler")
     source = (
@@ -301,6 +301,7 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
         } mqtt_client;
 
         uint32_t fake_now_ms{0};
+        uint32_t boot_id{424242};
         uint32_t millis() { return fake_now_ms; }
 
         #define id(value) value
@@ -340,12 +341,14 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
           bridge.add_on_bucket_received_callback(
               [](const std::string &data) { generated_on_bucket_received(data); });
 
-          // The parser still ACKs transport while the bounded publish gate is off.
+          // A capture completed while the physical publish gate is off is
+          // parsed and dropped without publishing.
           fake_now_ms = 10;
           capture(bridge, false);
           assert(mqtt_client.attempts == 0);
 
           rf433::rx_state().start_sniff(60, 0);
+          rf433::rx_state().set_radio_sniffing(true);
           fake_now_ms = 100;
           capture(bridge, false);
           capture(bridge, true);
@@ -367,36 +370,33 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
           assert(mqtt_client.messages.back().payload.at("t") == "200");
 
           rf433::rx_state().start_sniff(0, 201);
+          rf433::rx_state().set_radio_sniffing(false);
           capture(bridge, false);
           assert(mqtt_client.attempts == 4);
 
           rf433::rx_state().start_sniff(1, 1000);
+          rf433::rx_state().set_radio_sniffing(true);
           fake_now_ms = 1999;
           capture(bridge, true);
           assert(mqtt_client.attempts == 5);
           fake_now_ms = 2000;
+          assert(rf433::rx_state().tick(2000));
+          rf433::rx_state().set_radio_sniffing(false);
           capture(bridge, false);
           assert(mqtt_client.attempts == 5);
-          assert(rf433::rx_state().tick(2000));
           assert(!rf433::rx_state().tick(2001));
 
           for (const Message &message : mqtt_client.messages) {
             assert(message.topic == "rf433/test-bridge/rx");
+            assert(message.payload.at("boot") == "424242");
             assert(message.qos == 1);
             assert(!message.retained);
           }
 
-          // Eight completed B1 frames produce only A0 ACKs, never a B0 TX.
-          const auto &uart = bridge.written_bytes();
-          assert(uart.size() == 24);
-          for (size_t index = 0; index < uart.size(); index += 3) {
-            assert(uart[index] == 0xAA);
-            assert(uart[index + 1] == 0xA0);
-            assert(uart[index + 2] == 0x55);
-          }
-          const std::vector<uint8_t> b0_prefix{0xAA, 0xB0};
-          assert(std::search(uart.begin(), uart.end(), b0_prefix.begin(), b0_prefix.end()) ==
-                 uart.end());
+          // Eight completed B1 frames write nothing back to the coprocessor:
+          // no B0 TX, and no ACKs either — an ACK would make Portisch revert
+          // to standard sniffing via its stale last_sniffing_command.
+          assert(bridge.written_bytes().empty());
           return 0;
         }
         """
@@ -404,12 +404,16 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
     _compile_and_run(tmp_path, source)
 
 
-def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) -> None:
-    """The MQTT handler accepts sniff only, caps starts, and exempts cancel."""
+def test_generated_cmd_handler_delegates_sniff_and_disarms_without_tx(
+    tmp_path: Path,
+) -> None:
+    """The MQTT handler sets sniff intent and acknowledges RF-silent disarm."""
     cmd_lambda = _firmware_lambda("- topic: rf433/${bridge_id}/cmd", "\nglobals:")
     source = (
         r"""
+        #include <algorithm>
         #include <cassert>
+        #include <cctype>
         #include <cstdint>
         #include <map>
         #include <string>
@@ -418,6 +422,32 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
         #include <vector>
 
         #include "rf433_rx.h"
+
+        namespace rf433 {
+
+        inline bool valid_key(const std::string &value) {
+          if (value.empty() || value.size() > 64)
+            return false;
+          return std::all_of(value.begin(), value.end(), [](char character) {
+            const auto byte = static_cast<unsigned char>(character);
+            return std::isalnum(byte) || character == '-' || character == '_' ||
+                   character == '.' || character == ':' || character == ',';
+          });
+        }
+
+        struct FakeScheduler {
+          std::vector<std::string> disarmed_ids;
+          void disarm(const std::string &command_id) {
+            this->disarmed_ids.push_back(command_id);
+          }
+        };
+
+        inline FakeScheduler &tx_scheduler(uint32_t) {
+          static FakeScheduler scheduler;
+          return scheduler;
+        }
+
+        }  // namespace rf433
 
         struct JsonValueData {
           std::variant<std::monostate, std::string, int, bool> value;
@@ -467,11 +497,55 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
 
         struct FakeBridge {
           std::vector<std::string> actions;
-          void start_bucket_sniffing() { this->actions.push_back("B1"); }
-          void stop_advanced_sniffing() { this->actions.push_back("A7"); }
+          void start_bucket_sniffing() {
+            this->actions.push_back("B1");
+          }
+          void stop_advanced_sniffing() {
+            this->actions.push_back("A7");
+          }
         } portisch_rf_bridge;
 
+        struct JsonSlot {
+          std::map<std::string, std::string> *values;
+          std::string key;
+
+          JsonSlot &operator=(const std::string &value) {
+            (*this->values)[this->key] = value;
+            return *this;
+          }
+
+          JsonSlot &operator=(uint32_t value) {
+            (*this->values)[this->key] = std::to_string(value);
+            return *this;
+          }
+        };
+
+        struct JsonObject {
+          std::map<std::string, std::string> *values;
+          JsonSlot operator[](const char *key) { return {this->values, key}; }
+        };
+
+        struct Message {
+          std::string topic;
+          std::map<std::string, std::string> payload;
+          int qos;
+          bool retained;
+        };
+
+        struct FakeMqtt {
+          std::vector<Message> messages;
+
+          template<typename F>
+          bool publish_json(const std::string &topic, F &&builder, int qos, bool retained) {
+            Message message{topic, {}, qos, retained};
+            builder(JsonObject{&message.payload});
+            this->messages.push_back(std::move(message));
+            return true;
+          }
+        } mqtt_client;
+
         uint32_t fake_now_ms{0};
+        uint32_t boot_id{5150};
         uint32_t millis() { return fake_now_ms; }
 
         #define ESP_LOGW(...) ((void) 0)
@@ -484,18 +558,25 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
         + r"""
         }
 
-        static FakeJson command(const std::string &action, int seconds) {
+        static FakeJson sniff_command(const std::string &action, int seconds) {
           FakeJson value;
           value.set_string("action", action);
           value.set_int("seconds", seconds);
           return value;
         }
 
+        static FakeJson disarm_command(const std::string &command_id) {
+          FakeJson value;
+          value.set_string("action", "disarm");
+          value.set_string("command_id", command_id);
+          return value;
+        }
+
         int main() {
           fake_now_ms = 1;
-          generated_cmd_handler(command("listen", 30));
+          generated_cmd_handler(sniff_command("listen", 30));
           assert(portisch_rf_bridge.actions.empty());
-          assert(!rf433::rx_state().should_publish(fake_now_ms));
+          assert(!rf433::rx_state().should_publish());
 
           FakeJson missing_seconds;
           missing_seconds.set_string("action", "sniff");
@@ -504,46 +585,72 @@ def test_generated_cmd_handler_starts_and_cancels_bounded_sniff(tmp_path: Path) 
           wrong_type.set_string("action", "sniff");
           wrong_type.set_bool("seconds", true);
           generated_cmd_handler(wrong_type);
-          generated_cmd_handler(command("sniff", -1));
+          generated_cmd_handler(sniff_command("sniff", -1));
           assert(portisch_rf_bridge.actions.empty());
 
-          // No nonce is present or required. The value is hard-capped at 60.
+          // The value is hard-capped at 60. The handler records intent only;
+          // the interval reconciler owns all physical B1/A7 transitions.
           fake_now_ms = 100;
-          generated_cmd_handler(command("sniff", 61));
-          assert(portisch_rf_bridge.actions == std::vector<std::string>({"B1"}));
-          assert(rf433::rx_state().should_publish(60099));
-          assert(!rf433::rx_state().should_publish(60100));
+          generated_cmd_handler(sniff_command("sniff", 61));
+          assert(portisch_rf_bridge.actions.empty());
+          assert(!rf433::rx_state().should_publish());
+          assert(rf433::rx_state().bounded_active(60099));
+          assert(!rf433::rx_state().bounded_active(60100));
 
           fake_now_ms = 101;
-          generated_cmd_handler(command("sniff", 30));
-          assert(portisch_rf_bridge.actions.size() == 1);
+          generated_cmd_handler(sniff_command("sniff", 30));
+          assert(portisch_rf_bridge.actions.empty());
 
           // Cancellation wins inside the positive-command rate-limit window.
           fake_now_ms = 102;
-          generated_cmd_handler(command("sniff", 0));
-          assert(portisch_rf_bridge.actions ==
-                 std::vector<std::string>({"B1", "A7"}));
-          assert(!rf433::rx_state().should_publish(fake_now_ms));
+          generated_cmd_handler(sniff_command("sniff", 0));
+          assert(portisch_rf_bridge.actions.empty());
+          assert(!rf433::rx_state().bounded_active(102));
+          assert(!rf433::rx_state().should_publish());
 
           fake_now_ms = 200;
-          generated_cmd_handler(command("sniff", 30));
-          assert(portisch_rf_bridge.actions.size() == 2);
+          generated_cmd_handler(sniff_command("sniff", 30));
+          assert(!rf433::rx_state().bounded_active(200));
           fake_now_ms = 350;
-          generated_cmd_handler(command("sniff", 30));
-          assert(portisch_rf_bridge.actions.back() == "B1");
-          assert(rf433::rx_state().should_publish(30349));
-          assert(!rf433::rx_state().should_publish(30350));
+          generated_cmd_handler(sniff_command("sniff", 30));
+          assert(portisch_rf_bridge.actions.empty());
+          assert(rf433::rx_state().bounded_active(30349));
+          assert(!rf433::rx_state().bounded_active(30350));
 
-          // An accepted shorter extension reissues B1 but never shortens the window.
+          // An accepted shorter extension never shortens the intent window.
           fake_now_ms = 600;
-          generated_cmd_handler(command("sniff", 1));
-          assert(portisch_rf_bridge.actions.back() == "B1");
-          assert(rf433::rx_state().should_publish(30349));
-          assert(!rf433::rx_state().should_publish(30350));
+          generated_cmd_handler(sniff_command("sniff", 1));
+          assert(portisch_rf_bridge.actions.empty());
+          assert(rf433::rx_state().bounded_active(30349));
+          assert(!rf433::rx_state().bounded_active(30350));
+
+          FakeJson missing_command_id;
+          missing_command_id.set_string("action", "disarm");
+          generated_cmd_handler(missing_command_id);
+          generated_cmd_handler(disarm_command("invalid key"));
+          assert(rf433::tx_scheduler(35).disarmed_ids.empty());
+          assert(mqtt_client.messages.empty());
+
+          // Disarm bypasses the sniff rate limiter, delegates to the scheduler,
+          // publishes an idempotent acknowledgement, and has no TX surface.
           fake_now_ms = 601;
-          generated_cmd_handler(command("sniff", 0));
-          assert(portisch_rf_bridge.actions.back() == "A7");
-          assert(!rf433::rx_state().should_publish(fake_now_ms));
+          generated_cmd_handler(disarm_command("move:42"));
+          assert(rf433::tx_scheduler(35).disarmed_ids ==
+                 std::vector<std::string>({"move:42"}));
+          assert(mqtt_client.messages.size() == 1);
+          const Message &ack = mqtt_client.messages.front();
+          assert(ack.topic == "rf433/test-bridge/status");
+          assert(ack.payload.at("status") == "disarmed");
+          assert(ack.payload.at("command_id") == "move:42");
+          assert(ack.payload.at("t") == "601");
+          assert(ack.payload.at("boot") == "5150");
+          assert(ack.qos == 1);
+          assert(!ack.retained);
+          assert(portisch_rf_bridge.actions.empty());
+
+          generated_cmd_handler(sniff_command("sniff", 0));
+          assert(!rf433::rx_state().bounded_active(601));
+          assert(portisch_rf_bridge.actions.empty());
           return 0;
         }
         """
@@ -667,8 +774,101 @@ def test_b1_parser_uses_aok_envelope_offsets_and_preserves_interior_stop_bytes(
     )
 
 
-def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: Path) -> None:
-    """Transport ACKs stay independent from B1 publishing and A6 decoding bounds."""
+def test_b1_parser_accepts_oem_truncated_trailer_capture(tmp_path: Path) -> None:
+    """A real OEM capture with 65 bit pairs is accepted end to end.
+
+    The office remote (5cad7c:da) transmits 64 payload bits plus a trailer
+    that captures as a single 0-read instead of the nominal [1, 0] — every
+    press was rejected until this tolerance (live-captured 2026-07-17, decodes
+    to the remote's calibrated ALL/UP command). Payload-only 64-pair frames
+    and a lone trailer 1-bit remain rejected: neither occurs on air.
+    """
+    _write_rf_bridge_stubs(tmp_path)
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstddef>
+        #include <cstdint>
+        #include <string>
+        #include <vector>
+
+        #include "components/rf_bridge/rf_bridge.cpp"
+
+        using esphome::App;
+        using esphome::rf_bridge::B1FrameStatus;
+        using esphome::rf_bridge::b1_frame_status;
+        using esphome::rf_bridge::RFBridgeComponent;
+        using esphome::rf_bridge::is_aok_bucket_frame;
+
+        static std::vector<uint8_t> from_hex(const std::string &hex) {
+          std::vector<uint8_t> raw;
+          for (size_t index = 0; index + 1 < hex.size(); index += 2)
+            raw.push_back(static_cast<uint8_t>(
+                std::stoul(hex.substr(index, 2), nullptr, 16)));
+          return raw;
+        }
+
+        int main() {
+          // Live OEM capture: office remote 5cad7c:da, ALL channels, UP
+          // (cmd f4bb) — 65 bit pairs, truncated trailer.
+          const std::string real =
+              "AAB10413EC026C012C143C38192A192A1A1A19292A192A192A1A192A192A1A1A"
+              "1A1A19292A1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A"
+              "192A19292A192A1A1A192A1A1955";
+          const std::vector<uint8_t> frame = from_hex(real);
+          assert(is_aok_bucket_frame(frame));
+          assert(b1_frame_status(frame) == B1FrameStatus::CANDIDATE);
+
+          RFBridgeComponent bridge;
+          size_t published = 0;
+          std::string last;
+          bridge.add_on_bucket_received_callback([&](const std::string &data) {
+            published++;
+            last = data;
+          });
+          App.set_loop_component_start_time(10);
+          bridge.feed_uart(frame);
+          bridge.loop();
+          assert(published == 0);  // CANDIDATE resolves only at UART quiet
+          App.set_loop_component_start_time(17);
+          bridge.loop();
+          assert(published == 1);
+          assert(last == real);
+
+          // Payload-only (64 pairs) stays rejected.
+          std::vector<uint8_t> no_trailer = frame;
+          no_trailer.erase(no_trailer.end() - 2);
+          assert(!is_aok_bucket_frame(no_trailer));
+          App.set_loop_component_start_time(100);
+          bridge.feed_uart(no_trailer);
+          bridge.loop();
+          App.set_loop_component_start_time(400);
+          bridge.loop();
+          assert(published == 1);
+
+          // A lone trailer 1-bit cannot terminate a capture: rejected.
+          std::vector<uint8_t> lone_one = frame;
+          lone_one[lone_one.size() - 2] = 0x1A;
+          assert(!is_aok_bucket_frame(lone_one));
+          return 0;
+        }
+        """,
+    )
+
+
+def test_vendored_parser_never_acks_received_frames_and_bounds_advanced(tmp_path: Path) -> None:
+    """Received frames are never ACKed back to the EFM8BB1.
+
+    Portisch deliveries are fire-and-forget (RF_Bridge_main.c clears
+    RF_DATA_STATUS and re-enables the capture interrupt immediately after
+    uart_put_RF_buckets), while a host ACK is consumed by its RF_CODE_ACK
+    handler as PCA0_DoSniffing(last_sniffing_command) — and B1 arming leaves
+    last_sniffing_command at RF_CODE_RFIN, so a single ACKed capture silently
+    reverts the radio to standard sniffing and kills listening. Verified live
+    on rf433-bridge-office (2026-07-17): the first delivered ambient capture
+    plus its ACK ended bucket mode until the next TX cycle re-armed it.
+    """
     _write_rf_bridge_stubs(tmp_path)
     _compile_and_run(
         tmp_path,
@@ -697,16 +897,6 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           return frame;
         }
 
-        static void assert_ack_count(const RFBridgeComponent &bridge, size_t count) {
-          const auto &written = bridge.written_bytes();
-          assert(written.size() == count * 3U);
-          for (size_t index = 0; index < count; index++) {
-            assert(written[index * 3U] == 0xAA);
-            assert(written[index * 3U + 1U] == 0xA0);
-            assert(written[index * 3U + 2U] == 0x55);
-          }
-        }
-
         int main() {
           // TODO(hardware): Replace/augment the synthesized AOK fixtures in
           // this file with OEM-captured UP/DOWN/STOP vectors after the hardware
@@ -728,6 +918,8 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           App.set_loop_component_start_time(8);
           startup_bridge.loop();
           assert(startup_callbacks == 1);
+          // The accepted capture wrote nothing beyond the startup A7.
+          assert(startup_bridge.written_bytes().size() == 3U);
 
           RFBridgeComponent bridge;
           size_t bucket_callbacks = 0;
@@ -742,34 +934,33 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
               });
 
           // This foreign B1 has a valid bucket table but ends before the AOK
-          // minimum. UART quiet completes its transport without publishing it.
+          // minimum. UART quiet completes its transport without publishing it
+          // and without writing anything back to the coprocessor.
           App.set_loop_component_start_time(100);
           bridge.feed_uart({
               0xAA, 0xB1, 0x03, 0x00, 0x64, 0x01, 0x2C, 0x04, 0x00, 0x89, 0xAB, 0x55,
           });
           bridge.loop();
-          assert_ack_count(bridge, 0);
+          assert(bridge.written_bytes().empty());
           App.set_loop_component_start_time(106);
           bridge.loop();
-          assert_ack_count(bridge, 1);
+          assert(bridge.written_bytes().empty());
           assert(bucket_callbacks == 0);
 
-          // INVALID B1 metadata is ACKed and reset immediately instead of
-          // occupying the parser until its timeout.
+          // INVALID B1 metadata is dropped and reset immediately instead of
+          // occupying the parser until its timeout — still no write-back.
           App.set_loop_component_start_time(150);
           bridge.feed_uart({0xAA, 0xB1, 0x02});
           bridge.loop();
-          assert_ack_count(bridge, 2);
           assert(bucket_callbacks == 0);
           bridge.feed_uart({0x00, 0x64, 0x04, 0x00, 0x12, 0x55});
           bridge.loop();
-          assert_ack_count(bridge, 2);
           App.set_loop_component_start_time(156);
           bridge.loop();
-          assert_ack_count(bridge, 2);
+          assert(bridge.written_bytes().empty());
           assert(bucket_callbacks == 0);
 
-          // A truncated B1 still gets an ACK when the bounded timeout flushes it.
+          // A truncated B1 is flushed by the bounded timeout without an ACK.
           App.set_loop_component_start_time(200);
           bridge.feed_uart({
               0xAA, 0xB1, 0x03, 0x00, 0x64, 0x01, 0x2C, 0x04, 0x00, 0x89, 0xAB,
@@ -777,7 +968,7 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           bridge.loop();
           App.set_loop_component_start_time(451);
           bridge.loop();
-          assert_ack_count(bridge, 3);
+          assert(bridge.written_bytes().empty());
           assert(bucket_callbacks == 0);
 
           // The first 0x55 is code data: decoding waits for the exact endpoint
@@ -785,11 +976,10 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           App.set_loop_component_start_time(500);
           bridge.feed_uart({0xAA, 0xA6, 0x05, 0x01, 0x55});
           bridge.loop();
-          assert_ack_count(bridge, 3);
           assert(advanced_callbacks == 0);
           bridge.feed_uart({0x32, 0xFA, 0x80, 0x55});
           bridge.loop();
-          assert_ack_count(bridge, 4);
+          assert(bridge.written_bytes().empty());
           assert(advanced_callbacks == 1);
           assert(advanced.length == 0x05);
           assert(advanced.protocol == 0x01);
@@ -802,8 +992,15 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           bridge.loop();
           App.set_loop_component_start_time(606);
           bridge.loop();
-          assert_ack_count(bridge, 5);
+          assert(bridge.written_bytes().empty());
           assert(bucket_callbacks == 1);
+
+          // receive_idle() reports transport quiet so the keepalive re-arm
+          // never clips a frame that is mid-parse.
+          assert(bridge.receive_idle());
+          bridge.feed_uart({0xAA, 0xB1});
+          bridge.loop();
+          assert(!bridge.receive_idle());
           return 0;
         }
         """,
@@ -851,31 +1048,31 @@ def test_sniff_state_caps_rate_limits_expires_and_wraps(tmp_path: Path) -> None:
           assert(!rate.command_allowed(2000, missing));
 
           RxState state;
-          assert(!state.should_publish(0));
+          assert(!state.bounded_active(0));
           state.start_sniff(capped.seconds, 100);
-          assert(state.should_publish(100));
-          assert(state.should_publish(60099));
-          assert(!state.should_publish(60100));
+          assert(state.bounded_active(100));
+          assert(state.bounded_active(60099));
+          assert(!state.bounded_active(60100));
 
           state.start_sniff(1, 1000);
-          assert(state.should_publish(60099));
+          assert(state.bounded_active(60099));
           state.start_sniff(60, 2000);
-          assert(state.should_publish(61999));
-          assert(!state.should_publish(62000));
+          assert(state.bounded_active(61999));
+          assert(!state.bounded_active(62000));
           assert(!state.tick(61999));
           assert(state.tick(62000));
-          assert(!state.should_publish(62000));
+          assert(!state.bounded_active(62000));
           assert(!state.tick(62001));
 
           state.start_sniff(30, 70000);
           state.start_sniff(0, 70001);
-          assert(!state.should_publish(70001));
+          assert(!state.bounded_active(70001));
 
           RxState rollover;
           const uint32_t near_wrap = 0xFFFFFF00U;
           rollover.start_sniff(1, near_wrap);
-          assert(rollover.should_publish(near_wrap + 999U));
-          assert(!rollover.should_publish(near_wrap + 1000U));
+          assert(rollover.bounded_active(near_wrap + 999U));
+          assert(!rollover.bounded_active(near_wrap + 1000U));
           assert(rollover.tick(near_wrap + 1000U));
           assert(!rollover.tick(near_wrap + 1001U));
           return 0;
@@ -884,11 +1081,195 @@ def test_sniff_state_caps_rate_limits_expires_and_wraps(tmp_path: Path) -> None:
     )
 
 
-def test_firmware_wires_sniff_only_contract_without_rx_to_tx() -> None:
-    """YAML exposes bounded sniffing and excludes every deferred sync surface."""
+def test_rx_state_keeps_bounded_deadline_across_radio_preemption(
+    tmp_path: Path,
+) -> None:
+    """Bounded intent expires independently of physical bucket mode."""
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+        #include <type_traits>
+
+        #include "rf433_rx.h"
+
+        using rf433::RxState;
+
+        static_assert(std::is_same_v<decltype(&RxState::bounded_active),
+                                     bool (RxState::*)(uint32_t) const>);
+        static_assert(std::is_same_v<decltype(&RxState::wants_sniff),
+                                     bool (RxState::*)(uint32_t, bool) const>);
+        static_assert(std::is_same_v<decltype(&RxState::radio_sniffing),
+                                     bool (RxState::*)() const>);
+        static_assert(std::is_same_v<decltype(&RxState::set_radio_sniffing),
+                                     void (RxState::*)(bool)>);
+        static_assert(std::is_same_v<decltype(&RxState::should_publish),
+                                     bool (RxState::*)() const>);
+
+        int main() {
+          RxState bounded;
+          assert(!bounded.bounded_active(0));
+          bounded.start_sniff(2, 1000);
+          assert(bounded.bounded_active(1000));
+          assert(bounded.bounded_active(2999));
+          assert(!bounded.bounded_active(3000));
+
+          RxState extended;
+          extended.start_sniff(2, 1000);
+          // A shorter accepted request cannot shorten the existing deadline.
+          extended.start_sniff(1, 1500);
+          assert(extended.bounded_active(2999));
+          // A later deadline extends it.
+          extended.start_sniff(3, 1500);
+          assert(extended.bounded_active(4499));
+          assert(!extended.bounded_active(4500));
+          assert(!extended.tick(4499));
+          assert(extended.tick(4500));
+          assert(!extended.tick(4501));
+
+          RxState preempted;
+          preempted.start_sniff(30, 1000);
+          preempted.set_radio_sniffing(true);
+          assert(preempted.radio_sniffing());
+          assert(preempted.should_publish());
+
+          // TX yields physical bucket mode without touching bounded intent.
+          preempted.set_radio_sniffing(false);
+          assert(!preempted.radio_sniffing());
+          assert(!preempted.should_publish());
+          assert(preempted.bounded_active(30999));
+
+          preempted.set_radio_sniffing(true);
+          assert(preempted.bounded_active(30999));
+          assert(!preempted.tick(30999));
+          assert(!preempted.bounded_active(31000));
+          assert(preempted.tick(31000));
+          assert(!preempted.tick(31001));
+          // Expiry is logical only; the reconciler owns the physical edge.
+          assert(preempted.radio_sniffing());
+          assert(preempted.should_publish());
+          return 0;
+        }
+        """,
+    )
+
+
+def test_rx_state_wants_sniff_truth_table_and_cancel_preserves_radio(
+    tmp_path: Path,
+) -> None:
+    """Idle listen and bounded intent combine without implicit radio edges."""
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+
+        #include "rf433_rx.h"
+
+        using rf433::RxState;
+
+        int main() {
+          RxState state;
+          assert(!state.wants_sniff(100, false));
+          assert(state.wants_sniff(100, true));
+          assert(!state.should_publish());
+
+          state.start_sniff(1, 100);
+          assert(state.bounded_active(1099));
+          assert(state.wants_sniff(1099, false));
+          assert(state.wants_sniff(1099, true));
+          assert(!state.wants_sniff(1100, false));
+          assert(state.wants_sniff(1100, true));
+          // Logical intent alone does not claim that bucket mode is physical.
+          assert(!state.should_publish());
+
+          state.set_radio_sniffing(true);
+          assert(state.radio_sniffing());
+          assert(state.should_publish());
+          state.start_sniff(0, 101);
+          assert(!state.bounded_active(101));
+          assert(!state.wants_sniff(101, false));
+          assert(state.wants_sniff(101, true));
+          // Cancel leaves the physical state for the reconciler to change.
+          assert(state.radio_sniffing());
+          assert(state.should_publish());
+
+          state.set_radio_sniffing(false);
+          assert(!state.radio_sniffing());
+          assert(!state.should_publish());
+          return 0;
+        }
+        """,
+    )
+
+
+def test_rx_state_keepalive_rearms_only_while_radio_armed(tmp_path: Path) -> None:
+    """The B1 keepalive fires on a coarse cadence and only while listening.
+
+    Portisch can silently leave bucket-sniffing mode without telling the host
+    (its RF_CODE_ACK handler re-arms last_sniffing_command — which B1 arming
+    leaves at RF_CODE_RFIN — and an EFM8 watchdog reset boots into standard
+    sniffing). A periodic idempotent B1 bounds that deafness to one keepalive
+    period.
+    """
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+
+        #include "rf433_rx.h"
+
+        using rf433::RxState;
+
+        static_assert(rf433::RX_KEEPALIVE_MS == 5000);
+
+        int main() {
+          RxState state;
+          // Never due while the radio is off, no matter how stale the stamp.
+          assert(!state.keepalive_due(1000000));
+
+          state.set_radio_sniffing(true);
+          state.note_radio_armed(1000);
+          assert(!state.keepalive_due(1000));
+          assert(!state.keepalive_due(5999));
+          assert(state.keepalive_due(6000));
+
+          // Re-arming restarts the cadence.
+          state.note_radio_armed(6000);
+          assert(!state.keepalive_due(10999));
+          assert(state.keepalive_due(11000));
+
+          // Disarm gates the keepalive regardless of elapsed time.
+          state.set_radio_sniffing(false);
+          assert(!state.keepalive_due(1000000));
+          state.set_radio_sniffing(true);
+          assert(state.keepalive_due(1000000));
+
+          // millis() wraparound keeps the unsigned cadence arithmetic valid.
+          state.note_radio_armed(0xFFFFF000u);
+          assert(!state.keepalive_due(0xFFFFFFFFu));
+          assert(!state.keepalive_due(0x00000387u));
+          assert(state.keepalive_due(0x00000388u));
+          return 0;
+        }
+        """,
+    )
+
+
+def _assert_keepalive_wiring(interval_handler: str) -> None:
+    """Every physical B1 arm stamps the cadence; the re-arm gates on quiet."""
+    b1_arm_sites = 2  # idle-transition arm + periodic keepalive arm
+    assert interval_handler.count("rx.note_radio_armed(now_ms);") == b1_arm_sites
+    assert "rx.keepalive_due(now_ms)" in interval_handler
+    assert ".receive_idle()" in interval_handler
+
+
+def test_firmware_wires_state_sync_contract_without_rx_to_tx() -> None:
+    """YAML wires the state-sync primitives while RX stays observation-only."""
     package = BRIDGE_YAML.read_text()
     rx_header = RX_HEADER.read_text()
-    scheduler = (PROJECT_ROOT / "rf433_scheduler.h").read_text()
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
 
     assert "external_components:" in package
@@ -903,8 +1284,9 @@ def test_firmware_wires_sniff_only_contract_without_rx_to_tx() -> None:
     assert "validate_rx_command" in package
     assert 'x["seconds"].is<int>()' in package
     assert "command_allowed(now_ms, command)" in package
-    assert "start_bucket_sniffing" in package
     assert "command.seconds == 0" in package
+    assert 'listen_enabled: "false"' in package
+    assert "id(boot_id) = esphome::random_uint32();" in package
     assert 'root["frame"]' in package
     assert 'root["t"]' in package
     assert "last_t" not in package
@@ -916,27 +1298,64 @@ def test_firmware_wires_sniff_only_contract_without_rx_to_tx() -> None:
     assert "send_raw" not in rx_handler
     assert "tx_scheduler" not in rx_handler
     assert "start_bucket_sniffing" not in rx_handler
+    assert "stop_advanced_sniffing" not in rx_handler
+    assert "rf433::rx_state().should_publish()" in rx_handler
+    assert 'root["boot"] = id(boot_id);' in rx_handler
     assert "}, 1, false)" in rx_handler
     assert package.count(".send_raw(") == 1
 
     cmd_handler = package.split("- topic: rf433/${bridge_id}/cmd", maxsplit=1)[1].split(
         "\nglobals:", maxsplit=1
     )[0]
-    assert "start_bucket_sniffing" in cmd_handler
-    assert "stop_advanced_sniffing" in cmd_handler
-    interval_handler = package.split("interval:", maxsplit=1)[1]
-    assert "rx_state().tick(now_ms)" in interval_handler
-    assert "stop_advanced_sniffing" in interval_handler
-    assert "start_bucket_sniffing" not in interval_handler
+    assert "start_bucket_sniffing" not in cmd_handler
+    assert "stop_advanced_sniffing" not in cmd_handler
+    assert 'action == "disarm"' in cmd_handler
+    assert "rf433::valid_key(command_id)" in cmd_handler
+    assert ".disarm(command_id)" in cmd_handler
+    assert 'root["status"] = "disarmed";' in cmd_handler
+    assert 'root["t"] = status_ms;' in cmd_handler
+    assert 'root["boot"] = id(boot_id);' in cmd_handler
 
+    interval_handler = package.split("interval:", maxsplit=1)[1]
+    assert "rx.tick(now_ms)" in interval_handler
+    assert "!sched.idle() || !sched.rf_air_clear(now_ms)" in interval_handler
+    assert "rx.wants_sniff(now_ms, ${listen_enabled})" in interval_handler
+    assert "rx.set_radio_sniffing(desired)" in interval_handler
+    assert "stop_advanced_sniffing" in interval_handler
+    assert "start_bucket_sniffing" in interval_handler
+    _assert_keepalive_wiring(interval_handler)
+
+
+def test_firmware_state_sync_payloads_and_deferred_surface() -> None:
+    """The started/info payloads are stamped and the unbuilt surface stays absent."""
+    package = BRIDGE_YAML.read_text()
+    rx_header = RX_HEADER.read_text()
+    scheduler = (PROJECT_ROOT / "rf433_scheduler.h").read_text()
+    interval_handler = package.split("interval:", maxsplit=1)[1]
+
+    info_publish = interval_handler.split('publish_json("rf433/${bridge_id}/info"', maxsplit=1)[
+        1
+    ].split("}, 0, true)", maxsplit=1)[0]
+    assert 'root["boot"] = id(boot_id);' in info_publish
+    assert 'root["listen"] = ${listen_enabled};' in info_publish
+    assert 'root["v"] = 2;' in info_publish
+
+    # Both the replay and fresh-dispatch paths publish a measured age and the
+    # same bridge-clock/session fields needed to recover the handoff instant.
+    started_paths_stamping_age = 2
+    assert package.count('root["age_ms"]') == started_paths_stamping_age
+    assert 'root["age_ms"] = started_age_ms;' in package
+    assert 'root["age_ms"] = status_ms - dispatch_ms;' in interval_handler
+    assert 'publish_status("started", started_command_id);' in interval_handler
+
+    # The remaining integration-central surfaces are deliberately unbuilt.
+    # RX_KEEPALIVE_MS moved out of this list on 2026-07-17: the hardware spike
+    # proved Portisch silently exits bucket mode (ACK-handler re-arm of a stale
+    # last_sniffing_command), so the keepalive is now a shipped requirement.
     deferred_symbols = (
-        "listen_enabled",
         "session_nonce",
         "RxRadioState",
-        "RX_KEEPALIVE_MS",
-        "air_clear",
         "record_frame_sent",
-        "rf_busy_until_ms_",
         "completed_command_id",
     )
     combined = package + rx_header + scheduler
@@ -950,9 +1369,10 @@ def test_firmware_wires_sniff_only_contract_without_rx_to_tx() -> None:
 
 
 def test_vendored_component_wires_safe_filtered_rx_parsers() -> None:
-    """The local component ACKs B1 transport and bounds advanced receive data."""
+    """The local component never ACKs received frames and bounds advanced data."""
     component_python = (RF_BRIDGE_DIR / "__init__.py").read_text()
     component_cpp = (RF_BRIDGE_DIR / "rf_bridge.cpp").read_text()
+    component_header = (RF_BRIDGE_DIR / "rf_bridge.h").read_text()
 
     assert 'CONF_ON_BUCKET_RECEIVED = "on_bucket_received"' in component_python
     assert "add_on_bucket_received_callback" in component_python
@@ -965,7 +1385,12 @@ def test_vendored_component_wires_safe_filtered_rx_parsers() -> None:
     bucket_finish = component_cpp.split(
         "void RFBridgeComponent::finish_bucket_capture_(bool publish)", maxsplit=1
     )[1].split("bool RFBridgeComponent::parse_bridge_byte_", maxsplit=1)[0]
-    assert "this->ack_();" in bucket_finish
+    # A host ACK makes Portisch call PCA0_DoSniffing(last_sniffing_command),
+    # which B1 arming leaves at RF_CODE_RFIN — one ACKed capture would revert
+    # the radio to standard sniffing and silently end listening.
+    assert "this->ack_();" not in component_cpp
+    assert "void ack_();" not in component_header
+    assert "receive_idle" in component_header
     assert "if (publish)" in bucket_finish
     assert "bucket_data_callback_.call" in bucket_finish
     assert "send_raw" not in bucket_case
@@ -988,8 +1413,8 @@ def test_vendored_component_wires_safe_filtered_rx_parsers() -> None:
     assert "this->rx_buffer_[index]" in advanced_case
 
 
-def test_rx_docs_publish_sniff_only_contract_and_vendored_version() -> None:
-    """Docs cover bounded onboarding capture, layout, and hardware deferral."""
+def test_rx_docs_publish_state_sync_contract_and_vendored_version() -> None:
+    """Docs cover shipped opt-in state sync and its hardware rollout gate."""
     readme = (PROJECT_ROOT / "README.md").read_text()
     example = (PROJECT_ROOT / "examples" / "living-room.yaml").read_text()
     vendor_notes = (RF_BRIDGE_DIR / "README.md").read_text()
@@ -1000,17 +1425,28 @@ def test_rx_docs_publish_sniff_only_contract_and_vendored_version() -> None:
     assert '{"action":"sniff","seconds":0}' in readme
     assert "hard-capped at 60" in readme
     assert "Cancellation is exempt from the rate limiter" in readme
-    assert "Only while that sniff is active" in readme
+    assert "firmware primitives ship now" in readme
+    assert "`listen_enabled`" in readme
+    assert 'defaults to `"false"`' in readme
+    assert "Continuous `/rx`" in readme
     assert "QoS 1, non-retained" in readme
-    assert "plain `millis()`" in readme
+    assert "`handoff = t - age_ms`" in readme
+    assert '"listen":false' in readme
+    assert '"v":2' in readme
+    assert '{"action":"disarm","command_id":"move:42"}' in readme
+    assert '"status":"disarmed"' in readme
+    assert "monotonic modulo `2^32`" in readme
+    assert "activity stream" in readme
+    assert "broker ACL" in readme
     assert "privacy" in readme.lower()
-    assert "Continuous listen" in readme
-    assert "planned follow-up" in readme
+    assert "end-to-end state-sync use remains gated" in readme
     assert "real OEM-captured golden" in readme
     assert "HARDWARE-VALIDATION" in readme
     assert "components/" in readme
     assert "components/" in example
     assert "esphome compile living-room.yaml" in readme
+    assert "Only while that sniff is active" not in readme
+    assert "planned follow-up work" not in readme
 
     assert "nonce" not in readme.lower()
     assert '"action":"listen"' not in readme
