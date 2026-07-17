@@ -1,4 +1,4 @@
-# RX / listening — hardware debug (2026-07-17) — RESOLVED
+# RX / listening — hardware debug (2026-07-17) — RESOLVED (two root causes)
 
 First on-hardware test of the state-sync **RX / idle-listen** path found TX fully working but
 **no `/rx` at all** on physical remote presses. Root cause found and fixed the same day; the fix
@@ -98,14 +98,39 @@ house and synced end-to-end with no MQTT command anywhere on the bus:
 - Use this capture to replace/augment the synthesized AOK fixtures in `tests/`
   (`TODO(hardware)` markers).
 
+## Root cause #2 (same day): OEM truncated trailer — RESOLVED
+
+Direct validation of the Office remote (`5cad7c:da`) exposed a second, remote-specific failure:
+**every office press reached the bridge and was rejected by the AOK envelope filter.** Adding the
+rejected frames' bytes to the DEBUG log (now permanent) showed the remote transmits **65 bit
+pairs — 64 payload bits plus a trailer that captures as a single 0-read** — where the filter's
+`B1_MIN_PULSE_BYTES = 67` and fixed 66-pair envelope walk demanded the nominal `[1, 0]` trailer.
+The kitchen remote transmits the full trailer, which is why it synced first. The codec's
+calibration decoder had documented this exact truncation ("legacy captures with a truncated
+trailer") — the office remote is that remote; the tolerance just never reached the receive path.
+
+Fix (firmware `0bfc787`, consumer `d658ea6`):
+
+- firmware: `B1_MIN_PULSE_BYTES` 67→66; `is_aok_bucket_frame` accepts 66- and 65-pair encodings
+  (longest first; a lone trailer 1-read and payload-only 64-pair frames stay rejected — neither
+  occurs on air); rejected captures now log their bytes.
+- consumer: `codec.decode_rx_capture` (trailer-tolerant, strict superset) used by
+  `state_sync.frame_signature`; transport `encode_b0`/`decode_b0` stay strict. Echo comparison is
+  unaffected: signatures are payload-field based.
+
+**Office validation PASSED (16:20:58Z):** a physical office-remote ALL/UP press was accepted
+(`Received RFBridge Bucket`), published on `/rx`, and **all seven office covers** flipped to
+`opening` within 126 ms — including the `office_slider` group cover's first-ever state — and
+completed on their travel models. STOP applied as an idle freeze; the remote's OEM follow-on
+command (`cmd 0xdba2`, after UP) classified as non-movement and dropped. Live captures of all
+three actions are pinned in both repos' test suites.
+
 ## Remaining before "synced blinds" is done
 
 1. The multi-bridge listen rollout still runs through per-bridge channel discovery
    (`zemismart-private/ROLLOUT-office.md`) — and `zemismart-private/bridge-deploy/` still holds
-   the OLD firmware; sync it with this fix before flashing other bridges. (A 7th bridge,
+   the OLD firmware; sync it with these fixes before flashing other bridges. (A 7th bridge,
    `rf433-bridge-kitchen`, was enrolled separately the same day with `listen:false`.)
-2. Optional: direct-observation confirmation of the Office remote (`5cad7c:da`) via a
-   state-changing press (DOWN from open); the kitchen press already proves the identical path.
 
 ## Environment (for the record)
 
