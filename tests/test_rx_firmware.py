@@ -1439,9 +1439,16 @@ def test_rx_docs_publish_state_sync_contract_and_vendored_version() -> None:
     assert "activity stream" in readme
     assert "broker ACL" in readme
     assert "privacy" in readme.lower()
-    assert "end-to-end state-sync use remains gated" in readme
-    assert "real OEM-captured golden" in readme
-    assert "HARDWARE-VALIDATION" in readme
+    # The 2026-07-17 hardware spike closed the rollout gate: the README now
+    # records the validated findings instead of deferring to them.
+    assert "HARDWARE-VALIDATED (2026-07-17)" in readme
+    assert "remains gated" not in readme
+    assert "HARDWARE-VALIDATION" not in readme
+    assert "OEM-captured golden" in readme
+    assert "never ACKs deliveries" in readme
+    assert "paced by computed airtime" in readme
+    assert "github://joyfulhouse/esphome-rf433-mqtt-bridge" in readme
+    assert "R2 V2.2" in readme
     assert "components/" in readme
     assert "components/" in example
     assert "esphome compile living-room.yaml" in readme

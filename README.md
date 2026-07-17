@@ -133,22 +133,33 @@ interpreted with serial-number arithmetic. Pair every timestamp with `boot`, and
 state when that session value changes.
 
 Continuous receive is a household activity stream. Keep it opt-in and non-retained, and scope the
-broker ACL for `rf433/<bridge_id>/rx` and `rf433/<bridge_id>/cmd` to the integration principal. The
-end-to-end state-sync use remains gated on the hardware-validation rollout and real OEM-captured golden
-frames described below; shipping these firmware primitives does not remove that rollout gate.
+broker ACL for `rf433/<bridge_id>/rx` and `rf433/<bridge_id>/cmd` to the integration principal.
 
-> **TODO — HARDWARE-VALIDATION:** The current host AOK fixtures are synthesized from parser
-> assumptions; no real OEM-captured golden `AAB1…55` sample exists in this repository. The hardware
-> spike must add UP/DOWN/STOP captures across identities and channels, including timing jitter.
-> Before fleet use, also verify that cancellation A7 cleanly exits an in-flight B1 capture, real
-> captures contain the OEM `[1, 0]` trailer required by the filter, and ACKing accepted, rejected,
-> short, and timed-out B1 transport frames is benign. These physical checks remain deferred.
+> **HARDWARE-VALIDATED (2026-07-17):** end-to-end state sync runs in production on a
+> seven-bridge fleet; physical remote presses mirror into the controller within ~150 ms. The
+> hardware spike also settled every previously deferred physical question, twice against
+> intuition: **ACKing received B1 frames is not benign** — a host ACK makes Portisch re-arm its
+> stale `last_sniffing_command` and silently revert to standard sniffing, killing listening on
+> the first heard frame, so this component never ACKs deliveries; and **real OEM captures do not
+> all carry the `[1, 0]` trailer** — some remotes transmit 65 bit pairs with a single trailing
+> 0-read, which the filter now accepts. Real OEM-captured golden UP/DOWN/STOP frames (with field
+> bucket jitter) are pinned in the test suite alongside the synthesized fixtures. A 5 s
+> idempotent B1 keepalive bounds any remaining silent bucket-mode exit (e.g. an EFM8 watchdog
+> reset) to one period.
+
+Frame dispatch is paced by computed airtime: the EFM8BB1 transmits each B0 frame blocking
+(embedded repeats included) behind a small UART ring, so the scheduler holds the next handoff
+until the previous frame's air completes (`repeat_gap_ms` acts as a floor). A typical AOK frame
+with the production embedded repeat of 8 occupies ~560 ms of air, and controller-level `repeats`
+multiply that — keep the product modest, since the bridge cannot listen while transmitting.
 
 ## Hardware
 
 - **Sonoff RF Bridge R2** with the EFM8BB1 RF coprocessor flashed to
   [Portisch firmware](https://github.com/Portisch/RF-Bridge-EFM8BB1) (required — the stock RF
   firmware cannot transmit raw B0 buckets).
+- **Supported board revisions: R2 V1.0/V2.0 (EFM8BB1).** The 2022+ **R2 V2.2** replaced the
+  EFM8BB1 with an OB38S003, which cannot run Portisch — that revision is unsupported.
 - The ESP8285 runs this ESPHome package (`rf_bridge:` UART @ 19200; GPIO1/GPIO3 belong to the RF
   coprocessor, so serial logging is disabled).
 
@@ -173,6 +184,16 @@ simply your HA host; a standalone broker works identically.
    `rf433-mqtt-bridge.yaml` loads `components/rf_bridge/` as a local external component. Keep that
    directory intact rather than flattening it. It is vendored from ESPHome 2026.6.5's
    `esphome/components/rf_bridge` and extended with the B1 receive callback used by this package.
+
+   To use only the hardened `rf_bridge` component in an unrelated ESPHome config (Portisch
+   bucket receive with correct B1 framing, no delivery ACKs, `on_bucket_received`), pull it
+   straight from this repository instead of vendoring:
+
+   ```yaml
+   external_components:
+     - source: github://joyfulhouse/esphome-rf433-mqtt-bridge@v1.2.0
+       components: [rf_bridge]
+   ```
 2. Create `secrets.yaml` from `secrets.example.yaml`.
 3. Adjust the substitutions (bridge id, area, broker, credentials). Set `default_bridge: "true"`
    on exactly one bridge in your home. Networking is DHCP by default; a commented `manual_ip`
