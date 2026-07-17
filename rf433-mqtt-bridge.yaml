@@ -393,11 +393,24 @@ interval:
           const bool busy = !sched.idle() || !sched.rf_air_clear(now_ms);
           const bool desired = !busy && rx.wants_sniff(now_ms, ${listen_enabled});
           if (desired != rx.radio_sniffing()) {
-            if (desired)
+            if (desired) {
               id(portisch_rf_bridge).start_bucket_sniffing();
-            else
+              rx.note_radio_armed(now_ms);
+            } else {
               id(portisch_rf_bridge).stop_advanced_sniffing();
+            }
             rx.set_radio_sniffing(desired);
+          } else if (desired && rx.keepalive_due(now_ms) &&
+                     id(portisch_rf_bridge).receive_idle()) {
+            // Portisch silently reverts to standard sniffing when a host ACK
+            // or an EFM8 watchdog reset re-arms its stale
+            // last_sniffing_command (RF_CODE_RFIN after the B1 command
+            // handler). The vendored component no longer ACKs deliveries,
+            // and this idempotent B1 re-arm bounds any remaining silent
+            // fallback to one keepalive period. Gated on transport quiet so
+            // a capture mid-delivery is never clipped.
+            id(portisch_rf_bridge).start_bucket_sniffing();
+            rx.note_radio_armed(now_ms);
           }
           if (!id(mqtt_client).is_connected()) {
             // Hold the timer due so the first tick after a reconnect

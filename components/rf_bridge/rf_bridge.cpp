@@ -10,18 +10,14 @@ namespace esphome::rf_bridge {
 
 static const char *const TAG = "rf_bridge";
 
-void RFBridgeComponent::ack_() {
-  ESP_LOGV(TAG, "Sending ACK");
-  this->write(RF_CODE_START);
-  this->write(RF_CODE_ACK);
-  this->write(RF_CODE_STOP);
-  this->flush();
-}
-
 void RFBridgeComponent::finish_bucket_capture_(bool publish) {
-  // ACK before the automation publishes MQTT so broker backpressure cannot
-  // hold the EFM8BB1 in its completed-capture path.
-  this->ack_();
+  // Never ACK a delivery. Portisch's capture path is fire-and-forget (it
+  // clears RF_DATA_STATUS and re-enables the receive interrupt immediately
+  // after uart_put_RF_buckets), while a host ACK triggers its RF_CODE_ACK
+  // handler: PCA0_DoSniffing(last_sniffing_command) — and the B1 command
+  // handler leaves last_sniffing_command at RF_CODE_RFIN, so one ACKed
+  // capture silently reverts the radio to standard sniffing and ends
+  // listening (observed live on rf433-bridge-office, 2026-07-17).
   if (publish) {
     const std::string str = compact_hex(this->rx_buffer_);
     ESP_LOGD(TAG, "Received RFBridge Bucket: %s", str.c_str());
@@ -161,8 +157,11 @@ bool RFBridgeComponent::parse_bridge_byte_(uint8_t byte) {
 
   ESP_LOGVV(TAG, "Parsed: 0x%02X", byte);
 
-  if (byte == RF_CODE_STOP && action != RF_CODE_ACK)
-    this->ack_();
+  // Upstream ACKs every completed non-ACK frame here — a leftover from the
+  // stock Itead firmware protocol. On Portisch no delivery waits for a host
+  // ACK, and any ACK sent while bucket sniffing is armed reverts the radio
+  // to standard mode via its stale last_sniffing_command (see
+  // finish_bucket_capture_), so this fork never writes ACKs at all.
 
   // return false to reset buffer
   return false;

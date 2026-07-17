@@ -66,9 +66,11 @@ class RFBridgeComponent : public uart::UARTDevice, public Component {
   void start_bucket_sniffing();
   void send_raw(const std::string &code);
   void beep(uint16_t ms);
+  // True while no received frame is mid-parse. The package's B1 keepalive
+  // re-arm gates on this so it never clips a capture that is being delivered.
+  bool receive_idle() const { return this->rx_buffer_.empty(); }
 
  protected:
-  void ack_();
   void finish_bucket_capture_(bool publish);
   void reset_receive_state_();
   bool parse_bridge_byte_(uint8_t byte);

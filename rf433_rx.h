@@ -10,6 +10,13 @@ constexpr uint8_t MAX_SNIFF_SECONDS = 60;
 // Positive sniff commands are cheap, but bounding accepted starts/extensions
 // keeps a noisy broker client from monopolizing the 5 ms dispatch loop.
 constexpr uint32_t CMD_RATE_LIMIT_MS = 250;
+// Portisch can leave bucket-sniffing mode without telling the host: its
+// RF_CODE_ACK handler re-arms PCA0_DoSniffing(last_sniffing_command), which
+// the B1 command handler leaves pointing at RF_CODE_RFIN, and an EFM8
+// watchdog reset boots into standard sniffing. Re-sending B1 is idempotent
+// but costs the EFM8 ~10 ms of capture blackout, so the cadence stays coarse:
+// deafness is bounded to one period without meaningfully clipping captures.
+constexpr uint32_t RX_KEEPALIVE_MS = 5000;
 
 enum class RxCommandAction : uint8_t {
   INVALID,
@@ -96,6 +103,13 @@ class RxState {
 
   bool should_publish() const { return this->radio_sniffing_; }
 
+  // Stamped on every physical B1 arm (transition and keepalive alike).
+  void note_radio_armed(uint32_t now_ms) { this->last_arm_ms_ = now_ms; }
+
+  bool keepalive_due(uint32_t now_ms) const {
+    return this->radio_sniffing_ && now_ms - this->last_arm_ms_ >= RX_KEEPALIVE_MS;
+  }
+
  private:
   bool expire_bounded_(uint32_t now_ms) {
     if (!this->bounded_active_ || !deadline_reached(now_ms, this->bounded_until_ms_))
@@ -110,6 +124,7 @@ class RxState {
   bool positive_command_seen_{false};
   uint32_t bounded_until_ms_{0};
   uint32_t last_positive_command_ms_{0};
+  uint32_t last_arm_ms_{0};
 };
 
 inline RxState &rx_state() {

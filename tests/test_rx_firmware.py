@@ -341,7 +341,8 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
           bridge.add_on_bucket_received_callback(
               [](const std::string &data) { generated_on_bucket_received(data); });
 
-          // The parser still ACKs transport while the physical publish gate is off.
+          // A capture completed while the physical publish gate is off is
+          // parsed and dropped without publishing.
           fake_now_ms = 10;
           capture(bridge, false);
           assert(mqtt_client.attempts == 0);
@@ -392,17 +393,10 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
             assert(!message.retained);
           }
 
-          // Eight completed B1 frames produce only A0 ACKs, never a B0 TX.
-          const auto &uart = bridge.written_bytes();
-          assert(uart.size() == 24);
-          for (size_t index = 0; index < uart.size(); index += 3) {
-            assert(uart[index] == 0xAA);
-            assert(uart[index + 1] == 0xA0);
-            assert(uart[index + 2] == 0x55);
-          }
-          const std::vector<uint8_t> b0_prefix{0xAA, 0xB0};
-          assert(std::search(uart.begin(), uart.end(), b0_prefix.begin(), b0_prefix.end()) ==
-                 uart.end());
+          // Eight completed B1 frames write nothing back to the coprocessor:
+          // no B0 TX, and no ACKs either — an ACK would make Portisch revert
+          // to standard sniffing via its stale last_sniffing_command.
+          assert(bridge.written_bytes().empty());
           return 0;
         }
         """
@@ -780,8 +774,18 @@ def test_b1_parser_uses_aok_envelope_offsets_and_preserves_interior_stop_bytes(
     )
 
 
-def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: Path) -> None:
-    """Transport ACKs stay independent from B1 publishing and A6 decoding bounds."""
+def test_vendored_parser_never_acks_received_frames_and_bounds_advanced(tmp_path: Path) -> None:
+    """Received frames are never ACKed back to the EFM8BB1.
+
+    Portisch deliveries are fire-and-forget (RF_Bridge_main.c clears
+    RF_DATA_STATUS and re-enables the capture interrupt immediately after
+    uart_put_RF_buckets), while a host ACK is consumed by its RF_CODE_ACK
+    handler as PCA0_DoSniffing(last_sniffing_command) — and B1 arming leaves
+    last_sniffing_command at RF_CODE_RFIN, so a single ACKed capture silently
+    reverts the radio to standard sniffing and kills listening. Verified live
+    on rf433-bridge-office (2026-07-17): the first delivered ambient capture
+    plus its ACK ended bucket mode until the next TX cycle re-armed it.
+    """
     _write_rf_bridge_stubs(tmp_path)
     _compile_and_run(
         tmp_path,
@@ -810,16 +814,6 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           return frame;
         }
 
-        static void assert_ack_count(const RFBridgeComponent &bridge, size_t count) {
-          const auto &written = bridge.written_bytes();
-          assert(written.size() == count * 3U);
-          for (size_t index = 0; index < count; index++) {
-            assert(written[index * 3U] == 0xAA);
-            assert(written[index * 3U + 1U] == 0xA0);
-            assert(written[index * 3U + 2U] == 0x55);
-          }
-        }
-
         int main() {
           // TODO(hardware): Replace/augment the synthesized AOK fixtures in
           // this file with OEM-captured UP/DOWN/STOP vectors after the hardware
@@ -841,6 +835,8 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           App.set_loop_component_start_time(8);
           startup_bridge.loop();
           assert(startup_callbacks == 1);
+          // The accepted capture wrote nothing beyond the startup A7.
+          assert(startup_bridge.written_bytes().size() == 3U);
 
           RFBridgeComponent bridge;
           size_t bucket_callbacks = 0;
@@ -855,34 +851,33 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
               });
 
           // This foreign B1 has a valid bucket table but ends before the AOK
-          // minimum. UART quiet completes its transport without publishing it.
+          // minimum. UART quiet completes its transport without publishing it
+          // and without writing anything back to the coprocessor.
           App.set_loop_component_start_time(100);
           bridge.feed_uart({
               0xAA, 0xB1, 0x03, 0x00, 0x64, 0x01, 0x2C, 0x04, 0x00, 0x89, 0xAB, 0x55,
           });
           bridge.loop();
-          assert_ack_count(bridge, 0);
+          assert(bridge.written_bytes().empty());
           App.set_loop_component_start_time(106);
           bridge.loop();
-          assert_ack_count(bridge, 1);
+          assert(bridge.written_bytes().empty());
           assert(bucket_callbacks == 0);
 
-          // INVALID B1 metadata is ACKed and reset immediately instead of
-          // occupying the parser until its timeout.
+          // INVALID B1 metadata is dropped and reset immediately instead of
+          // occupying the parser until its timeout — still no write-back.
           App.set_loop_component_start_time(150);
           bridge.feed_uart({0xAA, 0xB1, 0x02});
           bridge.loop();
-          assert_ack_count(bridge, 2);
           assert(bucket_callbacks == 0);
           bridge.feed_uart({0x00, 0x64, 0x04, 0x00, 0x12, 0x55});
           bridge.loop();
-          assert_ack_count(bridge, 2);
           App.set_loop_component_start_time(156);
           bridge.loop();
-          assert_ack_count(bridge, 2);
+          assert(bridge.written_bytes().empty());
           assert(bucket_callbacks == 0);
 
-          // A truncated B1 still gets an ACK when the bounded timeout flushes it.
+          // A truncated B1 is flushed by the bounded timeout without an ACK.
           App.set_loop_component_start_time(200);
           bridge.feed_uart({
               0xAA, 0xB1, 0x03, 0x00, 0x64, 0x01, 0x2C, 0x04, 0x00, 0x89, 0xAB,
@@ -890,7 +885,7 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           bridge.loop();
           App.set_loop_component_start_time(451);
           bridge.loop();
-          assert_ack_count(bridge, 3);
+          assert(bridge.written_bytes().empty());
           assert(bucket_callbacks == 0);
 
           // The first 0x55 is code data: decoding waits for the exact endpoint
@@ -898,11 +893,10 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           App.set_loop_component_start_time(500);
           bridge.feed_uart({0xAA, 0xA6, 0x05, 0x01, 0x55});
           bridge.loop();
-          assert_ack_count(bridge, 3);
           assert(advanced_callbacks == 0);
           bridge.feed_uart({0x32, 0xFA, 0x80, 0x55});
           bridge.loop();
-          assert_ack_count(bridge, 4);
+          assert(bridge.written_bytes().empty());
           assert(advanced_callbacks == 1);
           assert(advanced.length == 0x05);
           assert(advanced.protocol == 0x01);
@@ -915,8 +909,15 @@ def test_vendored_parser_acks_rejected_b1_and_bounds_advanced_frames(tmp_path: P
           bridge.loop();
           App.set_loop_component_start_time(606);
           bridge.loop();
-          assert_ack_count(bridge, 5);
+          assert(bridge.written_bytes().empty());
           assert(bucket_callbacks == 1);
+
+          // receive_idle() reports transport quiet so the keepalive re-arm
+          // never clips a frame that is mid-parse.
+          assert(bridge.receive_idle());
+          bridge.feed_uart({0xAA, 0xB1});
+          bridge.loop();
+          assert(!bridge.receive_idle());
           return 0;
         }
         """,
@@ -1120,6 +1121,68 @@ def test_rx_state_wants_sniff_truth_table_and_cancel_preserves_radio(
     )
 
 
+def test_rx_state_keepalive_rearms_only_while_radio_armed(tmp_path: Path) -> None:
+    """The B1 keepalive fires on a coarse cadence and only while listening.
+
+    Portisch can silently leave bucket-sniffing mode without telling the host
+    (its RF_CODE_ACK handler re-arms last_sniffing_command — which B1 arming
+    leaves at RF_CODE_RFIN — and an EFM8 watchdog reset boots into standard
+    sniffing). A periodic idempotent B1 bounds that deafness to one keepalive
+    period.
+    """
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+
+        #include "rf433_rx.h"
+
+        using rf433::RxState;
+
+        static_assert(rf433::RX_KEEPALIVE_MS == 5000);
+
+        int main() {
+          RxState state;
+          // Never due while the radio is off, no matter how stale the stamp.
+          assert(!state.keepalive_due(1000000));
+
+          state.set_radio_sniffing(true);
+          state.note_radio_armed(1000);
+          assert(!state.keepalive_due(1000));
+          assert(!state.keepalive_due(5999));
+          assert(state.keepalive_due(6000));
+
+          // Re-arming restarts the cadence.
+          state.note_radio_armed(6000);
+          assert(!state.keepalive_due(10999));
+          assert(state.keepalive_due(11000));
+
+          // Disarm gates the keepalive regardless of elapsed time.
+          state.set_radio_sniffing(false);
+          assert(!state.keepalive_due(1000000));
+          state.set_radio_sniffing(true);
+          assert(state.keepalive_due(1000000));
+
+          // millis() wraparound keeps the unsigned cadence arithmetic valid.
+          state.note_radio_armed(0xFFFFF000u);
+          assert(!state.keepalive_due(0xFFFFFFFFu));
+          assert(!state.keepalive_due(0x00000387u));
+          assert(state.keepalive_due(0x00000388u));
+          return 0;
+        }
+        """,
+    )
+
+
+def _assert_keepalive_wiring(interval_handler: str) -> None:
+    """Every physical B1 arm stamps the cadence; the re-arm gates on quiet."""
+    b1_arm_sites = 2  # idle-transition arm + periodic keepalive arm
+    assert interval_handler.count("rx.note_radio_armed(now_ms);") == b1_arm_sites
+    assert "rx.keepalive_due(now_ms)" in interval_handler
+    assert ".receive_idle()" in interval_handler
+
+
 def test_firmware_wires_state_sync_contract_without_rx_to_tx() -> None:
     """YAML wires the state-sync primitives while RX stays observation-only."""
     package = BRIDGE_YAML.read_text()
@@ -1177,6 +1240,7 @@ def test_firmware_wires_state_sync_contract_without_rx_to_tx() -> None:
     assert "rx.set_radio_sniffing(desired)" in interval_handler
     assert "stop_advanced_sniffing" in interval_handler
     assert "start_bucket_sniffing" in interval_handler
+    _assert_keepalive_wiring(interval_handler)
 
 
 def test_firmware_state_sync_payloads_and_deferred_surface() -> None:
@@ -1202,10 +1266,12 @@ def test_firmware_state_sync_payloads_and_deferred_surface() -> None:
     assert 'publish_status("started", started_command_id);' in interval_handler
 
     # The remaining integration-central surfaces are deliberately unbuilt.
+    # RX_KEEPALIVE_MS moved out of this list on 2026-07-17: the hardware spike
+    # proved Portisch silently exits bucket mode (ACK-handler re-arm of a stale
+    # last_sniffing_command), so the keepalive is now a shipped requirement.
     deferred_symbols = (
         "session_nonce",
         "RxRadioState",
-        "RX_KEEPALIVE_MS",
         "record_frame_sent",
         "completed_command_id",
     )
@@ -1220,9 +1286,10 @@ def test_firmware_state_sync_payloads_and_deferred_surface() -> None:
 
 
 def test_vendored_component_wires_safe_filtered_rx_parsers() -> None:
-    """The local component ACKs B1 transport and bounds advanced receive data."""
+    """The local component never ACKs received frames and bounds advanced data."""
     component_python = (RF_BRIDGE_DIR / "__init__.py").read_text()
     component_cpp = (RF_BRIDGE_DIR / "rf_bridge.cpp").read_text()
+    component_header = (RF_BRIDGE_DIR / "rf_bridge.h").read_text()
 
     assert 'CONF_ON_BUCKET_RECEIVED = "on_bucket_received"' in component_python
     assert "add_on_bucket_received_callback" in component_python
@@ -1235,7 +1302,12 @@ def test_vendored_component_wires_safe_filtered_rx_parsers() -> None:
     bucket_finish = component_cpp.split(
         "void RFBridgeComponent::finish_bucket_capture_(bool publish)", maxsplit=1
     )[1].split("bool RFBridgeComponent::parse_bridge_byte_", maxsplit=1)[0]
-    assert "this->ack_();" in bucket_finish
+    # A host ACK makes Portisch call PCA0_DoSniffing(last_sniffing_command),
+    # which B1 arming leaves at RF_CODE_RFIN — one ACKed capture would revert
+    # the radio to standard sniffing and silently end listening.
+    assert "this->ack_();" not in component_cpp
+    assert "void ack_();" not in component_header
+    assert "receive_idle" in component_header
     assert "if (publish)" in bucket_finish
     assert "bucket_data_callback_.call" in bucket_finish
     assert "send_raw" not in bucket_case
