@@ -56,6 +56,16 @@ void RFBridgeComponent::setup() {
 }
 
 bool RFBridgeComponent::parse_bridge_byte_(uint8_t byte) {
+  if (this->bucket_candidate_ && byte == RF_CODE_START) {
+    // A queued next frame proves the candidate ending really terminated
+    // this capture: Portisch builds pulse entries from alternating signal
+    // edges, so 0xAA (two high-level nibbles) cannot occur inside pulse
+    // data. Publishing here splits back-to-back deliveries even when
+    // loop() never observes a quiet gap between them (ported from the
+    // upstream PR esphome/esphome#17683 review rounds).
+    this->finish_bucket_capture_(true);
+    this->rx_buffer_.clear();
+  }
   size_t at = this->rx_buffer_.size();
   this->rx_buffer_.push_back(byte);
   const uint8_t *raw = &this->rx_buffer_[0];

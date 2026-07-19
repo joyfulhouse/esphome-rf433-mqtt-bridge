@@ -1,8 +1,14 @@
 # Draft: upstream issue for `esphome/esphome` — two `rf_bridge` bugs with Portisch firmware
 
-Status: DRAFT for owner review — not yet filed. Suggested title:
-**`rf_bridge`: ACK-on-receive silently disables Portisch bucket sniffing; B1 parser truncates
-at interior `0x55` bytes**
+Status: FILED 2026-07-18 — issue
+[esphome/esphome#17682](https://github.com/esphome/esphome/issues/17682), fix PR
+[esphome/esphome#17683](https://github.com/esphome/esphome/pull/17683)
+(`[rf_bridge] Fix bucket sniffing with Portisch firmware`, branch
+`fix/rf-bridge-portisch-rx` on the `btli/esphome` fork). The upstream port is a
+generic subset of this fork's fixes: no AOK envelope validation, B1-only ACK
+suppression, declared-table framing with a 5 ms quiet-confirmed terminator
+candidate, deterministic split on a queued `0xAA` start, and a 250 ms
+in-progress B1 timeout gated on an empty UART buffer.
 
 ---
 
