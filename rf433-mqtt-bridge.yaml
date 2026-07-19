@@ -126,6 +126,8 @@ mqtt:
   discover_ip: false
   log_topic:
   topic_prefix:
+  # Kept disabled for the same STOP-safety reason as wifi's; prolonged MQTT
+  # loss is instead handled by the scheduler-gated watchdog interval below.
   reboot_timeout: 0s
   birth_message:
     topic: rf433/${bridge_id}/availability
@@ -449,3 +451,28 @@ interval:
             }, 1, false);
           };
           publish_status("started", started_command_id);
+  - interval: 10s
+    then:
+      - lambda: |-
+          // MQTT-outage watchdog. The stock mqtt/wifi reboot_timeout stays 0s
+          // because an unconditional reboot drops the scheduler's RAM-held
+          // fail-safe STOP deadlines. This gated variant reboots only when the
+          // scheduler is idle and the air is clear, which is always eventually
+          // true during an outage: commands arrive over MQTT, so a
+          // disconnected bridge can only drain. Field incident 2026-07-19: a
+          // bridge sat unreachable for 12 h retrying against a stale
+          // LB-conntrack tuple; a reboot (fresh TCP source ports) recovered it
+          // in seconds.
+          static uint32_t mqtt_ok_ms = millis();
+          const uint32_t now_ms = millis();
+          if (id(mqtt_client).is_connected()) {
+            mqtt_ok_ms = now_ms;
+            return;
+          }
+          if (static_cast<int32_t>(now_ms - mqtt_ok_ms) < 15 * 60 * 1000)
+            return;
+          auto &sched = rf433::tx_scheduler(${repeat_gap_ms});
+          if (!sched.idle() || !sched.rf_air_clear(now_ms))
+            return;
+          ESP_LOGW("watchdog", "MQTT unreachable for 15 min with idle scheduler; rebooting");
+          App.safe_reboot();
