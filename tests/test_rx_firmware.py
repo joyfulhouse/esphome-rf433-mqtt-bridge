@@ -415,6 +415,7 @@ def test_generated_cmd_handler_delegates_sniff_and_disarms_without_tx(
         #include <cassert>
         #include <cctype>
         #include <cstdint>
+        #include <cstring>
         #include <map>
         #include <string>
         #include <type_traits>
