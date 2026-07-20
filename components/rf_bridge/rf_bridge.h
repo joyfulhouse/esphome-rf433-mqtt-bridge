@@ -6,11 +6,11 @@
 #include "esphome/core/component.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/automation.h"
+#include "rf_bridge_protocol.h"
 
 namespace esphome::rf_bridge {
 
 static const uint8_t RF_MESSAGE_SIZE = 9;
-static const uint8_t RF_CODE_START = 0xAA;
 static const uint8_t RF_CODE_ACK = 0xA0;
 static const uint8_t RF_CODE_LEARN = 0xA1;
 static const uint8_t RF_CODE_LEARN_KO = 0xA2;
@@ -25,9 +25,7 @@ static const uint8_t RF_CODE_LEARN_NEW = 0xA9;
 static const uint8_t RF_CODE_LEARN_KO_NEW = 0xAA;
 static const uint8_t RF_CODE_LEARN_OK_NEW = 0xAB;
 static const uint8_t RF_CODE_RFOUT_BUCKET = 0xB0;
-static const uint8_t RF_CODE_RFIN_BUCKET = 0xB1;
 static const uint8_t RF_CODE_BEEP = 0xC0;
-static const uint8_t RF_CODE_STOP = 0x55;
 static const uint8_t RF_DEBOUNCE = 200;
 static const size_t MAX_RX_BUFFER_SIZE = 512;
 

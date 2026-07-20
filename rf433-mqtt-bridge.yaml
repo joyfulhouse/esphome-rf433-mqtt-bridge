@@ -153,12 +153,22 @@ mqtt:
     qos: 1
     then:
       - lambda: |-
-          const std::string command_id = x["command_id"].is<const char *>()
-                                             ? x["command_id"].as<std::string>()
-                                             : std::string();
-          const std::string target = x["target"].is<const char *>()
-                                         ? x["target"].as<std::string>()
-                                         : std::string();
+          // Bound each untrusted field's length BEFORE materializing it as an
+          // owning std::string (same rationale as read_frame's cap below): an
+          // oversized value must not force a heap copy just to be rejected by
+          // the length caps inside valid_key()/parse_target(). Over-limit
+          // values collapse to empty, which the same validators reject with
+          // the same status the oversized original would have received.
+          auto bounded_field = [&](const char *key, size_t max_chars) -> std::string {
+            if (!x[key].is<const char *>())
+              return std::string();
+            const char *value = x[key].as<const char *>();
+            if (strlen(value) > max_chars)
+              return std::string();
+            return std::string(value);
+          };
+          const std::string command_id = bounded_field("command_id", 64);
+          const std::string target = bounded_field("target", 53);
           auto publish_status = [&](const char *status, const std::string &reason) {
             id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
               root["status"] = status;
@@ -327,11 +337,19 @@ mqtt:
             ESP_LOGW("rf433", "Rejected RX command: action must be a string");
             return;
           }
-          const std::string action = x["action"].as<std::string>();
+          // Same pre-materialization bounding as /tx: the longest legal value
+          // ("disarm") is 6 chars; command_id's contract cap is 64.
+          const char *action_value = x["action"].as<const char *>();
+          if (strlen(action_value) > 16) {
+            ESP_LOGW("rf433", "Rejected RX command: action is invalid");
+            return;
+          }
+          const std::string action = action_value;
           if (action == "disarm") {
-            const std::string command_id = x["command_id"].is<const char *>()
-                                               ? x["command_id"].as<std::string>()
-                                               : std::string();
+            const char *disarm_id_value =
+                x["command_id"].is<const char *>() ? x["command_id"].as<const char *>() : "";
+            const std::string command_id =
+                strlen(disarm_id_value) > 64 ? std::string() : std::string(disarm_id_value);
             if (!rf433::valid_key(command_id)) {
               ESP_LOGW("rf433", "Rejected disarm command: command_id is invalid");
               return;

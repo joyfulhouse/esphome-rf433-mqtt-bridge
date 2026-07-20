@@ -423,9 +423,8 @@ class TargetScheduler {
         const uint32_t airtime_ms = entry.airtime_ms;
         if (--entry.remaining > 0)
           this->flush_stops_.push_back(std::move(entry));
-        this->next_rf_at_ = now_ms + this->dispatch_hold_ms_(airtime_ms);
         this->flush_last_ = true;
-        this->record_dispatch_(now_ms, airtime_ms);
+        this->record_dispatch_(now_ms, airtime_ms, uart_ms_(raw.size()));
         return raw;
       }
       this->flush_last_ = false;
@@ -459,12 +458,11 @@ class TargetScheduler {
         if (command.remaining > 0)
           command.next_at = now_ms + this->repeat_gap_ms_;
 
-        this->next_rf_at_ = now_ms + this->dispatch_hold_ms_(airtime_ms);
         this->flush_last_ = false;
         this->cursor_ = (index + 1) % count;
         if (complete)
           this->erase_(target);
-        this->record_dispatch_(now_ms, airtime_ms);
+        this->record_dispatch_(now_ms, airtime_ms, uart_ms_(raw.size()));
         return raw;
       }
     }
@@ -588,23 +586,22 @@ class TargetScheduler {
     this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
   }
 
-  void mark_displaced_(const std::string &command_id) {
+  // Update an existing ring slot's remembered lifecycle in place.
+  // started_at_ms is only meaningful for state 2; other states pass 0.
+  void mark_recent_(const std::string &command_id, uint8_t state, uint32_t started_at_ms) {
     for (RecentCommand &recent : this->recent_ids_) {
       if (recent.command_id == command_id) {
-        recent.state = 4;
+        recent.state = state;
+        recent.started_at_ms = started_at_ms;
         return;
       }
     }
   }
 
+  void mark_displaced_(const std::string &command_id) { this->mark_recent_(command_id, 4, 0); }
+
   void mark_started_(const std::string &command_id, uint32_t now_ms) {
-    for (RecentCommand &recent : this->recent_ids_) {
-      if (recent.command_id == command_id) {
-        recent.state = 2;
-        recent.started_at_ms = now_ms;
-        return;
-      }
-    }
+    this->mark_recent_(command_id, 2, now_ms);
   }
 
   static bool due_(uint32_t now_ms, uint32_t deadline_ms) {
@@ -632,18 +629,36 @@ class TargetScheduler {
     return static_cast<uint32_t>((airtime_us + 999U) / 1000U);
   }
 
-  void record_dispatch_(uint32_t now_ms, uint32_t airtime_ms) {
-    this->rf_busy_until_ = now_ms + airtime_ms + RF_AIRTIME_MARGIN_MS;
-    this->rf_dispatched_ = true;
+  // UART serialization time for a hex-encoded frame at the fixed 19200-baud
+  // EFM8BB1 link (hex_chars/2 bytes x 10 bits, ceiled to ms). The dispatch
+  // timestamp is taken BEFORE the ESP serializes the frame over UART, and the
+  // coprocessor only starts RF once the trailer byte arrives, so the frame's
+  // real occupancy is serialization + airtime measured from that timestamp.
+  // An airtime-only hold under-covered the tail by the serialization time
+  // (~45 ms for a production AOK frame, ~135 ms at MAX_B0_FRAME_BYTES) and
+  // could let the next handoff reach the EFM8's ~64-byte UART ring while RF
+  // was still on air.
+  static uint32_t uart_ms_(size_t hex_chars) {
+    return static_cast<uint32_t>((static_cast<uint64_t>(hex_chars) * 5000U + 19199U) / 19200U);
   }
 
-  // Hold the next UART handoff until this frame's air completes. The EFM8BB1
-  // transmits a B0 frame blocking (embedded repeats included) behind a
-  // ~64-byte UART ring, so a frame handed off mid-transmission corrupts in
-  // that ring instead of pacing (field-observed: 10 rapid dispatches, one
-  // completion ACK). Zero/unknown airtimes keep the plain repeat gap.
-  uint32_t dispatch_hold_ms_(uint32_t airtime_ms) const {
-    return std::max(this->repeat_gap_ms_, airtime_ms + RF_AIRTIME_MARGIN_MS);
+  // Single owner of the dispatch-timing invariant: one call records both the
+  // pacing hold for the next UART handoff and the RF-air-busy horizon used by
+  // rf_air_clear(). The EFM8BB1 transmits a B0 frame blocking (embedded
+  // repeats included) behind a ~64-byte UART ring, so a frame handed off
+  // mid-transmission corrupts in that ring instead of pacing (field-observed:
+  // 10 rapid dispatches, one completion ACK). Zero/unknown airtimes keep the
+  // plain repeat gap.
+  void record_dispatch_(uint32_t now_ms, uint32_t airtime_ms, uint32_t serialize_ms) {
+    // Serialization is charged only when the frame will actually key RF
+    // (airtime > 0). A non-B0 frame's bytes drain through the EFM8's ring
+    // concurrently (its parser discards them without transmitting), so
+    // charging its UART time would only slow fail-safe STOP flushing.
+    const uint32_t occupancy_ms =
+        airtime_ms > 0 ? serialize_ms + airtime_ms + RF_AIRTIME_MARGIN_MS : RF_AIRTIME_MARGIN_MS;
+    this->rf_busy_until_ = now_ms + occupancy_ms;
+    this->rf_dispatched_ = true;
+    this->next_rf_at_ = now_ms + std::max(this->repeat_gap_ms_, occupancy_ms);
   }
 
   const std::string &phase_raw_(const Command &command) const {
