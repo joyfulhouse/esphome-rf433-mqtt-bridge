@@ -482,8 +482,10 @@ int main() {
   assert(flush_idle.idle());
 
   // This existing synthetic B0 fixture has 1,048,560 us of on-air time:
-  // two 0xFFFF-us pulses repeated eight times. Millisecond ceiling plus the
-  // 5 ms handoff margin makes it air-clear 1,054 ms after dispatch.
+  // two 0xFFFF-us pulses repeated eight times. The EFM8 keys RF only after
+  // the full command arrives over UART, so the busy window is the frame's
+  // 5 ms serialization (18 hex chars at 19200 baud, ceiled) plus 1,049 ms
+  // of air plus the 5 ms handoff margin: air-clear 1,059 ms after dispatch.
   const std::string airtime_frame = "AAB0050108FFFF0855";
   TargetScheduler air_scheduler(35);
   assert(air_scheduler.rf_air_clear(100));
@@ -492,15 +494,15 @@ int main() {
   raw = air_scheduler.next(100, started);
   assert(raw && *raw == airtime_frame);
   assert(!air_scheduler.rf_air_clear(100));
-  assert(!air_scheduler.rf_air_clear(1153));
-  assert(air_scheduler.rf_air_clear(1154));
+  assert(!air_scheduler.rf_air_clear(1158));
+  assert(air_scheduler.rf_air_clear(1159));
 
   // The same signed serial-number comparison remains correct when the busy
   // deadline wraps through UINT32_MAX.
   TargetScheduler wrap_scheduler(35);
   const uint32_t wrap_start = std::numeric_limits<uint32_t>::max() - 500U;
-  const uint32_t wrap_clear_at = wrap_start + 1054U;
-  assert(wrap_clear_at == 553U);
+  const uint32_t wrap_clear_at = wrap_start + 1059U;
+  assert(wrap_clear_at == 558U);
   assert(wrap_scheduler.rf_air_clear(wrap_start));
   assert(wrap_scheduler.schedule("wrap-air", target_b, airtime_frame, "", 1, 0, "",
                                  wrap_start, displaced, reason));
@@ -592,10 +594,11 @@ def test_native_scheduler_paces_dispatch_by_frame_airtime(tmp_path: Path) -> Non
     The coprocessor transmits a B0 frame blocking (embedded repeats included)
     with only a ~64-byte UART ring; a frame dispatched during that window is
     corrupted in the ring instead of paced (observed in the field: 10 rapid
-    dispatches produced a single completion ACK). The global pacing gate must
-    therefore wait max(repeat_gap, frame airtime + margin) after every
-    dispatch, computed from the same admission-time airtime used by
-    rf_air_clear.
+    dispatches produced a single completion ACK). The coprocessor keys RF only
+    after the full command arrives over the 19200-baud link, so the global
+    pacing gate must wait max(repeat_gap, serialization + airtime + margin)
+    after every dispatch, computed from the same admission-time airtime used
+    by rf_air_clear.
     """
     compiler = shutil.which("c++")
     if compiler is None:
@@ -624,6 +627,11 @@ int main() {
   assert(rf433::normalize_b0_with_airtime(frame, normalized, reason, airtime_us));
   const uint32_t airtime_ms = static_cast<uint32_t>((airtime_us + 999U) / 1000U);
   assert(airtime_ms > 100);  // realistic burst: far above the pacing gap
+  // UART serialization of the frame at 19200 baud (hex_chars/2 bytes x 10
+  // bits, ceiled to ms) -- the scheduler charges it because RF only starts
+  // once the trailer byte arrives at the coprocessor.
+  const uint32_t uart_ms =
+      static_cast<uint32_t>((frame.size() * 5000ULL + 19199ULL) / 19200ULL);
 
   std::string started;
   std::string reason2;
@@ -638,8 +646,8 @@ int main() {
   // The old gap-only gate would re-dispatch at +35 ms, mid-transmission.
   assert(!scheduler.next(1035, started));
   assert(!scheduler.next(1000 + airtime_ms, started));
-  // One margin tick after the air clears, the second repeat goes out.
-  const uint32_t clear_at = 1000 + airtime_ms + 5;
+  // One margin tick after serialization + air clears, the second repeat goes.
+  const uint32_t clear_at = 1000 + uart_ms + airtime_ms + 5;
   assert(!scheduler.next(clear_at - 1, started));
   raw = scheduler.next(clear_at, started);
   assert(raw && *raw == frame);
@@ -647,7 +655,7 @@ int main() {
 
   // Same pacing applies between the final repeats.
   assert(!scheduler.next(clear_at + 35, started));
-  raw = scheduler.next(clear_at + airtime_ms + 5, started);
+  raw = scheduler.next(clear_at + uart_ms + airtime_ms + 5, started);
   assert(raw && *raw == frame);
   assert(scheduler.idle());
 
@@ -694,7 +702,10 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     assert "TargetScheduler" in scheduler
     assert "rf433::tx_scheduler" in package
     assert 'x["command_id"]' in package
-    assert 'x["target"]' in package
+    # /tx reads command_id and target through the length-bounding helper so an
+    # oversized field is rejected before it is materialized as a std::string.
+    assert 'bounded_field("command_id", 64)' in package
+    assert 'bounded_field("target", 53)' in package
     assert '"stop_raw"' in package
     assert '"trailer_raw"' in package
     assert "stop_raw requires stop_after_ms" in package

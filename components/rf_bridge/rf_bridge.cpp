@@ -181,12 +181,22 @@ bool RFBridgeComponent::parse_bridge_byte_(uint8_t byte) {
 }
 
 void RFBridgeComponent::write_byte_str_(const std::string &codes) {
-  uint8_t code;
-  int size = codes.length();
-  for (int i = 0; i < size; i += 2) {
-    code = strtol(codes.substr(i, 2).c_str(), nullptr, 16);
-    this->write(code);
-  }
+  // Callers supply validated hex (the scheduler normalizes /tx frames; the
+  // advanced-code action is config-authored). Convert nibbles in place -- the
+  // previous substr+strtol form heap-allocated a temporary string per byte,
+  // ~130 allocations for a production frame on every repeat of every dispatch.
+  const auto nibble = [](char value) -> uint8_t {
+    if (value >= '0' && value <= '9')
+      return static_cast<uint8_t>(value - '0');
+    if (value >= 'A' && value <= 'F')
+      return static_cast<uint8_t>(value - 'A' + 10);
+    if (value >= 'a' && value <= 'f')
+      return static_cast<uint8_t>(value - 'a' + 10);
+    return 0;
+  };
+  const size_t size = codes.length();
+  for (size_t i = 0; i + 1 < size; i += 2)
+    this->write(static_cast<uint8_t>((nibble(codes[i]) << 4) | nibble(codes[i + 1])));
 }
 
 void RFBridgeComponent::loop() {

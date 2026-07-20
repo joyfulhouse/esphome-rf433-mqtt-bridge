@@ -7,6 +7,13 @@
 
 namespace esphome::rf_bridge {
 
+// Wire framing bytes shared with rf_bridge.h's command set. They live in this
+// dependency-free header so the native contract tests and the on-target
+// component parse the same values instead of re-typed literals.
+static const uint8_t RF_CODE_START = 0xAA;
+static const uint8_t RF_CODE_RFIN_BUCKET = 0xB1;
+static const uint8_t RF_CODE_STOP = 0x55;
+
 constexpr uint8_t B1_MIN_BUCKETS = 3;
 constexpr uint8_t B1_MAX_BUCKETS = 8;
 // Shortest accepted capture: preamble byte + 65 bit-pair bytes. OEM remotes
@@ -39,7 +46,7 @@ inline uint16_t b1_bucket(const std::vector<uint8_t> &raw, size_t index) {
 }
 
 inline bool is_aok_bucket_frame(const std::vector<uint8_t> &raw) {
-  if (raw.size() < 4 || raw[0] != 0xAA || raw[1] != 0xB1 || raw.back() != 0x55)
+  if (raw.size() < 4 || raw[0] != RF_CODE_START || raw[1] != RF_CODE_RFIN_BUCKET || raw.back() != RF_CODE_STOP)
     return false;
   const uint8_t bucket_count = raw[2];
   if (bucket_count < B1_MIN_BUCKETS || bucket_count > B1_MAX_BUCKETS)
@@ -152,11 +159,11 @@ inline bool is_aok_bucket_frame(const std::vector<uint8_t> &raw) {
 inline B1FrameStatus b1_frame_status(const std::vector<uint8_t> &raw) {
   if (raw.empty())
     return B1FrameStatus::INCOMPLETE;
-  if (raw[0] != 0xAA)
+  if (raw[0] != RF_CODE_START)
     return B1FrameStatus::INVALID;
   if (raw.size() == 1)
     return B1FrameStatus::INCOMPLETE;
-  if (raw[1] != 0xB1)
+  if (raw[1] != RF_CODE_RFIN_BUCKET)
     return B1FrameStatus::INVALID;
   if (raw.size() == 2)
     return B1FrameStatus::INCOMPLETE;
@@ -180,7 +187,7 @@ inline B1FrameStatus b1_frame_status(const std::vector<uint8_t> &raw) {
     return B1FrameStatus::INCOMPLETE;
   if (raw.size() > max_frame_size)
     return B1FrameStatus::INVALID;
-  if (raw.back() == 0x55 && is_aok_bucket_frame(raw)) {
+  if (raw.back() == RF_CODE_STOP && is_aok_bucket_frame(raw)) {
     // B1 has no B0-style total-length byte. AOK's 65/66-pair envelope plus
     // bounded capture padding gives four derived candidate offsets. A 0x55
     // at any shorter offset can itself be a legitimate pulse or padding byte,

@@ -415,6 +415,7 @@ def test_generated_cmd_handler_delegates_sniff_and_disarms_without_tx(
         #include <cassert>
         #include <cctype>
         #include <cstdint>
+        #include <cstring>
         #include <map>
         #include <string>
         #include <type_traits>
@@ -471,6 +472,10 @@ def test_generated_cmd_handler_delegates_sniff_and_disarms_without_tx(
           template<typename T> T as() const {
             if constexpr (std::is_same_v<T, std::string>)
               return std::get<std::string>(this->data->value);
+            // ArduinoJson returns a pointer into the document's storage; the
+            // map-held std::string plays that role here.
+            if constexpr (std::is_same_v<T, const char *>)
+              return std::get<std::string>(this->data->value).c_str();
             if constexpr (std::is_same_v<T, int>)
               return std::get<int>(this->data->value);
           }
