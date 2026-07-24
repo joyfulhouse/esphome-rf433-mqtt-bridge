@@ -23,17 +23,20 @@ methods intact. Its local changes are limited to:
 - a bounded 250 ms timeout for an in-progress B1 frame instead of the upstream 50 ms timeout; and
 - an unconditional startup A7 stop-sniff plus partial-capture reset for ESP-only restarts.
 
-The bridge package uses `on_bucket_received` only for the bounded Learn/onboarding flow:
+The bridge package uses `on_bucket_received` for the bounded Learn/onboarding flow and opt-in
+continuous state sync:
 
 - `{"action":"sniff","seconds":30}` on `rf433/<bridge_id>/cmd` starts or extends a sniff; integer
   values 1 through 60 select the window, with larger values hard-capped;
 - `{"action":"sniff","seconds":0}` cancels immediately;
-- `rf433/<bridge_id>/rx` publishes QoS 1, non-retained captures only while that sniff is active; and
+- `rf433/<bridge_id>/rx` publishes QoS 1, non-retained captures while that sniff is active or
+  opt-in idle listening is enabled; and
 - the callback never schedules or triggers TX.
 
-Continuous listen and live state-sync are planned follow-up work and are not part of this firmware
-slice. Real OEM capture decoding remains deferred hardware validation; current AOK fixtures are
-synthesized from the documented envelope assumptions.
+Continuous listen and live state sync ship behind the `listen_enabled` opt-in and are
+hardware-validated. The AOK tests include a re-keyed 65-pair fixture derived from an OEM capture.
+Its field jitter and truncated trailer are preserved without publishing the source remote's
+fixed-code identity; synthesized fixtures cover the broader envelope behavior.
 
 Rebase these files deliberately when changing the pinned ESPHome version; a local external
 component shadows the complete upstream `rf_bridge` implementation.

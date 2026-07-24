@@ -780,13 +780,14 @@ def test_b1_parser_uses_aok_envelope_offsets_and_preserves_interior_stop_bytes(
 
 
 def test_b1_parser_accepts_oem_truncated_trailer_capture(tmp_path: Path) -> None:
-    """A real OEM capture with 65 bit pairs is accepted end to end.
+    """A re-keyed OEM capture with 65 bit pairs is accepted end to end.
 
-    The office remote (5cad7c:da) transmits 64 payload bits plus a trailer
-    that captures as a single 0-read instead of the nominal [1, 0] — every
-    press was rejected until this tolerance (live-captured 2026-07-17, decodes
-    to the remote's calibrated ALL/UP command). Payload-only 64-pair frames
-    and a lone trailer 1-bit remain rejected: neither occurs on air.
+    The source capture contains 64 payload bits plus a trailer that captures
+    as a single 0-read instead of the nominal [1, 0]. Its real-world bucket
+    jitter and truncated-trailer structure are preserved, while the fixed-code
+    identity and command are replaced with synthetic test values. Payload-only
+    64-pair frames and a lone trailer 1-bit remain rejected: neither occurs on
+    air.
     """
     _write_rf_bridge_stubs(tmp_path)
     _compile_and_run(
@@ -815,13 +816,14 @@ def test_b1_parser_accepts_oem_truncated_trailer_capture(tmp_path: Path) -> None
         }
 
         int main() {
-          // Live OEM capture: office remote 5cad7c:da, ALL channels, UP
-          // (cmd f4bb) — 65 bit pairs, truncated trailer.
-          const std::string real =
-              "AAB10413EC026C012C143C38192A192A1A1A19292A192A192A1A192A192A1A1A"
-              "1A1A19292A1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A"
-              "192A19292A192A1A1A192A1A1955";
-          const std::vector<uint8_t> frame = from_hex(real);
+          // Re-keyed OEM-derived capture: synthetic remote 0xA1B2C3:0x42,
+          // channels 1-6, UP, synthetic command 0xF42B. The captured bucket
+          // jitter and 65-pair truncated trailer are unchanged.
+          const std::string capture_hex =
+              "AAB10413EC026C012C143C381A192A192929292A1A192A1A19292A192A1A192929292A1A"
+              "192A192929292A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A192929292A192"
+              "A192A1A1955";
+          const std::vector<uint8_t> frame = from_hex(capture_hex);
           assert(is_aok_bucket_frame(frame));
           assert(b1_frame_status(frame) == B1FrameStatus::CANDIDATE);
 
@@ -839,7 +841,7 @@ def test_b1_parser_accepts_oem_truncated_trailer_capture(tmp_path: Path) -> None
           App.set_loop_component_start_time(17);
           bridge.loop();
           assert(published == 1);
-          assert(last == real);
+          assert(last == capture_hex);
 
           // Payload-only (64 pairs) stays rejected.
           std::vector<uint8_t> no_trailer = frame;
@@ -903,9 +905,8 @@ def test_vendored_parser_never_acks_received_frames_and_bounds_advanced(tmp_path
         }
 
         int main() {
-          // TODO(hardware): Replace/augment the synthesized AOK fixtures in
-          // this file with OEM-captured UP/DOWN/STOP vectors after the hardware
-          // spike validates identities, channels, and capture jitter.
+          // This synthesized envelope fixture complements the separately
+          // pinned, re-keyed OEM-derived UP capture with preserved field jitter.
           RFBridgeComponent startup_bridge;
           size_t startup_callbacks = 0;
           startup_bridge.add_on_bucket_received_callback(
@@ -1449,7 +1450,7 @@ def test_rx_docs_publish_state_sync_contract_and_vendored_version() -> None:
     assert "HARDWARE-VALIDATED (2026-07-17)" in readme
     assert "remains gated" not in readme
     assert "HARDWARE-VALIDATION" not in readme
-    assert "OEM-captured golden" in readme
+    assert "golden UP fixture" in readme
     assert "never ACKs deliveries" in readme
     assert "paced by computed airtime" in readme
     assert "github://joyfulhouse/esphome-rf433-mqtt-bridge" in readme
@@ -1473,4 +1474,36 @@ def test_rx_docs_publish_state_sync_contract_and_vendored_version() -> None:
     assert "startup A7 stop-sniff" in vendor_notes
     assert "bounded Learn/onboarding flow" in vendor_notes
     assert "never schedules or triggers TX" in vendor_notes
-    assert "Real OEM capture decoding remains deferred" in vendor_notes
+    assert "remains deferred" not in vendor_notes
+
+
+def test_release_metadata_matches_latest_tag() -> None:
+    """Project/lock versions align and CI executes through the lockfile."""
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
+    uv_lock = (PROJECT_ROOT / "uv.lock").read_text()
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    project_lock_entry = uv_lock.split('name = "esphome-rf433-mqtt-bridge"', maxsplit=1)[1].split(
+        "[package.dev-dependencies]", maxsplit=1
+    )[0]
+
+    assert 'version = "1.2.2"' in pyproject
+    assert 'version = "1.2.2"' in project_lock_entry
+    assert "uv run --locked ruff check ." in workflow
+    assert "uv run --locked ruff format --check ." in workflow
+    assert "uv run --locked pytest -q" in workflow
+    assert "uv run ruff" not in workflow
+    assert "uv run pytest" not in workflow
+
+
+def test_rx_docs_match_shipped_behavior() -> None:
+    """Corrected docs describe parser casing, validation, and fixture scope."""
+    readme = (PROJECT_ROOT / "README.md").read_text()
+    vendor_notes = (RF_BRIDGE_DIR / "README.md").read_text()
+
+    assert "case-insensitive" in readme
+    assert "canonical uppercase" in readme
+    assert "golden UP fixture" in readme
+    assert "synthetic remote identity" in readme
+    assert "Continuous listen and live state sync ship" in vendor_notes
+    assert "hardware-validated" in vendor_notes
+    assert "re-keyed 65-pair fixture derived from an OEM capture" in vendor_notes

@@ -82,32 +82,31 @@ nothing):
 
 ## Real-remote validation (2026-07-17, later the same day) — PASSED
 
-A physical **kitchen remote ALL-channels UP press** was heard by the Office bridge across the
-house and synced end-to-end with no MQTT command anywhere on the bus:
+A physical **ALL-channels UP press from one OEM remote** was heard by the Office bridge across
+the house and synced end-to-end with no MQTT command anywhere on the bus:
 
-- `15:50:49Z` Office log: `Received RFBridge Bucket: AAB104142802760122141E38192A192A1A1A19292A1929292A192A192A19292A19292A19292929292A1A192A1A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A19292A1A1A192929292A1A1955`
-  — **the first real OEM capture**; decodes to `prefix=0x5c8a92 remote=0x0d chans=[1..6]
-  cmd=0xf4e1` = the calibrated Kitchen ALL/UP reference command, byte-exact against the
-  Hubitat-era calibration.
+- `15:50:49Z` Office log: `Received RFBridge Bucket: [redacted fixed-code RF credential]`
+  — **the first real OEM capture**; decodes to the calibrated ALL-channels/UP reference,
+  byte-exact against the earlier calibration.
 - `15:50:48.970Z` `cover.kitchen_shades` → `opening`, motion-modeled to `open/100` over its 61 s
   travel; an MQTT subscription spanning the window shows **no `/tx` on any bridge** — the
   transition came from the heard press. An earlier heard DOWN produced the matching full
   `closing → closed` cycle.
 - Heard UP on a fully-open cover and heard STOP on an idle cover are deliberate model no-ops and
   leave no visible trace — expected, observed.
-- Use this capture to replace/augment the synthesized AOK fixtures in `tests/`
-  (`TODO(hardware)` markers).
+- A re-keyed derivative of this capture can replace or augment synthesized AOK fixtures without
+  publishing a working fixed-code credential.
 
 ## Root cause #2 (same day): OEM truncated trailer — RESOLVED
 
-Direct validation of the Office remote (`5cad7c:da`) exposed a second, remote-specific failure:
-**every office press reached the bridge and was rejected by the AOK envelope filter.** Adding the
-rejected frames' bytes to the DEBUG log (now permanent) showed the remote transmits **65 bit
-pairs — 64 payload bits plus a trailer that captures as a single 0-read** — where the filter's
+Direct validation of another OEM remote exposed a second, remote-specific failure: **every press
+reached the bridge and was rejected by the AOK envelope filter.** Adding the rejected frames'
+bytes to the DEBUG log (now permanent) showed that it transmits **65 bit pairs — 64 payload bits
+plus a trailer that captures as a single 0-read** — where the filter's
 `B1_MIN_PULSE_BYTES = 67` and fixed 66-pair envelope walk demanded the nominal `[1, 0]` trailer.
-The kitchen remote transmits the full trailer, which is why it synced first. The codec's
+The first OEM remote transmits the full trailer, which is why it synced first. The codec's
 calibration decoder had documented this exact truncation ("legacy captures with a truncated
-trailer") — the office remote is that remote; the tolerance just never reached the receive path.
+trailer"); the tolerance just never reached the receive path.
 
 Fix (firmware `0bfc787`, consumer `d658ea6`):
 
@@ -118,12 +117,12 @@ Fix (firmware `0bfc787`, consumer `d658ea6`):
   `state_sync.frame_signature`; transport `encode_b0`/`decode_b0` stay strict. Echo comparison is
   unaffected: signatures are payload-field based.
 
-**Office validation PASSED (16:20:58Z):** a physical office-remote ALL/UP press was accepted
+**Office validation PASSED (16:20:58Z):** a physical OEM-remote ALL/UP press was accepted
 (`Received RFBridge Bucket`), published on `/rx`, and **all seven office covers** flipped to
 `opening` within 126 ms — including the `office_slider` group cover's first-ever state — and
 completed on their travel models. STOP applied as an idle freeze; the remote's OEM follow-on
-command (`cmd 0xdba2`, after UP) classified as non-movement and dropped. Live captures of all
-three actions are pinned in both repos' test suites.
+command (`cmd 0xdba2`, after UP) classified as non-movement and dropped. This firmware's test
+suite pins a re-keyed UP derivative with the original field jitter.
 
 ## Remaining before "synced blinds" is done
 

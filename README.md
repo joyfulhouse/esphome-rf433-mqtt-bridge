@@ -81,7 +81,8 @@ Command body on `tx`:
 }
 ```
 
-`target` is `prefix:remote_id:channels` (lowercase hex, strictly increasing channels 1..16).
+`target` is `prefix:remote_id:channels`. Hex parsing is case-insensitive and canonical uppercase
+is used internally; channels must be strictly increasing values from 1 through 16.
 `trailer_raw`, `stop_after_ms`, and `stop_raw` are optional; a timed command requires `stop_raw`.
 
 ### Time-boxed onboarding sniff
@@ -142,10 +143,11 @@ broker ACL for `rf433/<bridge_id>/rx` and `rf433/<bridge_id>/cmd` to the integra
 > stale `last_sniffing_command` and silently revert to standard sniffing, killing listening on
 > the first heard frame, so this component never ACKs deliveries; and **real OEM captures do not
 > all carry the `[1, 0]` trailer** — some remotes transmit 65 bit pairs with a single trailing
-> 0-read, which the filter now accepts. Real OEM-captured golden UP/DOWN/STOP frames (with field
-> bucket jitter) are pinned in the test suite alongside the synthesized fixtures. A 5 s
-> idempotent B1 keepalive bounds any remaining silent bucket-mode exit (e.g. an EFM8 watchdog
-> reset) to one period.
+> 0-read, which the filter now accepts. One golden UP fixture derived from an OEM capture is
+> pinned with a synthetic remote identity while preserving its field bucket jitter and truncated
+> trailer; synthesized fixtures cover the broader envelope behavior. A 5 s idempotent B1
+> keepalive bounds any remaining silent bucket-mode exit (e.g. an EFM8 watchdog reset) to one
+> period.
 
 Frame dispatch is paced by computed airtime: the EFM8BB1 transmits each B0 frame blocking
 (embedded repeats included) behind a small UART ring, so the scheduler holds the next handoff
@@ -155,15 +157,28 @@ multiply that — keep the product modest, since the bridge cannot listen while 
 
 ## Hardware
 
-- **Sonoff RF Bridge R2** with the EFM8BB1 RF coprocessor flashed to
-  [Portisch firmware](https://github.com/Portisch/RF-Bridge-EFM8BB1) (required — the stock RF
-  firmware cannot transmit raw B0 buckets).
-- **Supported board revisions: R2 V1.0/V2.0 (EFM8BB1).** The 2022+ **R2 V2.2** replaced the
-  EFM8BB1 with an OB38S003, which cannot run Portisch — that revision is unsupported.
+**→ [HARDWARE.md](HARDWARE.md) is the complete buy-it-and-flash-it guide** — board revisions,
+flashing Portisch onto the RF coprocessor, and replacing Tasmota with this package. Start there
+if you are setting up a bridge for the first time.
+
+The short version:
+
+- **Sonoff RF Bridge R2** ([itead.cc](https://itead.cc/product/sonoff-rf-bridge-433/), 433 MHz
+  variant) with the EFM8BB1 RF coprocessor flashed to
+  [Portisch firmware](https://github.com/Portisch/RF-Bridge-EFM8BB1) — required, because the stock
+  RF firmware cannot transmit raw B0 buckets.
+- **Supported board revisions: R2 V1.0/V2.0 (EFM8BB1)** — what this project is validated on. The
+  2022+ **R2 V2.2** replaced the EFM8BB1 with an OB38S003, which cannot run Portisch and is
+  unsupported. New stock may be either revision and listings rarely say which, so check before
+  buying.
 - The ESP8285 runs this ESPHome package (`rf_bridge:` UART @ 19200; GPIO1/GPIO3 belong to the RF
-  coprocessor, so serial logging is disabled).
+  coprocessor, so serial logging is disabled). Tasmota is used only as a one-time tool to flash
+  the coprocessor — it cannot drive the [zemismart-blinds][zemismart-blinds] integration itself.
 
 ## Install
+
+**New bridge?** Flash the RF coprocessor first — [HARDWARE.md](HARDWARE.md) walks through it.
+The steps below cover the ESP8285 side, and assume the coprocessor already runs Portisch.
 
 Any MQTT broker works — with Home Assistant's Mosquitto add-on (the common setup), the broker is
 simply your HA host; a standalone broker works identically.
@@ -191,7 +206,7 @@ simply your HA host; a standalone broker works identically.
 
    ```yaml
    external_components:
-     - source: github://joyfulhouse/esphome-rf433-mqtt-bridge@v1.2.0
+     - source: github://joyfulhouse/esphome-rf433-mqtt-bridge@v1.2.2
        components: [rf_bridge]
    ```
 2. Create `secrets.yaml` from `secrets.example.yaml`.
@@ -205,7 +220,9 @@ uvx --from "esphome==2026.6.5" esphome compile living-room.yaml
 uvx --from "esphome==2026.6.5" esphome run living-room.yaml
 ```
 
-First flash of a stock device requires serial; later updates are OTA.
+First flash of a stock device requires serial (5-pin header beside the power switch, switch slid
+toward it, button held while powering on — [HARDWARE.md §4](HARDWARE.md#4-step-2--this-package-on-the-esp8285));
+later updates are OTA.
 
 ## Development
 
@@ -224,8 +241,17 @@ package, headers, and `components/`, and performs the same full
 
 ## Roadmap
 
-- **State-sync rollout:** the opt-in firmware surface is available now; end-to-end use waits for real
-  OEM hardware fixtures and the validation gates above.
+State sync shipped and is hardware-validated in production (see the note above); it stays behind
+`listen_enabled` because continuous receive is a household activity stream that should be an
+explicit choice.
+
+Known deferred work, kept visible rather than forgotten:
+
+- **Structural cleanup on the RF path** — B1 analyzer unification and a single command container
+  (behaviour-preserving, but churn on a live-validated path; wants hardware re-validation).
+- **Clarity refactors** — a `ReplayState` enum and a `Frame{raw, airtime}` struct.
+- **Analyzed and judged negligible** — status-publish retry queue, disarm-tombstone ring eviction,
+  10 s watchdog sampling granularity.
 
 ## Support Development
 

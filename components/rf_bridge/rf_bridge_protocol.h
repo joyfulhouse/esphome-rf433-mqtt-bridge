@@ -17,8 +17,8 @@ static const uint8_t RF_CODE_STOP = 0x55;
 constexpr uint8_t B1_MIN_BUCKETS = 3;
 constexpr uint8_t B1_MAX_BUCKETS = 8;
 // Shortest accepted capture: preamble byte + 65 bit-pair bytes. OEM remotes
-// nominally encode 66 pairs (64 payload + [1, 0] trailer), but the office
-// 5cad7c remote's trailer captures one pair short (live-captured 2026-07-17).
+// nominally encode 66 pairs (64 payload + [1, 0] trailer), but field captures
+// confirm that some remotes' trailers capture one pair short.
 constexpr size_t B1_MIN_PULSE_BYTES = 66;
 constexpr size_t B1_MAX_PULSE_BYTES = 69;
 constexpr uint32_t B1_CANDIDATE_QUIET_MS = 5;
@@ -102,12 +102,11 @@ inline bool is_aok_bucket_frame(const std::vector<uint8_t> &raw) {
 
   const size_t encoded_start = sync_index + 2U;
   // OEM remotes nominally encode 64 payload bits plus a [1, 0] trailer, but
-  // some truncate the trailer on air so it captures as a single 0-read (the
-  // office 5cad7c remote, live-captured 2026-07-17; a lone 1-read cannot
-  // terminate a capture without its paired low). Accept the 66-pair nominal
-  // form and the 65-pair truncation, longest first — a full trailer's last
-  // pair can never be misread as padding because bit pulses fail the
-  // padding's AOK_SYNC_MIN_US floor.
+  // some truncate the trailer on air so it captures as a single 0-read. A lone
+  // 1-read cannot terminate a capture without its paired low. Accept the
+  // 66-pair nominal form and the 65-pair truncation, longest first — a full
+  // trailer's last pair can never be misread as padding because bit pulses
+  // fail the padding's AOK_SYNC_MIN_US floor.
   for (size_t trailer_bits = AOK_TRAILER_BITS; trailer_bits + 1U >= AOK_TRAILER_BITS;
        trailer_bits--) {
     const size_t bit_count = AOK_PAYLOAD_BITS + trailer_bits;

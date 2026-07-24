@@ -13,7 +13,7 @@ wheels = [
 
 [[package]]
 name = "esphome-rf433-mqtt-bridge"
-version = "1.0.0"
+version = "1.2.2"
 source = { virtual = "." }
 
 [package.dev-dependencies]
