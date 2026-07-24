@@ -18,7 +18,8 @@
 #
 # MQTT is provider-agnostic: any broker works. With Home Assistant's Mosquitto
 # add-on (the common core-mqtt setup) the broker is your HA host; a dedicated
-# broker works the same way. Leave mqtt_username empty for anonymous brokers.
+# broker works the same way. Authenticated MQTT is required for deployment:
+# override the blank placeholders with a least-privilege bridge principal.
 
 substitutions:
   bridge_id: rf433-bridge
@@ -31,6 +32,8 @@ substitutions:
   mqtt_username: ""
   mqtt_password: ""
   default_repeats: "5"
+  # Clamped by TargetScheduler to 0..60,000 ms so substitutions cannot cross
+  # the signed millis() comparison horizon or indefinitely postpone work.
   repeat_gap_ms: "35"
   api_encryption_key: REPLACE_WITH_32_BYTE_BASE64_KEY
   ota_password: REPLACE_WITH_OTA_PASSWORD
@@ -91,7 +94,8 @@ rf_bridge:
 # ESPHome emits the globals pstorage before the `includes:` header, so a
 # custom-typed global fails to compile. It keeps one state map per bridge and
 # emits one RF frame at a time globally while preserving each target's repeat
-# phase and absolute monotonic STOP deadline.
+# phase and absolute monotonic STOP due time (priority, not an exact on-air
+# timestamp).
 
 wifi:
   ssid: !secret wifi_ssid
@@ -111,6 +115,23 @@ api:
 ota:
   - platform: esphome
     password: ${ota_password}
+    # This is a mitigation, not persistence: armed STOP state is intentionally
+    # RAM-only, so an unexpected reset or power loss still cannot preserve it.
+    # A requested OTA gives us a begin callback; latch TX closed, drain one
+    # fail-safe STOP per armed command, and wait through each physical RF hold
+    # before the blocking transfer proceeds.
+    on_begin:
+      then:
+        - lambda: |-
+            id(ota_active) = true;
+            auto &sched = rf433::tx_scheduler(${repeat_gap_ms});
+            const auto stops = sched.drain_armed_stops();
+            for (const auto &stop : stops) {
+              while (!sched.rf_air_clear(millis()))
+                delay(1);
+              id(portisch_rf_bridge).send_raw(stop.raw);
+              delay(stop.occupancy_ms);
+            }
 
 mqtt:
   id: mqtt_client
@@ -169,18 +190,28 @@ mqtt:
           };
           const std::string command_id = bounded_field("command_id", 64);
           const std::string target = bounded_field("target", 53);
-          auto publish_status = [&](const char *status, const std::string &reason) {
-            id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
-              root["status"] = status;
-              root["command_id"] = command_id;
-              if (!reason.empty())
-                root["reason"] = reason;
-            }, 1, false);
+          auto send_status = [&](const rf433::LifecycleEvent &event) {
+            return id(mqtt_client).publish_json(
+                "rf433/${bridge_id}/status", [=](JsonObject root) {
+                  root["status"] = event.status();
+                  root["command_id"] = event.command_id;
+                  if (!event.reason.empty())
+                    root["reason"] = event.reason;
+                  if (event.has_age)
+                    root["age_ms"] = event.age_ms;
+                  if (event.has_clock) {
+                    root["t"] = event.timestamp_ms;
+                    root["boot"] = event.boot_id;
+                  }
+                }, 1, false);
+          };
+          auto publish_status = [&](const rf433::LifecycleEvent &event) {
+            rf433::lifecycle_outbox().publish_or_enqueue(event, send_status);
           };
           auto reject = [&](const std::string &reason) {
             ESP_LOGW("rf433", "Rejected command %s for %s: %s", command_id.c_str(),
                      target.c_str(), reason.c_str());
-            publish_status("rejected", reason);
+            publish_status(rf433::LifecycleEvent::rejected(command_id, reason));
           };
 
           // command_id and target are fully validated (parsed) inside
@@ -189,6 +220,10 @@ mqtt:
           // below. Re-parsing the target here would just waste cycles.
           if (!rf433::valid_key(command_id)) {
             reject("command_id is invalid");
+            return;
+          }
+          if (id(ota_active)) {
+            reject("OTA update in progress");
             return;
           }
 
@@ -212,19 +247,14 @@ mqtt:
           if (replay == 4) {
             // The original command was displaced after admission; replaying
             // accepted would let the controller rebuild a retired motion.
-            publish_status("displaced", "");
+            publish_status(rf433::LifecycleEvent::displaced(command_id));
             return;
           }
           if (replay > 0) {
-            publish_status("accepted", "");
+            publish_status(rf433::LifecycleEvent::accepted(command_id));
             if (replay == 2) {
-              id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
-                root["status"] = "started";
-                root["command_id"] = command_id;
-                root["age_ms"] = started_age_ms;
-                root["t"] = replay_ms;
-                root["boot"] = id(boot_id);
-              }, 1, false);
+              publish_status(rf433::LifecycleEvent::started(
+                  command_id, started_age_ms, replay_ms, id(boot_id)));
             }
             return;
           }
@@ -318,16 +348,13 @@ mqtt:
           }
           // `displaced` is published now, at admission of the replacing
           // command, but the displaced command's flushed fail-safe STOP
-          // physically transmits over the next pacing gap(s) (~${repeat_gap_ms}
-          // ms each). A controller that freezes its motion model at
-          // displaced-time is within one pacing gap of the physical truth.
+          // physically transmits after earlier physical RF occupancy and
+          // earlier displaced STOPs clear. The user repeat-gap floor never
+          // delays it.
           for (const std::string &displaced_id : displaced_ids) {
-            id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
-              root["status"] = "displaced";
-              root["command_id"] = displaced_id;
-            }, 1, false);
+            publish_status(rf433::LifecycleEvent::displaced(displaced_id));
           }
-          publish_status("accepted", "");
+          publish_status(rf433::LifecycleEvent::accepted(command_id));
 
   - topic: rf433/${bridge_id}/cmd
     qos: 1
@@ -356,12 +383,18 @@ mqtt:
             }
             rf433::tx_scheduler(${repeat_gap_ms}).disarm(command_id);
             const uint32_t status_ms = millis();
-            id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
-              root["status"] = "disarmed";
-              root["command_id"] = command_id;
-              root["t"] = status_ms;
-              root["boot"] = id(boot_id);
-            }, 1, false);
+            const auto event = rf433::LifecycleEvent::disarmed(
+                command_id, status_ms, id(boot_id));
+            auto send_status = [&](const rf433::LifecycleEvent &queued) {
+              return id(mqtt_client).publish_json(
+                  "rf433/${bridge_id}/status", [=](JsonObject root) {
+                    root["status"] = queued.status();
+                    root["command_id"] = queued.command_id;
+                    root["t"] = queued.timestamp_ms;
+                    root["boot"] = queued.boot_id;
+                  }, 1, false);
+            };
+            rf433::lifecycle_outbox().publish_or_enqueue(event, send_status);
             return;
           }
           const bool seconds_is_integer = x["seconds"].is<int>();
@@ -388,6 +421,9 @@ globals:
   - id: boot_id
     type: uint32_t
     initial_value: "0"
+  - id: ota_active
+    type: bool
+    initial_value: "false"
   - id: next_info_ms
     type: uint32_t
     initial_value: "0"
@@ -410,6 +446,31 @@ interval:
           auto &sched = rf433::tx_scheduler(${repeat_gap_ms});
           auto &rx = rf433::rx_state();
           rx.tick(now_ms);
+          auto &outbox = rf433::lifecycle_outbox();
+          auto send_status = [&](const rf433::LifecycleEvent &event) {
+            return id(mqtt_client).publish_json(
+                "rf433/${bridge_id}/status", [=](JsonObject root) {
+                  root["status"] = event.status();
+                  root["command_id"] = event.command_id;
+                  if (!event.reason.empty())
+                    root["reason"] = event.reason;
+                  if (event.has_age)
+                    root["age_ms"] = event.age_ms;
+                  if (event.has_clock) {
+                    root["t"] = event.timestamp_ms;
+                    root["boot"] = event.boot_id;
+                  }
+                }, 1, false);
+          };
+          if (id(mqtt_client).is_connected())
+            outbox.flush(send_status);
+          static uint32_t logged_outbox_drops = 0;
+          if (outbox.dropped_count() != logged_outbox_drops) {
+            ESP_LOGW("rf433", "Lifecycle outbox dropped %u oldest event(s), total=%u",
+                     outbox.dropped_count() - logged_outbox_drops,
+                     outbox.dropped_count());
+            logged_outbox_drops = outbox.dropped_count();
+          }
           const bool busy = !sched.idle() || !sched.rf_air_clear(now_ms);
           const bool desired = !busy && rx.wants_sniff(now_ms, ${listen_enabled});
           if (desired != rx.radio_sniffing()) {
@@ -459,16 +520,10 @@ interval:
           // UART. ESPHome's rf_bridge send_raw does not wait for an EFM8BB1
           // ack, so `started` is proof of dispatch, not of RF emission.
           const uint32_t status_ms = millis();
-          auto publish_status = [&](const char *status, const std::string &command_id) {
-            id(mqtt_client).publish_json("rf433/${bridge_id}/status", [=](JsonObject root) {
-              root["status"] = status;
-              root["command_id"] = command_id;
-              root["age_ms"] = status_ms - dispatch_ms;
-              root["t"] = status_ms;
-              root["boot"] = id(boot_id);
-            }, 1, false);
-          };
-          publish_status("started", started_command_id);
+          outbox.publish_or_enqueue(
+              rf433::LifecycleEvent::started(
+                  started_command_id, status_ms - dispatch_ms, status_ms, id(boot_id)),
+              send_status);
   - interval: 10s
     then:
       - lambda: |-

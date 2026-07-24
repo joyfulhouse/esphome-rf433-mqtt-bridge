@@ -15,6 +15,7 @@ BRIDGE_YAML = PROJECT_ROOT / "rf433-mqtt-bridge.yaml"
 RX_HEADER = PROJECT_ROOT / "rf433_rx.h"
 RF_BRIDGE_DIR = PROJECT_ROOT / "components" / "rf_bridge"
 RF_BRIDGE_PROTOCOL = RF_BRIDGE_DIR / "rf_bridge_protocol.h"
+TX_SEND_PATHS = 2
 
 
 def _compile_and_run(tmp_path: Path, source_text: str) -> None:
@@ -423,32 +424,7 @@ def test_generated_cmd_handler_delegates_sniff_and_disarms_without_tx(
         #include <vector>
 
         #include "rf433_rx.h"
-
-        namespace rf433 {
-
-        inline bool valid_key(const std::string &value) {
-          if (value.empty() || value.size() > 64)
-            return false;
-          return std::all_of(value.begin(), value.end(), [](char character) {
-            const auto byte = static_cast<unsigned char>(character);
-            return std::isalnum(byte) || character == '-' || character == '_' ||
-                   character == '.' || character == ':' || character == ',';
-          });
-        }
-
-        struct FakeScheduler {
-          std::vector<std::string> disarmed_ids;
-          void disarm(const std::string &command_id) {
-            this->disarmed_ids.push_back(command_id);
-          }
-        };
-
-        inline FakeScheduler &tx_scheduler(uint32_t) {
-          static FakeScheduler scheduler;
-          return scheduler;
-        }
-
-        }  // namespace rf433
+        #include "rf433_scheduler.h"
 
         struct JsonValueData {
           std::variant<std::monostate, std::string, int, bool> value;
@@ -633,15 +609,15 @@ def test_generated_cmd_handler_delegates_sniff_and_disarms_without_tx(
           missing_command_id.set_string("action", "disarm");
           generated_cmd_handler(missing_command_id);
           generated_cmd_handler(disarm_command("invalid key"));
-          assert(rf433::tx_scheduler(35).disarmed_ids.empty());
+          uint32_t age = 0;
+          assert(rf433::tx_scheduler(35).replay_state("move:42", 600, age) == 0);
           assert(mqtt_client.messages.empty());
 
           // Disarm bypasses the sniff rate limiter, delegates to the scheduler,
           // publishes an idempotent acknowledgement, and has no TX surface.
           fake_now_ms = 601;
           generated_cmd_handler(disarm_command("move:42"));
-          assert(rf433::tx_scheduler(35).disarmed_ids ==
-                 std::vector<std::string>({"move:42"}));
+          assert(rf433::tx_scheduler(35).replay_state("move:42", 601, age) == 4);
           assert(mqtt_client.messages.size() == 1);
           const Message &ack = mqtt_client.messages.front();
           assert(ack.topic == "rf433/test-bridge/status");
@@ -1308,7 +1284,8 @@ def test_firmware_wires_state_sync_contract_without_rx_to_tx() -> None:
     assert "rf433::rx_state().should_publish()" in rx_handler
     assert 'root["boot"] = id(boot_id);' in rx_handler
     assert "}, 1, false)" in rx_handler
-    assert package.count(".send_raw(") == 1
+    # Normal interval TX plus the OTA begin STOP-flush path; RX itself has none.
+    assert package.count(".send_raw(") == TX_SEND_PATHS
 
     cmd_handler = package.split("- topic: rf433/${bridge_id}/cmd", maxsplit=1)[1].split(
         "\nglobals:", maxsplit=1
@@ -1318,9 +1295,10 @@ def test_firmware_wires_state_sync_contract_without_rx_to_tx() -> None:
     assert 'action == "disarm"' in cmd_handler
     assert "rf433::valid_key(command_id)" in cmd_handler
     assert ".disarm(command_id)" in cmd_handler
-    assert 'root["status"] = "disarmed";' in cmd_handler
-    assert 'root["t"] = status_ms;' in cmd_handler
-    assert 'root["boot"] = id(boot_id);' in cmd_handler
+    assert "LifecycleEvent::disarmed" in cmd_handler
+    assert "lifecycle_outbox().publish_or_enqueue" in cmd_handler
+    assert 'root["t"] = queued.timestamp_ms;' in cmd_handler
+    assert 'root["boot"] = queued.boot_id;' in cmd_handler
 
     interval_handler = package.split("interval:", maxsplit=1)[1]
     assert "rx.tick(now_ms)" in interval_handler
@@ -1346,13 +1324,14 @@ def test_firmware_state_sync_payloads_and_deferred_surface() -> None:
     assert 'root["listen"] = ${listen_enabled};' in info_publish
     assert 'root["v"] = 2;' in info_publish
 
-    # Both the replay and fresh-dispatch paths publish a measured age and the
-    # same bridge-clock/session fields needed to recover the handoff instant.
+    # Both the handler and interval outbox publishers serialize measured age
+    # and bridge-clock/session fields when the lifecycle event carries them.
     started_paths_stamping_age = 2
     assert package.count('root["age_ms"]') == started_paths_stamping_age
-    assert 'root["age_ms"] = started_age_ms;' in package
-    assert 'root["age_ms"] = status_ms - dispatch_ms;' in interval_handler
-    assert 'publish_status("started", started_command_id);' in interval_handler
+    assert "LifecycleEvent::started(" in package
+    assert "started_age_ms, replay_ms, id(boot_id)" in package
+    assert "status_ms - dispatch_ms, status_ms, id(boot_id)" in interval_handler
+    assert "outbox.publish_or_enqueue(" in interval_handler
 
     # The remaining integration-central surfaces are deliberately unbuilt.
     # RX_KEEPALIVE_MS moved out of this list on 2026-07-17: the hardware spike
@@ -1475,6 +1454,21 @@ def test_rx_docs_publish_state_sync_contract_and_vendored_version() -> None:
     assert "bounded Learn/onboarding flow" in vendor_notes
     assert "never schedules or triggers TX" in vendor_notes
     assert "remains deferred" not in vendor_notes
+
+
+def test_stop_integrity_contract_is_documented() -> None:
+    """README scopes timing, replay, ACL, semantic-trust, and RAM guarantees."""
+    readme = (PROJECT_ROOT / "README.md").read_text()
+    normalized = " ".join(readme.split())
+
+    assert "not a guaranteed on-air timestamp" in normalized
+    assert "roughly N physical frame-occupancy intervals" in normalized
+    assert "64 most recent same-boot command IDs" in normalized
+    assert "Authenticated MQTT is required" in normalized
+    assert "| Controller |" in readme
+    assert "| Bridge `<bridge_id>` |" in readme
+    assert "trusts the authenticated" in readme
+    assert "unexpected reset or power loss" in readme
 
 
 def test_release_metadata_matches_latest_tag() -> None:

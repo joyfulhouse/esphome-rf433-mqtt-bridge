@@ -22,18 +22,25 @@ validates, schedules, and transmits Portisch **B0** raw frames.
   means the frame was handed to the RF coprocessor over UART (ESPHome's `send_raw` does not wait
   for an EFM8BB1 ack); it is proof of dispatch, not of RF emission.
 - **Per-target scheduling** — one RF frame on air at a time, while each target keeps its own
-  repeat phase and an **absolute monotonic STOP deadline** (`stop_after_ms` + `stop_raw`) so a
-  partial movement is stopped by the bridge itself even if the controller disappears.
+  repeat phase and an **absolute monotonic STOP due time** (`stop_after_ms` + `stop_raw`) so a
+  partial movement is stopped by the bridge itself even if the controller disappears. The due
+  time raises STOP to safety priority; it is not a guaranteed on-air timestamp because an
+  already-transmitting frame and earlier safety STOPs must physically clear first.
 - **Latest command wins** — a new command whose channels overlap an active target on the same
   remote displaces it: the displaced command's pending fail-safe STOP is flushed on air first,
   and a `displaced` status with its `command_id` tells the controller to retire its motion model.
-  `displaced` is published at admission of the replacing command, while the flushed STOP physically
-  transmits within the next pacing gap(s); a controller that freezes the model at displaced-time is
-  within one pacing gap of physical truth.
+  `displaced` is published at admission of the replacing command. The first flushed STOP bypasses
+  the discretionary `repeat_gap_ms` floor, but still waits for physical RF occupancy and earlier
+  safety STOPs. A replacement overlapping N active targets can therefore put the last first-STOP
+  copy roughly N physical frame-occupancy intervals after `displaced`; the status is not an on-air
+  timestamp.
 - **Duplicate suppression** — a ring of recent `command_id`s suppresses QoS-1 broker redeliveries
   and same-boot retained replays. The ring lives in RAM, so a retained `tx` command *can* replay
   after a reboot: **retained `tx` publishes are unsupported and dangerous — never publish them.**
-- **Bounded memory** — admission enforces a total stored-frame budget sized for the ESP8285 heap.
+- **Bounded memory and latency** — admission enforces both a stored-frame heap budget and a
+  4,000 ms aggregate first-STOP occupancy budget. Lifecycle statuses use a 32-event FIFO outbox;
+  duplicate command/status transitions coalesce, sustained overflow drops the oldest event, and
+  the bridge logs a monotonic drop counter.
 - **Retained discovery** — the beacon publishes retained `availability` (birth/will) and `info`
   (area, default flag, boot session, listen capability, and contract version) so controllers can
   discover online bridges and prefer one in the same area.
@@ -56,6 +63,17 @@ All topics live under the fixed `rf433/` root:
 | `rf433/<bridge_id>/rx` | bridge → broker (QoS 1, non-retained) | `{"frame":"AAB1...55","t":123456,"boot":2718281828}` |
 | `rf433/<bridge_id>/cmd` | controller → bridge (QoS 1, non-retained) | bounded sniff/cancel or disarm command (below) |
 
+Authenticated MQTT is required. Use distinct controller and bridge principals where the broker
+supports them, never grant anonymous access, and apply this least-privilege broker ACL matrix:
+
+| Principal | May publish | May subscribe |
+|---|---|---|
+| Controller | `rf433/<bridge_id>/tx`, `rf433/<bridge_id>/cmd` | `rf433/<bridge_id>/status`, `rf433/<bridge_id>/rx`, `rf433/<bridge_id>/info`, `rf433/<bridge_id>/availability` |
+| Bridge `<bridge_id>` | its own `status`, `rx`, `info`, and `availability` topics | its own `tx` and `cmd` topics |
+
+No bridge principal should be able to publish `/tx` or `/cmd`, and no controller principal should
+be able to publish bridge-originated `status`, `rx`, `info`, or `availability`.
+
 `status` is `accepted`, `rejected` (with `reason`), `started` (first RF dispatch), `displaced`
 (a newer overlapping command replaced this one — see below), or `disarmed`.
 
@@ -64,8 +82,15 @@ QoS-1 broker redeliveries are answered idempotently: an already-admitted `comman
 Every `started`, both fresh and replayed, carries `t`, `age_ms`, and `boot`. `t` is the publish time
 on the bridge clock and `age_ms` is measured from the command's one stored dispatch instant, so
 `handoff = t - age_ms` modulo the 32-bit clock range. The controller anchors its motion model at
-that handoff. A `command_id` that was rejected by a state-dependent admission check (scheduler full,
-storage budget) is remembered and re-rejected, never silently admitted later.
+that handoff. Duplicate/rejection memory is authoritative for live commands and for the 64 most
+recent same-boot command IDs. Within that window, a `command_id` rejected by a state-dependent
+admission check (scheduler full, storage, or first-STOP budget) is re-rejected rather than silently
+admitted later. The ring is RAM-only and older completed IDs can be evicted.
+
+Failed lifecycle publishes are queued in the bounded outbox and retried on the 5 ms tick/reconnect,
+FIFO across commands and in lifecycle order within one `command_id`. This keeps a failed or replayed
+`accepted` ahead of its `started`; successfully delivered events are removed and are not republished
+by the outbox.
 
 Command body on `tx`:
 
@@ -84,6 +109,9 @@ Command body on `tx`:
 `target` is `prefix:remote_id:channels`. Hex parsing is case-insensitive and canonical uppercase
 is used internally; channels must be strictly increasing values from 1 through 16.
 `trailer_raw`, `stop_after_ms`, and `stop_raw` are optional; a timed command requires `stop_raw`.
+The bridge validates JSON shape, bounds, and B0 structure, but deliberately trusts the authenticated
+controller for frame semantics: it cannot prove that `raw`, `trailer_raw`, and `stop_raw` address
+the same physical blind or match the declared `target`.
 
 ### Time-boxed onboarding sniff
 
@@ -133,8 +161,8 @@ Treat `t` as a `millis()` clock that is monotonic modulo `2^32`; equal stamps ar
 interpreted with serial-number arithmetic. Pair every timestamp with `boot`, and discard correlation
 state when that session value changes.
 
-Continuous receive is a household activity stream. Keep it opt-in and non-retained, and scope the
-broker ACL for `rf433/<bridge_id>/rx` and `rf433/<bridge_id>/cmd` to the integration principal.
+Continuous receive is a household activity stream. Keep it opt-in and non-retained, and apply the
+authenticated least-privilege matrix above.
 
 > **HARDWARE-VALIDATED (2026-07-17):** end-to-end state sync runs in production on a
 > seven-bridge fleet; physical remote presses mirror into the controller within ~150 ms. The
@@ -151,9 +179,17 @@ broker ACL for `rf433/<bridge_id>/rx` and `rf433/<bridge_id>/cmd` to the integra
 
 Frame dispatch is paced by computed airtime: the EFM8BB1 transmits each B0 frame blocking
 (embedded repeats included) behind a small UART ring, so the scheduler holds the next handoff
-until the previous frame's air completes (`repeat_gap_ms` acts as a floor). A typical AOK frame
-with the production embedded repeat of 8 occupies ~560 ms of air, and controller-level `repeats`
-multiply that — keep the product modest, since the bridge cannot listen while transmitting.
+until the previous frame's UART serialization and air complete. For normal ACTION/TRAILER work,
+`repeat_gap_ms` is an additional discretionary floor, clamped to `0…60,000 ms`; due and displaced
+STOPs bypass that floor but never physical occupancy. A typical AOK frame with the production
+embedded repeat of 8 occupies ~560 ms of air, and controller-level `repeats` multiply that — keep
+the product modest, since the bridge cannot listen while transmitting.
+
+At an ESPHome OTA `on_begin`, the bridge stops accepting new `/tx`, synchronously sends one early
+STOP for every already-armed timed command (waiting through physical RF occupancy between frames),
+and clears the scheduler before the blocking transfer. This mitigates requested OTA updates; it is
+not durable STOP persistence or a full idle-only OTA interlock. Armed STOP state is RAM-only by
+design, so an unexpected reset or power loss still cannot preserve it.
 
 ## Hardware
 
@@ -250,8 +286,8 @@ Known deferred work, kept visible rather than forgotten:
 - **Structural cleanup on the RF path** — B1 analyzer unification and a single command container
   (behaviour-preserving, but churn on a live-validated path; wants hardware re-validation).
 - **Clarity refactors** — a `ReplayState` enum and a `Frame{raw, airtime}` struct.
-- **Analyzed and judged negligible** — status-publish retry queue, disarm-tombstone ring eviction,
-  10 s watchdog sampling granularity.
+- **Analyzed and judged negligible** — disarm-tombstone ring eviction and 10 s watchdog sampling
+  granularity.
 
 ## Support Development
 

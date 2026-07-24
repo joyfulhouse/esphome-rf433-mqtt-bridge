@@ -21,6 +21,8 @@ substitutions:
   default_bridge: "true"       # "true" on exactly one bridge in your home
   listen_enabled: "false"
   # With Home Assistant's Mosquitto add-on, the broker is your HA host.
+  # Use an authenticated, least-privilege bridge account; anonymous MQTT is
+  # outside the firmware's safety contract.
   mqtt_broker: homeassistant.local
   mqtt_username: !secret mqtt_username
   mqtt_password: !secret mqtt_password

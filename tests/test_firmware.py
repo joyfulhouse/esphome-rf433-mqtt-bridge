@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,24 @@ import pytest
 PROJECT_ROOT = Path(__file__).parents[1]
 SCHEDULER_HEADER = PROJECT_ROOT / "rf433_scheduler.h"
 BRIDGE_YAML = PROJECT_ROOT / "rf433-mqtt-bridge.yaml"
+
+
+def _firmware_lambda(section_start: str, section_end: str) -> str:
+    """Extract a shipped ESPHome lambda for host execution."""
+    package = BRIDGE_YAML.read_text()
+    section = package.split(section_start, maxsplit=1)[1].split(section_end, maxsplit=1)[0]
+    body = section.split("- lambda: |-", maxsplit=1)[1]
+    substitutions = {
+        "${bridge_id}": "test-bridge",
+        "${bridge_area}": "test-area",
+        "${default_bridge}": "false",
+        "${default_repeats}": "5",
+        "${listen_enabled}": "false",
+        "${repeat_gap_ms}": "35",
+    }
+    for key, value in substitutions.items():
+        body = body.replace(key, value)
+    return textwrap.dedent(body).strip()
 
 
 def test_native_scheduler_keeps_per_target_timed_stops_and_frame_order(tmp_path: Path) -> None:
@@ -693,6 +712,674 @@ int main() {
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
+def test_native_scheduler_bounds_gap_and_stops_override_user_pacing(tmp_path: Path) -> None:
+    """Invalid user gaps are bounded and cannot postpone a physically-clear STOP."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
+    source = tmp_path / "scheduler_gap_safety_test.cpp"
+    binary = tmp_path / "scheduler_gap_safety_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+#include "rf433_scheduler.h"
+
+using rf433::TargetScheduler;
+
+int main() {
+  std::string started;
+  std::string reason;
+  std::vector<std::string> displaced;
+
+  // A due STOP bypasses the 60-second user floor as soon as the 5 ms physical
+  // occupancy is clear.
+  TargetScheduler due_stop(60000);
+  assert(due_stop.schedule("due", "a1b2c3:04:1", "ACTION", "", 1, 10, "STOP", 0,
+                           displaced, reason));
+  auto raw = due_stop.next(0, started);
+  assert(raw && *raw == "ACTION");
+  assert(!due_stop.next(4, started));
+  raw = due_stop.next(10, started);
+  assert(raw && *raw == "STOP");
+
+  // A negative substitution must not survive conversion as a huge uint32_t.
+  // Clamping it to zero leaves only the 5 ms physical safety margin.
+  TargetScheduler negative_gap(-35);
+  assert(negative_gap.schedule("negative", "a1b2c3:01:1", "N", "", 2, 0, "", 0,
+                               displaced, reason));
+  raw = negative_gap.next(0, started);
+  assert(raw && *raw == "N");
+  assert(!negative_gap.next(4, started));
+  raw = negative_gap.next(5, started);
+  assert(raw && *raw == "N");
+
+  // An oversized preference is clamped to 60 seconds, still far inside the
+  // signed serial-arithmetic horizon.
+  TargetScheduler oversized_gap(std::numeric_limits<int32_t>::max());
+  assert(oversized_gap.schedule("oversized", "a1b2c3:02:1", "O", "", 2, 0, "", 100,
+                                displaced, reason));
+  raw = oversized_gap.next(100, started);
+  assert(raw && *raw == "O");
+  assert(!oversized_gap.next(60099, started));
+  raw = oversized_gap.next(60100, started);
+  assert(raw && *raw == "O");
+
+  // The maximum bounded gap remains correct when its deadline wraps uint32_t.
+  TargetScheduler rollover_gap(std::numeric_limits<int32_t>::max());
+  const uint32_t wrap_start = std::numeric_limits<uint32_t>::max() - 30000U;
+  const uint32_t wrap_due = wrap_start + 60000U;
+  assert(wrap_due == 29999U);
+  assert(rollover_gap.schedule("rollover", "a1b2c3:03:1", "R", "", 2, 0, "",
+                               wrap_start, displaced, reason));
+  raw = rollover_gap.next(wrap_start, started);
+  assert(raw && *raw == "R");
+  assert(!rollover_gap.next(wrap_due - 1U, started));
+  raw = rollover_gap.next(wrap_due, started);
+  assert(raw && *raw == "R");
+
+  // A displaced STOP has the same safety priority; the replacement ACTION
+  // remains discretionary and continues to honor the long user floor.
+  TargetScheduler displaced_stop(60000);
+  assert(displaced_stop.schedule("old", "a1b2c3:05:1", "OLD", "", 1, 1000, "SAFE", 0,
+                                 displaced, reason));
+  raw = displaced_stop.next(0, started);
+  assert(raw && *raw == "OLD");
+  assert(displaced_stop.schedule("new", "a1b2c3:05:1", "NEW", "", 1, 0, "", 1,
+                                 displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "old");
+  assert(!displaced_stop.next(4, started));
+  raw = displaced_stop.next(5, started);
+  assert(raw && *raw == "SAFE");
+  assert(!displaced_stop.next(60004, started));
+  raw = displaced_stop.next(60005, started);
+  assert(raw && *raw == "NEW");
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, text=True)
+
+
+def test_native_scheduler_rejects_first_stop_occupancy_over_budget(tmp_path: Path) -> None:
+    """Admission bounds aggregate one-copy fail-safe STOP occupancy."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
+    source = tmp_path / "scheduler_stop_budget_test.cpp"
+    binary = tmp_path / "scheduler_stop_budget_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <string>
+#include <vector>
+#include "rf433_scheduler.h"
+
+using rf433::TargetScheduler;
+
+int main() {
+  // This valid B0 frame occupies 1,059 ms including UART serialization and
+  // scheduler margin. Three first STOP copies fit the 4,000 ms safety budget;
+  // the fourth would raise aggregate occupancy to 4,236 ms and is rejected.
+  const std::string slow_stop = "AAB0050108FFFF0855";
+  TargetScheduler scheduler(0);
+  std::string reason;
+  std::vector<std::string> displaced;
+  for (int index = 0; index < 3; index++) {
+    const std::string target = "a1b2c3:0" + std::to_string(index + 1) + ":1";
+    assert(scheduler.schedule("timed-" + std::to_string(index), target, "A", "", 1,
+                              60000, slow_stop, 0, displaced, reason));
+  }
+  assert(!scheduler.schedule("timed-3", "a1b2c3:04:1", "A", "", 1, 60000,
+                             slow_stop, 0, displaced, reason));
+  assert(reason == "first-STOP safety budget exceeded");
+  uint32_t age = 0;
+  assert(scheduler.replay_state("timed-3", 0, age) == 3);
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_native_scheduler_ota_drain_emits_armed_stops_once_and_clears(
+    tmp_path: Path,
+) -> None:
+    """OTA draining snapshots only armed STOPs and leaves no scheduled work."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
+    source = tmp_path / "scheduler_ota_drain_test.cpp"
+    binary = tmp_path / "scheduler_ota_drain_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <string>
+#include <vector>
+#include "rf433_scheduler.h"
+
+using rf433::TargetScheduler;
+
+int main() {
+  TargetScheduler scheduler(60000);
+  std::string started;
+  std::string reason;
+  std::vector<std::string> displaced;
+
+  assert(scheduler.schedule("armed", "a1b2c3:01:1", "A", "", 5, 60000, "SA", 0,
+                            displaced, reason));
+  auto raw = scheduler.next(0, started);
+  assert(raw && *raw == "A" && started == "armed");
+  // This timed command never reached its first ACTION handoff, so its STOP is
+  // not armed and OTA must not synthesize motion by transmitting anything.
+  assert(scheduler.schedule("unstarted", "a1b2c3:02:1", "B", "", 5, 60000, "SB", 1,
+                            displaced, reason));
+
+  const auto stops = scheduler.drain_armed_stops();
+  assert(stops.size() == 1);
+  assert(stops[0].raw == "SA");
+  assert(stops[0].occupancy_ms == 5);
+  assert(scheduler.idle());
+  assert(!scheduler.next(60000, started));
+  assert(scheduler.drain_armed_stops().empty());
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_generated_ota_begin_flushes_armed_stop_before_return(tmp_path: Path) -> None:
+    """Execute the shipped OTA begin lambda with physical occupancy waits."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the generated firmware test")
+    ota_lambda = _firmware_lambda("    on_begin:", "\n\nmqtt:")
+    source = tmp_path / "generated_ota_test.cpp"
+    binary = tmp_path / "generated_ota_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "rf433_scheduler.h"
+
+struct FakeBridge {
+  std::vector<std::string> sent;
+  void send_raw(const std::string &raw) { this->sent.push_back(raw); }
+} portisch_rf_bridge;
+
+uint32_t fake_now_ms{0};
+bool ota_active{false};
+
+uint32_t millis() { return fake_now_ms; }
+void delay(uint32_t duration_ms) { fake_now_ms += duration_ms; }
+
+#define id(value) value
+
+void generated_ota_begin() {
+"""
+        + ota_lambda
+        + r"""
+}
+
+int main() {
+  const std::string action = "AAB005010100010055";
+  const std::string stop = "AAB005010100000055";
+  auto &scheduler = rf433::tx_scheduler(35);
+  std::string started;
+  std::string reason;
+  std::vector<std::string> displaced;
+
+  assert(scheduler.schedule("armed", "a1b2c3:01:1", action, "", 3, 60000, stop, 100,
+                            displaced, reason));
+  auto raw = scheduler.next(100, started);
+  assert(raw && *raw == action && started == "armed");
+  portisch_rf_bridge.send_raw(*raw);
+  assert(scheduler.schedule("unstarted", "a1b2c3:02:1", action, "", 3, 60000, stop, 101,
+                            displaced, reason));
+
+  fake_now_ms = 101;
+  generated_ota_begin();
+  assert(ota_active);
+  assert(portisch_rf_bridge.sent == std::vector<std::string>({action, stop}));
+  assert(scheduler.idle());
+  assert(fake_now_ms >= 116);  // wait for current frame, then drained STOP occupancy
+  assert(scheduler.drain_armed_stops().empty());
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_native_lifecycle_outbox_retries_in_order_once_after_reconnect(
+    tmp_path: Path,
+) -> None:
+    """A lost accepted/started pair is delivered FIFO exactly once on reconnect."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
+    source = tmp_path / "lifecycle_outbox_test.cpp"
+    binary = tmp_path / "lifecycle_outbox_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <string>
+#include <vector>
+#include "rf433_scheduler.h"
+
+using rf433::LifecycleEvent;
+using rf433::LifecycleKind;
+using rf433::LifecycleOutbox;
+using rf433::TargetScheduler;
+
+int main() {
+  TargetScheduler scheduler(0);
+  LifecycleOutbox outbox;
+  bool connected = false;
+  std::vector<LifecycleKind> delivered;
+  auto publish = [&](const LifecycleEvent &event) {
+    if (!connected)
+      return false;
+    delivered.push_back(event.kind);
+    return true;
+  };
+
+  std::string reason;
+  std::string started;
+  std::vector<std::string> displaced;
+  assert(scheduler.schedule("move-1", "a1b2c3:01:1", "A", "", 1, 1000, "SA", 0,
+                            displaced, reason));
+  assert(!outbox.publish_or_enqueue(LifecycleEvent::accepted("move-1"), publish));
+  auto raw = scheduler.next(0, started);
+  assert(raw && *raw == "A" && started == "move-1");
+  assert(!outbox.publish_or_enqueue(LifecycleEvent::started("move-1", 0, 0, 42), publish));
+  // A duplicate callback for the same lifecycle transition coalesces by id
+  // instead of consuming capacity or delivering started twice.
+  assert(!outbox.publish_or_enqueue(LifecycleEvent::started("move-1", 5, 5, 42), publish));
+  assert(outbox.size() == 2);
+  assert(delivered.empty());
+
+  connected = true;
+  assert(outbox.flush(publish) == 2);
+  assert(outbox.empty());
+  assert(delivered.size() == 2);
+  assert(delivered[0] == LifecycleKind::ACCEPTED);
+  assert(delivered[1] == LifecycleKind::STARTED);
+  assert(outbox.flush(publish) == 0);
+  assert(delivered.size() == 2);
+
+  // A replayed accepted may arrive while only started is pending. Lifecycle
+  // order, not callback arrival order, still governs delivery for that id.
+  LifecycleOutbox replay_order;
+  connected = false;
+  assert(!replay_order.publish_or_enqueue(
+      LifecycleEvent::started("move-2", 5, 5, 42), publish));
+  assert(!replay_order.publish_or_enqueue(
+      LifecycleEvent::accepted("move-2"), publish));
+  connected = true;
+  delivered.clear();
+  assert(replay_order.flush(publish) == 2);
+  assert(delivered[0] == LifecycleKind::ACCEPTED);
+  assert(delivered[1] == LifecycleKind::STARTED);
+
+  // Capacity is fixed. Sustained failures drop the oldest event and expose
+  // the loss through a monotonic counter.
+  connected = false;
+  for (size_t index = 0; index <= LifecycleOutbox::CAPACITY; index++) {
+    assert(!outbox.publish_or_enqueue(
+        LifecycleEvent::accepted("overflow-" + std::to_string(index)), publish));
+  }
+  assert(outbox.size() == LifecycleOutbox::CAPACITY);
+  assert(outbox.dropped_count() == 1);
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_generated_tx_and_tick_replay_started_once_after_reconnect(tmp_path: Path) -> None:
+    """Execute the shipped admission/tick lambdas across an MQTT disconnect."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the generated firmware test")
+    tx_lambda = _firmware_lambda(
+        "- topic: rf433/${bridge_id}/tx",
+        "\n\n  - topic: rf433/${bridge_id}/cmd",
+    )
+    tick_lambda = _firmware_lambda(
+        "interval:\n  - interval: 5ms",
+        "\n  - interval: 10s",
+    )
+    source = tmp_path / "generated_lifecycle_test.cpp"
+    binary = tmp_path / "generated_lifecycle_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "rf433_rx.h"
+#include "rf433_scheduler.h"
+
+struct JsonValueData {
+  std::variant<std::monostate, std::string, int, bool> value;
+};
+
+struct JsonValue {
+  const JsonValueData *data;
+
+  bool isNull() const {
+    return this->data == nullptr ||
+           std::holds_alternative<std::monostate>(this->data->value);
+  }
+
+  template<typename T> bool is() const {
+    if (this->data == nullptr)
+      return false;
+    if constexpr (std::is_same_v<T, const char *>)
+      return std::holds_alternative<std::string>(this->data->value);
+    if constexpr (std::is_same_v<T, int>)
+      return std::holds_alternative<int>(this->data->value);
+    return false;
+  }
+
+  template<typename T> T as() const {
+    if constexpr (std::is_same_v<T, const char *>)
+      return std::get<std::string>(this->data->value).c_str();
+    if constexpr (std::is_same_v<T, int>)
+      return std::get<int>(this->data->value);
+  }
+
+  int operator|(int fallback) const {
+    return this->data != nullptr && std::holds_alternative<int>(this->data->value)
+               ? std::get<int>(this->data->value)
+               : fallback;
+  }
+};
+
+struct FakeJson {
+  std::map<std::string, JsonValueData> values;
+
+  JsonValue operator[](const char *key) const {
+    const auto found = this->values.find(key);
+    return {found == this->values.end() ? nullptr : &found->second};
+  }
+
+  void set_string(const std::string &key, const std::string &value) {
+    this->values[key].value = value;
+  }
+
+  void set_int(const std::string &key, int value) {
+    this->values[key].value = value;
+  }
+};
+
+struct JsonSlot {
+  std::map<std::string, std::string> *values;
+  std::string key;
+
+  JsonSlot &operator=(const std::string &value) {
+    (*this->values)[this->key] = value;
+    return *this;
+  }
+
+  JsonSlot &operator=(const char *value) {
+    (*this->values)[this->key] = value;
+    return *this;
+  }
+
+  JsonSlot &operator=(uint32_t value) {
+    (*this->values)[this->key] = std::to_string(value);
+    return *this;
+  }
+
+  JsonSlot &operator=(int value) {
+    (*this->values)[this->key] = std::to_string(value);
+    return *this;
+  }
+
+  JsonSlot &operator=(bool value) {
+    (*this->values)[this->key] = value ? "true" : "false";
+    return *this;
+  }
+};
+
+struct JsonObject {
+  std::map<std::string, std::string> *values;
+  JsonSlot operator[](const char *key) { return {this->values, key}; }
+};
+
+struct Message {
+  std::string topic;
+  std::map<std::string, std::string> payload;
+  int qos;
+  bool retained;
+};
+
+struct FakeMqtt {
+  bool connected{false};
+  size_t attempts{0};
+  std::vector<Message> messages;
+
+  bool is_connected() const { return this->connected; }
+
+  template<typename F>
+  bool publish_json(const std::string &topic, F &&builder, int qos, bool retained) {
+    this->attempts++;
+    Message message{topic, {}, qos, retained};
+    builder(JsonObject{&message.payload});
+    if (!this->connected)
+      return false;
+    this->messages.push_back(std::move(message));
+    return true;
+  }
+} mqtt_client;
+
+struct FakeBridge {
+  std::vector<std::string> sent;
+  bool sniffing{false};
+
+  void send_raw(const std::string &raw) { this->sent.push_back(raw); }
+  void start_bucket_sniffing() { this->sniffing = true; }
+  void stop_advanced_sniffing() { this->sniffing = false; }
+  bool receive_idle() const { return true; }
+} portisch_rf_bridge;
+
+uint32_t fake_now_ms{0};
+uint32_t boot_id{42};
+uint32_t next_info_ms{0};
+bool ota_active{false};
+
+uint32_t millis() { return fake_now_ms; }
+
+#define ESP_LOGW(...) ((void) 0)
+#define id(value) value
+
+void generated_tx_handler(const FakeJson &x) {
+"""
+        + tx_lambda
+        + r"""
+}
+
+void generated_tick() {
+"""
+        + tick_lambda
+        + r"""
+}
+
+int main() {
+  const std::string frame = "AAB005010100010055";
+  FakeJson command;
+  command.set_string("command_id", "move-1");
+  command.set_string("target", "a1b2c3:01:1");
+  command.set_string("raw", frame);
+  command.set_int("repeats", 1);
+  command.set_int("stop_after_ms", 1000);
+  command.set_string("stop_raw", frame);
+
+  fake_now_ms = 100;
+  generated_tx_handler(command);
+  assert(mqtt_client.messages.empty());
+  assert(rf433::lifecycle_outbox().size() == 1);  // accepted is retained
+
+  generated_tick();
+  assert(portisch_rf_bridge.sent == std::vector<std::string>({frame}));
+  assert(rf433::lifecycle_outbox().size() == 2);  // accepted, then started
+  assert(mqtt_client.messages.empty());
+
+  mqtt_client.connected = true;
+  fake_now_ms = 105;
+  generated_tick();
+  std::vector<Message> statuses;
+  for (const Message &message : mqtt_client.messages) {
+    if (message.topic == "rf433/test-bridge/status")
+      statuses.push_back(message);
+  }
+  assert(statuses.size() == 2);
+  assert(statuses[0].payload.at("status") == "accepted");
+  assert(statuses[0].payload.at("command_id") == "move-1");
+  assert(statuses[1].payload.at("status") == "started");
+  assert(statuses[1].payload.at("command_id") == "move-1");
+  assert(statuses[1].payload.at("boot") == "42");
+  assert(rf433::lifecycle_outbox().empty());
+
+  fake_now_ms = 110;
+  generated_tick();
+  size_t delivered_statuses = 0;
+  for (const Message &message : mqtt_client.messages) {
+    if (message.topic == "rf433/test-bridge/status")
+      delivered_statuses++;
+  }
+  assert(delivered_statuses == 2);  // no reconnect duplicate
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
 def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     """Firmware reports admission plus the first actual RF ACTION dispatch."""
     package = BRIDGE_YAML.read_text()
@@ -712,13 +1399,16 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     assert 'root["command_id"]' in package
     assert 'root["status"]' in package
     assert 'root["target"]' not in package
-    assert 'publish_status("accepted"' in package
-    assert '"rejected"' in package
+    assert "LifecycleEvent::accepted" in package
+    assert "LifecycleEvent::rejected" in package
     assert ".schedule(" in package
     assert ".next(" in package
     assert 'publish_status("queued"' not in package
-    assert 'publish_status("started"' in package
-    assert '"displaced"' in package
+    assert "LifecycleEvent::started" in package
+    assert "lifecycle_outbox" in package
+    assert "publish_or_enqueue" in package
+    assert "outbox.flush(send_status)" in package
+    assert "LifecycleEvent::displaced" in package
     assert "displaced_ids" in package
     assert '"sent"' not in package
     assert '"cancelled"' not in package

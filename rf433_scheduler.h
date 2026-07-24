@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rf433 {
@@ -30,6 +31,18 @@ constexpr size_t MAX_TOTAL_FRAME_BYTES = 16384;
 // STOP. A real AOK frame runs ~550 ms at the controller's embedded repeat of
 // 8; two seconds admits the full legal repeat range with margin.
 constexpr uint64_t MAX_FRAME_AIRTIME_US = 2000000;
+// A user pacing preference is never allowed to approach the 2^31 ms signed
+// serial-arithmetic horizon used by due_(). Sixty seconds is already far above
+// any useful repeat cadence while leaving >35,000x headroom for rollover-safe
+// comparisons. Invalid substitutions are clamped at construction, before a
+// negative value can survive as a huge unsigned delay.
+constexpr uint32_t MAX_REPEAT_GAP_MS = 60000;
+// Reserve no more than four seconds of aggregate physical occupancy for one
+// fail-safe STOP copy per concurrent timed obligation. Together with at most
+// one already in-flight legal frame (~2.14 s including UART and margin), this
+// bounds a newly due first STOP far below the former ~33 s 16-target case while
+// admitting several normal ~0.56 s AOK STOP frames.
+constexpr uint32_t MAX_FIRST_STOP_OCCUPANCY_MS = 4000;
 // Recently admitted command IDs, used to drop QoS-1 broker redeliveries and
 // same-boot retained replays. The ring lives in RAM, so it cannot suppress a
 // retained command replayed after a reboot -- retained tx publishes are
@@ -41,6 +54,174 @@ constexpr uint64_t MAX_FRAME_AIRTIME_US = 2000000;
 // schedule() dedup consult live scheduler state), but the headroom keeps the
 // completed-id window intact even at peak occupancy.
 constexpr size_t COMMAND_ID_RING_SIZE = 64;
+
+enum class LifecycleKind : uint8_t {
+  ACCEPTED,
+  REJECTED,
+  STARTED,
+  DISPLACED,
+  DISARMED,
+};
+
+struct LifecycleEvent {
+  LifecycleKind kind{LifecycleKind::ACCEPTED};
+  std::string command_id;
+  std::string reason;
+  uint32_t age_ms{0};
+  uint32_t timestamp_ms{0};
+  uint32_t boot_id{0};
+  bool has_age{false};
+  bool has_clock{false};
+
+  static LifecycleEvent accepted(const std::string &command_id) {
+    return make_(LifecycleKind::ACCEPTED, command_id);
+  }
+
+  static LifecycleEvent rejected(const std::string &command_id, const std::string &reason) {
+    LifecycleEvent event = make_(LifecycleKind::REJECTED, command_id);
+    event.reason = reason;
+    return event;
+  }
+
+  static LifecycleEvent started(const std::string &command_id, uint32_t age_ms,
+                                uint32_t timestamp_ms, uint32_t boot_id) {
+    LifecycleEvent event = make_(LifecycleKind::STARTED, command_id);
+    event.age_ms = age_ms;
+    event.timestamp_ms = timestamp_ms;
+    event.boot_id = boot_id;
+    event.has_age = true;
+    event.has_clock = true;
+    return event;
+  }
+
+  static LifecycleEvent displaced(const std::string &command_id) {
+    return make_(LifecycleKind::DISPLACED, command_id);
+  }
+
+  static LifecycleEvent disarmed(const std::string &command_id, uint32_t timestamp_ms,
+                                 uint32_t boot_id) {
+    LifecycleEvent event = make_(LifecycleKind::DISARMED, command_id);
+    event.timestamp_ms = timestamp_ms;
+    event.boot_id = boot_id;
+    event.has_clock = true;
+    return event;
+  }
+
+  const char *status() const {
+    switch (this->kind) {
+      case LifecycleKind::ACCEPTED:
+        return "accepted";
+      case LifecycleKind::REJECTED:
+        return "rejected";
+      case LifecycleKind::STARTED:
+        return "started";
+      case LifecycleKind::DISPLACED:
+        return "displaced";
+      case LifecycleKind::DISARMED:
+        return "disarmed";
+    }
+    return "rejected";
+  }
+
+ protected:
+  static LifecycleEvent make_(LifecycleKind kind, const std::string &command_id) {
+    LifecycleEvent event;
+    event.kind = kind;
+    event.command_id = command_id;
+    return event;
+  }
+};
+
+// ESPHome's MQTT client retries a failed QoS enqueue only once immediately.
+// Keep lifecycle truth across longer disconnects in a fixed FIFO. Repeated
+// callbacks for the same command transition coalesce in place; transitions
+// retain lifecycle order per command (accepted before started) even if a
+// broker replay arrives after a later phase was queued. Sustained overload
+// drops the oldest event and increments dropped_count_ instead of growing heap
+// without bound.
+class LifecycleOutbox {
+ public:
+  static constexpr size_t CAPACITY = 32;
+
+  bool empty() const { return this->size_ == 0; }
+  size_t size() const { return this->size_; }
+  uint32_t dropped_count() const { return this->dropped_count_; }
+
+  template<typename Publisher>
+  bool publish_or_enqueue(const LifecycleEvent &event, Publisher &&publish) {
+    if (this->empty() && publish(event))
+      return true;
+    this->enqueue_(event);
+    return false;
+  }
+
+  template<typename Publisher> size_t flush(Publisher &&publish) {
+    size_t published = 0;
+    while (!this->empty()) {
+      if (!publish(this->events_[0]))
+        break;
+      this->pop_front_();
+      published++;
+    }
+    return published;
+  }
+
+ protected:
+  void enqueue_(const LifecycleEvent &event) {
+    for (size_t index = 0; index < this->size_; index++) {
+      LifecycleEvent &queued = this->events_[index];
+      if (queued.command_id == event.command_id && queued.kind == event.kind) {
+        queued = event;
+        return;
+      }
+    }
+    size_t insertion = this->size_;
+    for (size_t index = 0; index < this->size_; index++) {
+      const LifecycleEvent &queued = this->events_[index];
+      if (queued.command_id == event.command_id &&
+          lifecycle_rank_(event.kind) < lifecycle_rank_(queued.kind)) {
+        insertion = index;
+        break;
+      }
+    }
+    if (this->size_ == CAPACITY) {
+      this->pop_front_();
+      this->dropped_count_++;
+      if (insertion > 0)
+        insertion--;
+    }
+    for (size_t index = this->size_; index > insertion; index--)
+      this->events_[index] = std::move(this->events_[index - 1]);
+    this->events_[insertion] = event;
+    this->size_++;
+  }
+
+  static uint8_t lifecycle_rank_(LifecycleKind kind) {
+    switch (kind) {
+      case LifecycleKind::ACCEPTED:
+      case LifecycleKind::REJECTED:
+        return 0;
+      case LifecycleKind::STARTED:
+        return 1;
+      case LifecycleKind::DISPLACED:
+      case LifecycleKind::DISARMED:
+        return 2;
+    }
+    return 0;
+  }
+
+  void pop_front_() {
+    if (this->empty())
+      return;
+    for (size_t index = 1; index < this->size_; index++)
+      this->events_[index - 1] = std::move(this->events_[index]);
+    this->events_[--this->size_] = LifecycleEvent{};
+  }
+
+  std::array<LifecycleEvent, CAPACITY> events_{};
+  size_t size_{0};
+  uint32_t dropped_count_{0};
+};
 
 inline int hex_value(char value) {
   if (value >= '0' && value <= '9')
@@ -215,12 +396,57 @@ inline bool parse_target(const std::string &value, std::string &identity, uint16
 
 class TargetScheduler {
  public:
-  explicit TargetScheduler(uint32_t repeat_gap_ms) : repeat_gap_ms_(repeat_gap_ms) {}
+  struct EmergencyStop {
+    std::string raw;
+    uint32_t occupancy_ms{0};
+  };
+
+  explicit TargetScheduler(int64_t repeat_gap_ms)
+      : repeat_gap_ms_(static_cast<uint32_t>(
+            std::clamp<int64_t>(repeat_gap_ms, 0, MAX_REPEAT_GAP_MS))) {}
 
   bool idle() const { return this->commands_.empty() && this->flush_stops_.empty(); }
 
   bool rf_air_clear(uint32_t now_ms) const {
-    return !this->rf_dispatched_ || due_(now_ms, this->rf_busy_until_);
+    if (!this->rf_dispatched_ || due_(now_ms, this->rf_busy_until_))
+      return true;
+    // A legal physical hold is <2.2 s. If serial arithmetic says "before"
+    // while the unsigned forward distance is over 60 s, the observation is
+    // actually more than 2^31 ms after a stale deadline, not before a current
+    // one. This preserves idle recovery across the full millis() rollover.
+    return static_cast<uint32_t>(this->rf_busy_until_ - now_ms) > MAX_REPEAT_GAP_MS;
+  }
+
+  // OTA begin cannot be vetoed safely on every supported transport, so convert
+  // every already-armed timed obligation into one immediate STOP handoff. One
+  // B0 STOP already contains its embedded RF repeats; scheduler-level copies
+  // improve reliability during normal operation but must not hold up the
+  // blocking update. Unstarted commands have no armed STOP and are discarded
+  // without emitting their ACTION. The caller waits occupancy_ms after each
+  // synchronous UART write, preserving the physical RF constraint.
+  std::vector<EmergencyStop> drain_armed_stops() {
+    std::vector<EmergencyStop> stops;
+    stops.reserve(this->flush_stops_.size() + this->commands_.size());
+    for (const FlushStop &entry : this->flush_stops_) {
+      stops.push_back(
+          EmergencyStop{entry.raw, frame_occupancy_ms_(entry.airtime_ms, entry.raw.size())});
+    }
+    for (const std::string &target : this->order_) {
+      const Command &command = this->commands_.at(target);
+      if (command.owes_stop()) {
+        stops.push_back(EmergencyStop{
+            command.stop_raw,
+            frame_occupancy_ms_(command.stop_airtime_ms, command.stop_raw.size()),
+        });
+      }
+    }
+    this->commands_.clear();
+    this->order_.clear();
+    this->flush_stops_.clear();
+    this->cursor_ = 0;
+    this->flush_last_ = false;
+    this->next_user_at_.reset();
+    return stops;
   }
 
   // Abort every future frame for this id and retain the same terminal state
@@ -304,6 +530,37 @@ class TargetScheduler {
       return false;
     }
 
+    uint64_t first_stop_occupancy_ms = 0;
+    for (const auto &item : this->commands_) {
+      const Command &command = item.second;
+      if (command.identity == identity && (command.mask & mask) != 0) {
+        // A started overlapping command moves into flush_stops_ below and
+        // keeps one STOP reservation. An unstarted command is simply replaced
+        // and has no armed fail-safe obligation.
+        if (command.owes_stop()) {
+          first_stop_occupancy_ms +=
+              frame_occupancy_ms_(command.stop_airtime_ms, command.stop_raw.size());
+        }
+      } else if (command.stop_after_ms > 0 && !command.stop_raw.empty()) {
+        first_stop_occupancy_ms +=
+            frame_occupancy_ms_(command.stop_airtime_ms, command.stop_raw.size());
+      }
+    }
+    for (const FlushStop &entry : this->flush_stops_) {
+      first_stop_occupancy_ms +=
+          frame_occupancy_ms_(entry.airtime_ms, entry.raw.size());
+    }
+    if (stop_after_ms > 0 && !stop_raw.empty()) {
+      const uint32_t stop_airtime_ms = frame_airtime_ms_(stop_raw);
+      first_stop_occupancy_ms +=
+          frame_occupancy_ms_(stop_airtime_ms, stop_raw.size());
+    }
+    if (first_stop_occupancy_ms > MAX_FIRST_STOP_OCCUPANCY_MS) {
+      this->remember_(command_id, 3);
+      reason = "first-STOP safety budget exceeded";
+      return false;
+    }
+
     this->displace_overlapping_(identity, mask, displaced_ids);
 
     Command command;
@@ -333,11 +590,11 @@ class TargetScheduler {
   // redeliveries idempotently: 0 = unknown (not a duplicate), 1 = admitted
   // but RF not yet started, 2 = admitted and RF started (started_age_ms is
   // set to how long ago), 3 = rejected by a STATE-DEPENDENT check (scheduler
-  // full / storage budget) whose outcome must not silently flip on a later
-  // redelivery, 4 = displaced after admission (replaying accepted would let
-  // the controller rebuild a retired motion). Deterministic validation
-  // rejections are not remembered -- a redelivery re-validates identically,
-  // which is already idempotent.
+  // full / storage / first-STOP safety budget) whose outcome must not silently
+  // flip on a later redelivery, 4 = displaced after admission (replaying
+  // accepted would let the controller rebuild a retired motion).
+  // Deterministic validation rejections are not remembered -- a redelivery
+  // re-validates identically, which is already idempotent.
   int replay_state(const std::string &command_id, uint32_t now_ms,
                    uint32_t &started_age_ms) const {
     started_age_ms = 0;
@@ -373,26 +630,19 @@ class TargetScheduler {
 
   std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id) {
     started_command_id.clear();
-    // Age-based pacing-gate reset, run every tick regardless of queue state. A
-    // stale gate once blocked ALL transmission for up to ~24.9 days after
-    // millis() wrapped past the signed comparison horizon (observed: a bridge
-    // idle >2^31 ms accepted commands but never transmitted). Resetting only
-    // when the gate is more than 60s stale preserves the short-term spacing
-    // owed to the just-dispatched frame -- an unconditional drain-reset erased
-    // it, letting a command that arrived right after the queue drained transmit
-    // with <repeat_gap_ms spacing while the EFM8BB1 was still transmitting. The
-    // 5ms interval tick carries the gate through this >60s window long before
-    // now-gate could wrap negative at 2^31 ms, so the rollover fix is kept.
-    if (this->next_rf_at_.has_value() &&
-        static_cast<int32_t>(now_ms - *this->next_rf_at_) > 60000)
-      this->next_rf_at_.reset();
+    // Age-based reset applies only to the discretionary user floor. Physical
+    // occupancy has its own short, bounded rf_busy_until_ horizon and is never
+    // bypassed. Resetting only when the floor is >60s stale preserves spacing
+    // owed to a just-dispatched frame while preventing an idle gate from
+    // surviving long enough to cross the signed comparison horizon.
+    if (this->next_user_at_.has_value() &&
+        static_cast<int32_t>(now_ms - *this->next_user_at_) > 60000)
+      this->next_user_at_.reset();
     if (this->commands_.empty() && this->flush_stops_.empty())
       return std::nullopt;
-    if (this->next_rf_at_.has_value() && !due_(now_ms, *this->next_rf_at_))
-      return std::nullopt;
 
-    // Arm due fail-safe STOPs before the flush branch so displaced-STOP
-    // flushing can alternate fairly with them.
+    // Arm due fail-safe STOPs before consulting either gate. In particular,
+    // the discretionary repeat gap must never hide that a STOP is due.
     for (const std::string &target : this->order_) {
       Command &command = this->commands_.at(target);
       if (command.deadline_armed && command.phase != Phase::STOP &&
@@ -402,6 +652,10 @@ class TargetScheduler {
         command.next_at = now_ms;
       }
     }
+    // UART serialization + RF airtime + margin is a hardware constraint for
+    // every frame, including urgent STOPs.
+    if (!this->rf_air_clear(now_ms))
+      return std::nullopt;
 
     // Fail-safe STOPs of displaced commands go on air ahead of actions, but
     // ROTATE among flush entries and ALTERNATE with due scheduled STOPs: one
@@ -432,6 +686,11 @@ class TargetScheduler {
 
     const size_t count = this->order_.size();
     for (int stop_priority = 1; stop_priority >= 0; stop_priority--) {
+      // Normal ACTION/TRAILER work honors the user preference globally.
+      // Armed STOP work bypasses this floor after physical RF occupancy clears.
+      if (stop_priority == 0 && this->next_user_at_.has_value() &&
+          !due_(now_ms, *this->next_user_at_))
+        continue;
       for (size_t offset = 0; offset < count; offset++) {
         const size_t index = (this->cursor_ + offset) % count;
         const std::string target = this->order_[index];
@@ -455,8 +714,10 @@ class TargetScheduler {
         }
         command.remaining--;
         const bool complete = command.remaining == 0 && this->advance_(command);
-        if (command.remaining > 0)
-          command.next_at = now_ms + this->repeat_gap_ms_;
+        if (command.remaining > 0) {
+          command.next_at =
+              command.phase == Phase::STOP ? now_ms : now_ms + this->repeat_gap_ms_;
+        }
 
         this->flush_last_ = false;
         this->cursor_ = (index + 1) % count;
@@ -642,6 +903,11 @@ class TargetScheduler {
     return static_cast<uint32_t>((static_cast<uint64_t>(hex_chars) * 5000U + 19199U) / 19200U);
   }
 
+  static uint32_t frame_occupancy_ms_(uint32_t airtime_ms, size_t hex_chars) {
+    return airtime_ms > 0 ? uart_ms_(hex_chars) + airtime_ms + RF_AIRTIME_MARGIN_MS
+                          : RF_AIRTIME_MARGIN_MS;
+  }
+
   // Single owner of the dispatch-timing invariant: one call records both the
   // pacing hold for the next UART handoff and the RF-air-busy horizon used by
   // rf_air_clear(). The EFM8BB1 transmits a B0 frame blocking (embedded
@@ -655,10 +921,11 @@ class TargetScheduler {
     // concurrently (its parser discards them without transmitting), so
     // charging its UART time would only slow fail-safe STOP flushing.
     const uint32_t occupancy_ms =
-        airtime_ms > 0 ? serialize_ms + airtime_ms + RF_AIRTIME_MARGIN_MS : RF_AIRTIME_MARGIN_MS;
+        airtime_ms > 0 ? serialize_ms + airtime_ms + RF_AIRTIME_MARGIN_MS
+                       : RF_AIRTIME_MARGIN_MS;
     this->rf_busy_until_ = now_ms + occupancy_ms;
     this->rf_dispatched_ = true;
-    this->next_rf_at_ = now_ms + std::max(this->repeat_gap_ms_, occupancy_ms);
+    this->next_user_at_ = now_ms + this->repeat_gap_ms_;
   }
 
   const std::string &phase_raw_(const Command &command) const {
@@ -723,7 +990,7 @@ class TargetScheduler {
   // Keep one 5 ms scheduler tick beyond the ceiled frame airtime before RX.
   static constexpr uint32_t RF_AIRTIME_MARGIN_MS = 5;
   uint32_t repeat_gap_ms_;
-  std::optional<uint32_t> next_rf_at_;
+  std::optional<uint32_t> next_user_at_;
   uint32_t rf_busy_until_{0};
   size_t cursor_{0};
   bool rf_dispatched_{false};
@@ -741,8 +1008,13 @@ class TargetScheduler {
 // single per-bridge instance as a function-local static instead; the beacon
 // lambdas run after the include and call this accessor. The gap argument is
 // honored only on first construction.
-inline TargetScheduler &tx_scheduler(uint32_t repeat_gap_ms) {
+inline TargetScheduler &tx_scheduler(int64_t repeat_gap_ms) {
   static TargetScheduler instance(repeat_gap_ms);
+  return instance;
+}
+
+inline LifecycleOutbox &lifecycle_outbox() {
+  static LifecycleOutbox instance;
   return instance;
 }
 
