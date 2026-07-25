@@ -1329,7 +1329,9 @@ def test_firmware_state_sync_payloads_and_deferred_surface() -> None:
     started_paths_stamping_age = 2
     assert package.count('root["age_ms"]') == started_paths_stamping_age
     assert "LifecycleEvent::started(" in package
-    assert "started_age_ms, replay_ms, id(boot_id)" in package
+    # The redelivery path shares one measured-age variable across `started` and,
+    # since #6, `displaced` (whichever the replay resolves to).
+    assert "replay_age_ms, replay_ms, id(boot_id)" in package
     assert "status_ms - dispatch_ms, status_ms, id(boot_id)" in interval_handler
     assert "outbox.publish_or_enqueue(" in interval_handler
 

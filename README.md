@@ -29,11 +29,13 @@ validates, schedules, and transmits Portisch **B0** raw frames.
 - **Latest command wins** — a new command whose channels overlap an active target on the same
   remote displaces it: the displaced command's pending fail-safe STOP is flushed on air first,
   and a `displaced` status with its `command_id` tells the controller to retire its motion model.
-  `displaced` is published at admission of the replacing command. The first flushed STOP bypasses
-  the discretionary `repeat_gap_ms` floor, but still waits for physical RF occupancy and earlier
-  safety STOPs. A replacement overlapping N active targets can therefore put the last first-STOP
-  copy roughly N physical frame-occupancy intervals after `displaced`; the status is not an on-air
-  timestamp.
+  `displaced` is published at admission of the replacing command and, like `started`, carries
+  `age_ms`, `t`, and `boot` anchored on the displacement instant (`displacement = t - age_ms`), so
+  the controller can *measure* its post-displacement flush-tolerance window rather than budget a
+  wider one. The first flushed STOP bypasses the discretionary `repeat_gap_ms` floor, but still
+  waits for physical RF occupancy and earlier safety STOPs. A replacement overlapping N active
+  targets can therefore put the last first-STOP copy roughly N physical frame-occupancy intervals
+  after `displaced`; the status is not an on-air timestamp.
 - **Duplicate suppression** — a ring of recent `command_id`s suppresses QoS-1 broker redeliveries
   and same-boot retained replays. The ring lives in RAM, so a retained `tx` command *can* replay
   after a reboot: **retained `tx` publishes are unsupported and dangerous — never publish them.**
@@ -82,7 +84,13 @@ QoS-1 broker redeliveries are answered idempotently: an already-admitted `comman
 Every `started`, both fresh and replayed, carries `t`, `age_ms`, and `boot`. `t` is the publish time
 on the bridge clock and `age_ms` is measured from the command's one stored dispatch instant, so
 `handoff = t - age_ms` modulo the 32-bit clock range. The controller anchors its motion model at
-that handoff. Duplicate/rejection memory is authoritative for live commands and for the 64 most
+that handoff. `displaced` carries the same three fields anchored on the *displacement* instant
+(`displacement = t - age_ms`), fresh and replayed alike — including a redelivery arriving while the
+displaced command's owed STOP is still draining, which reports the age since the original
+displacement, not 0. The one exception is a `command_id` that reached the terminal displaced/disarmed
+state by an explicit `disarm` (not by displacement): it has no displacement instant, so its replayed
+`displaced` omits `age_ms`/`t`/`boot` rather than reporting a fabricated age of 0. Duplicate/rejection
+memory is authoritative for live commands and for the 64 most
 recent same-boot command IDs. Within that window, a `command_id` rejected by a state-dependent
 admission check (scheduler full, storage, or first-STOP budget) is re-rejected rather than silently
 admitted later. The ring is RAM-only and older completed IDs can be evicted.
@@ -149,7 +157,9 @@ transmits in response to a heard frame.
 The additional MQTT surface is:
 
 - `/status` `started` always carries `t`, `age_ms`, and `boot`; use `handoff = t - age_ms` for the
-  original UART handoff instant.
+  original UART handoff instant. `displaced` carries the same fields anchored on the displacement
+  instant (`displacement = t - age_ms`) — except when the terminal state was reached by `disarm`,
+  which has no such instant and so omits them.
 - Retained `/info` advertises `boot`, `listen`, and `v` (`2` for this contract), allowing a controller
   to discover which bridges participate without waiting for traffic.
 - Publish `{"action":"disarm","command_id":"move:42"}` to `/cmd` to cancel every future scheduled

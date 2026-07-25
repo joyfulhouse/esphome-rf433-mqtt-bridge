@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is documented in
 [README.md](README.md#mqtt-topic-contract).
 
+## [Unreleased]
+
+### Added
+
+- **`displaced` carries the displacement clock** (contract change the consumer relies on,
+  [#6](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/6)): the `displaced` status
+  now emits `age_ms`, `t`, and `boot` — the same clock fields `started` already carried — anchored
+  on the instant the firmware performed the displacement (`displacement = t - age_ms`). A redelivery
+  arriving while the displaced command's owed fail-safe STOP is still draining, and one arriving
+  after it has fully drained, both report the age since the *original* displacement rather than a
+  stale 0. This lets the controller *measure* its post-displacement flush-tolerance window instead
+  of budgeting a wider-than-necessary one; an over-wide window is not free, because while it is open
+  a genuine physical STOP press on those channels is absorbed rather than acted on. A `command_id`
+  that reached the terminal state by an explicit `disarm` has no displacement instant, so its
+  replayed `displaced` omits the three fields rather than reporting a fabricated age. The wire
+  format is unchanged (the publisher already emitted these keys when present); only the `displaced`
+  event now populates them. Per-command RAM cost: `+4` bytes on each draining displaced-STOP flush
+  entry (transient, at most `MAX_TARGETS`), and `0` net bytes on the recent-command ring
+  (a validity flag placed in existing struct padding).
+
 ## [1.2.2] - 2026-07-20
 
 Review hardening from a multi-model adversarial pass over v1.2.1.

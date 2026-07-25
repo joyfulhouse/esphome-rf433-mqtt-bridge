@@ -98,6 +98,22 @@ struct LifecycleEvent {
     return make_(LifecycleKind::DISPLACED, command_id);
   }
 
+  // A displacement whose original instant is known. age_ms is how long ago the
+  // firmware performed the displacement; timestamp_ms/boot_id anchor it on the
+  // firmware clock exactly as started() does, so the controller can budget its
+  // post-displacement flush window from the instant itself instead of inferring
+  // it from other measurements.
+  static LifecycleEvent displaced(const std::string &command_id, uint32_t age_ms,
+                                  uint32_t timestamp_ms, uint32_t boot_id) {
+    LifecycleEvent event = make_(LifecycleKind::DISPLACED, command_id);
+    event.age_ms = age_ms;
+    event.timestamp_ms = timestamp_ms;
+    event.boot_id = boot_id;
+    event.has_age = true;
+    event.has_clock = true;
+    return event;
+  }
+
   static LifecycleEvent disarmed(const std::string &command_id, uint32_t timestamp_ms,
                                  uint32_t boot_id) {
     LifecycleEvent event = make_(LifecycleKind::DISARMED, command_id);
@@ -561,7 +577,7 @@ class TargetScheduler {
       return false;
     }
 
-    this->displace_overlapping_(identity, mask, displaced_ids);
+    this->displace_overlapping_(identity, mask, now_ms, displaced_ids);
 
     Command command;
     command.command_id = command_id;
@@ -595,9 +611,19 @@ class TargetScheduler {
   // accepted would let the controller rebuild a retired motion).
   // Deterministic validation rejections are not remembered -- a redelivery
   // re-validates identically, which is already idempotent.
+  // age_ms is set to how long ago the reported instant occurred: the RF handoff
+  // for a started command (state 2) or the displacement for a displaced one
+  // (state 4). has_age, when supplied, reports whether age_ms is a real
+  // measurement rather than a silent 0 -- a command displaced by displacement
+  // carries a timestamp, but one that reached state 4 by disarm (or was
+  // remembered without one) does not, and the caller must not publish a bogus
+  // age_ms=0 for it. All timestamp deltas are unsigned millis() subtractions,
+  // correct across the 2^32 rollover.
   int replay_state(const std::string &command_id, uint32_t now_ms,
-                   uint32_t &started_age_ms) const {
-    started_age_ms = 0;
+                   uint32_t &age_ms, bool *has_age = nullptr) const {
+    age_ms = 0;
+    if (has_age != nullptr)
+      *has_age = false;
     // Live scheduler state is authoritative for a still-active command and
     // survives ring eviction: a currently scheduled command answers from
     // commands_, and a displaced command still draining its fail-safe STOPs
@@ -608,20 +634,32 @@ class TargetScheduler {
     for (const auto &item : this->commands_) {
       if (item.second.command_id == command_id) {
         if (item.second.started) {
-          started_age_ms = now_ms - item.second.started_at_ms;
+          age_ms = now_ms - item.second.started_at_ms;
+          if (has_age != nullptr)
+            *has_age = true;
           return 2;
         }
         return 1;
       }
     }
     for (const FlushStop &entry : this->flush_stops_) {
-      if (entry.command_id == command_id)
+      if (entry.command_id == command_id) {
+        // A still-draining displaced command carries its displacement instant.
+        age_ms = now_ms - entry.displaced_at_ms;
+        if (has_age != nullptr)
+          *has_age = true;
         return 4;
+      }
     }
     for (const RecentCommand &recent : this->recent_ids_) {
       if (recent.command_id == command_id) {
-        if (recent.state == 2)
-          started_age_ms = now_ms - recent.started_at_ms;
+        // State 2 always recorded an RF-start instant; state 4 recorded a
+        // displacement instant only when it reached state 4 by displacement.
+        if ((recent.state == 2 || recent.state == 4) && recent.has_timestamp) {
+          age_ms = now_ms - recent.started_at_ms;
+          if (has_age != nullptr)
+            *has_age = true;
+        }
         return recent.state;
       }
     }
@@ -740,6 +778,9 @@ class TargetScheduler {
     int remaining{0};
     std::string command_id;
     uint32_t airtime_ms{0};
+    // millis() when the owning command was displaced, so a redelivery arriving
+    // while the STOP still drains reports its age since that instant, not 0.
+    uint32_t displaced_at_ms{0};
   };
 
   struct Command {
@@ -773,7 +814,7 @@ class TargetScheduler {
     }
   };
 
-  void displace_overlapping_(const std::string &identity, uint16_t mask,
+  void displace_overlapping_(const std::string &identity, uint16_t mask, uint32_t now_ms,
                              std::vector<std::string> &displaced_ids) {
     std::vector<std::string> displaced_targets;
     for (const auto &item : this->commands_) {
@@ -788,10 +829,10 @@ class TargetScheduler {
         // displaced mid-STOP. They go on air one per pacing gap; the frame is
         // stored once with its send count.
         const int copies = command.phase == Phase::STOP ? command.remaining : command.repeats;
-        this->flush_stops_.push_back(
-            FlushStop{command.stop_raw, copies, command.command_id, command.stop_airtime_ms});
+        this->flush_stops_.push_back(FlushStop{command.stop_raw, copies, command.command_id,
+                                               command.stop_airtime_ms, now_ms});
       }
-      this->mark_displaced_(command.command_id);
+      this->mark_displaced_(command.command_id, now_ms);
       displaced_ids.push_back(command.command_id);
       this->erase_(target);
     }
@@ -831,7 +872,7 @@ class TargetScheduler {
     // only shortens the dedup window for already-completed command ids.
     for (RecentCommand &recent : this->recent_ids_) {
       if (recent.command_id == command_id) {
-        recent = RecentCommand{command_id, state, 0};
+        recent = RecentCommand{command_id, state, false, 0};
         return;
       }
     }
@@ -839,30 +880,37 @@ class TargetScheduler {
       RecentCommand &slot = this->recent_ids_[this->recent_cursor_];
       this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
       if (!this->is_active_(slot.command_id)) {
-        slot = RecentCommand{command_id, state, 0};
+        slot = RecentCommand{command_id, state, false, 0};
         return;
       }
     }
-    this->recent_ids_[this->recent_cursor_] = RecentCommand{command_id, state, 0};
+    this->recent_ids_[this->recent_cursor_] = RecentCommand{command_id, state, false, 0};
     this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
   }
 
-  // Update an existing ring slot's remembered lifecycle in place.
-  // started_at_ms is only meaningful for state 2; other states pass 0.
-  void mark_recent_(const std::string &command_id, uint8_t state, uint32_t started_at_ms) {
+  // Update an existing ring slot's remembered lifecycle in place. timestamp_ms
+  // is the RF-start instant for state 2 and the displacement instant for state
+  // 4; has_timestamp records whether it is a real instant so a later redelivery
+  // does not report a bogus age of 0. remember_() writes has_timestamp=false,
+  // which is why a state-4 slot created by disarm carries no age.
+  void mark_recent_(const std::string &command_id, uint8_t state, bool has_timestamp,
+                    uint32_t timestamp_ms) {
     for (RecentCommand &recent : this->recent_ids_) {
       if (recent.command_id == command_id) {
         recent.state = state;
-        recent.started_at_ms = started_at_ms;
+        recent.has_timestamp = has_timestamp;
+        recent.started_at_ms = timestamp_ms;
         return;
       }
     }
   }
 
-  void mark_displaced_(const std::string &command_id) { this->mark_recent_(command_id, 4, 0); }
+  void mark_displaced_(const std::string &command_id, uint32_t now_ms) {
+    this->mark_recent_(command_id, 4, true, now_ms);
+  }
 
   void mark_started_(const std::string &command_id, uint32_t now_ms) {
-    this->mark_recent_(command_id, 2, now_ms);
+    this->mark_recent_(command_id, 2, true, now_ms);
   }
 
   static bool due_(uint32_t now_ms, uint32_t deadline_ms) {
@@ -981,9 +1029,15 @@ class TargetScheduler {
   // redeliveries idempotently instead of rejecting (or re-running) the
   // duplicate. state: 1 admitted, 2 started (at started_at_ms), 3 rejected
   // by a state-dependent admission check, 4 displaced or disarmed (terminal).
+  // started_at_ms holds the RF-start instant (state 2) or the displacement
+  // instant (state 4 reached by displacement); has_timestamp is false when no
+  // real instant was recorded (state 4 reached by disarm, or any remember_()
+  // slot) so a redelivery reports no age instead of a bogus 0. has_timestamp
+  // occupies padding after state, so RecentCommand does not grow.
   struct RecentCommand {
     std::string command_id;
     uint8_t state{0};
+    bool has_timestamp{false};
     uint32_t started_at_ms{0};
   };
 
