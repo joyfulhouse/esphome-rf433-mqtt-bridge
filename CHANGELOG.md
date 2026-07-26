@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is documented in
 [README.md](README.md#mqtt-topic-contract).
 
-## [Unreleased]
+## [1.3.0] - 2026-07-26
 
 ### Added
 
@@ -27,6 +27,38 @@ Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is d
   event now populates them. Per-command RAM cost: `+4` bytes on each draining displaced-STOP flush
   entry (transient, at most `MAX_TARGETS`), and `0` net bytes on the recent-command ring
   (a validity flag placed in existing struct padding).
+
+### Fixed
+
+- **Four fail-safe-STOP delay paths closed** (safety batch A, from the release-hardening
+  review — every change either removes a way to delay a due STOP or makes the delay visible):
+  - `repeat_gap_ms` no longer postpones a due STOP. The pacing gate splits into physical RF
+    occupancy (UART + airtime + margin, always honored) and the discretionary user floor, which
+    armed STOP work bypasses once the air is clear; STOPs arm before either gate is consulted.
+    The substitution is clamped 0..60000, so a negative value can no longer survive as a huge
+    unsigned delay.
+  - Admission bounds aggregate first-STOP occupancy at 4 s, cutting the worst-case late STOP
+    from ~33 s (16 targets × 2 s frames) to ~6.2 s; beyond it commands are rejected with a
+    reason and remembered.
+  - A bounded 32-event lifecycle outbox retries statuses on reconnect, so a broker flap between
+    admission and first RF handoff can no longer lose `started` after the command and its local
+    STOP already executed.
+  - OTA begin latches `/tx` closed and synchronously fires every armed STOP before the blocking
+    transfer — "blind runs to its hardware limit after the update reboots" becomes "blind stops
+    slightly early". The full OTA veto interlock remains deferred to hardware validation.
+
+### Documentation
+
+- README and HARDWARE.md rewritten for a first-time builder: per-step "done when" checkpoints,
+  the radio-chip/Wi-Fi-chip two-firmware split made unmissable, protocol reference folded behind
+  disclosure. Board-revision incompatibility (EFM8BB1 vs OB38S003), Tasmota-as-temporary-tool,
+  and fail-safe STOP semantics verified intact. The status-contract section now states that a
+  `displaced` clock anchors the admission instant, not when the owed STOP reaches air — a
+  controller sizing a flush window from it must add drain latency.
+- Docs corrected to match the implementation (batch A): displaced-STOP timing is N pacing gaps
+  not one, `deadline_at` is a due time not an on-air guarantee, duplicate suppression is scoped
+  to live commands plus the 64-ID same-boot window, and an authenticated least-privilege ACL
+  matrix now covers `/tx` and `/cmd`.
 
 ## [1.2.2] - 2026-07-20
 
