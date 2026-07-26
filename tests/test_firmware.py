@@ -1421,3 +1421,156 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     assert "CancelResult" not in scheduler
     assert "queue_depth" not in scheduler
     assert "stop_and_drain" not in scheduler
+    # #6: `displaced` now carries the same clock information as `started` so the
+    # consumer can MEASURE its post-displacement flush window from the actual
+    # displacement instant instead of budgeting a wider-than-necessary one.
+    # The redelivery path only stamps age when the firmware genuinely holds the
+    # instant, so it branches on the has_age signal it asks replay_state for.
+    assert "replay_state(command_id, replay_ms, replay_age_ms,\n" in package
+    assert "&replay_has_age)" in package
+    assert "if (replay_has_age) {" in package
+    # Two sites emit an age-anchored status through the shared replay variable:
+    # the replayed `started` and the replayed `displaced`. Reverting either to a
+    # bare, ageless publish drops this count.
+    assert package.count("replay_age_ms, replay_ms, id(boot_id)") == 2
+    # The fresh-admission path anchors each displacement on the admission millis,
+    # mirroring `started`'s `status_ms - dispatch_ms, status_ms` shape.
+    assert "displaced_status_ms - admit_ms, displaced_status_ms, id(boot_id)" in package
+
+
+def test_native_scheduler_stamps_age_on_displaced(tmp_path: Path) -> None:
+    """`displaced` carries age since the ORIGINAL displacement, from both the
+    live flush queue and the ring, and withholds it when no instant exists."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
+    source = tmp_path / "displaced_age.cpp"
+    binary = tmp_path / "displaced_age"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include "rf433_scheduler.h"
+
+using rf433::TargetScheduler;
+
+int main() {
+  std::string reason;
+  std::string started;
+  std::vector<std::string> displaced;
+  uint32_t age = 0;
+  bool has_age = false;
+
+  // A timed command that has started RF still owes a fail-safe STOP; displacing
+  // it moves that owed STOP into the live flush queue AND remembers the
+  // displacement instant. Query at the instant itself: age is exactly 0 and is
+  // flagged as a real measurement, not the old silent 0.
+  TargetScheduler owe(35);
+  assert(owe.schedule("victim", "a1b2c3:20:1", "V", "", 3, 60000, "SV", 0, displaced, reason));
+  auto raw = owe.next(0, started);
+  assert(raw && *raw == "V" && started == "victim");
+  assert(owe.schedule("usurper", "a1b2c3:20:1", "U", "", 1, 0, "", 100, displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "victim");
+  int state = owe.replay_state("victim", 100, age, &has_age);
+  assert(state == 4 && has_age && age == 0);  // from flush_stops_, at the instant
+
+  // Still draining in the flush queue 540 ms later: age tracks elapsed time
+  // since the displacement (t=100), NOT the query time.
+  state = owe.replay_state("victim", 640, age, &has_age);
+  assert(state == 4 && has_age && age == 540);
+
+  // Drain every owed STOP copy so `victim` leaves flush_stops_ and is answered
+  // from the ring instead. A REDELIVERY long after still reports the age since
+  // the original displacement (t=100), proving the ring carries the instant.
+  for (uint32_t t = 100; t <= 500; t++) {
+    std::string st;
+    owe.next(t, st);
+  }
+  state = owe.replay_state("victim", 5000, age, &has_age);
+  assert(state == 4 && has_age && age == 4900);  // from the ring, since t=100
+
+  // A displaced command that owes NO fail-safe STOP never enters flush_stops_,
+  // yet the ring still carries its displacement instant.
+  TargetScheduler noowe(35);
+  assert(noowe.schedule("no-owe", "aabbcc:21:1", "N", "", 3, 0, "", 0, displaced, reason));
+  raw = noowe.next(0, started);
+  assert(raw && *raw == "N" && started == "no-owe");  // started, more repeats, no STOP owed
+  assert(noowe.schedule("replacer", "aabbcc:21:1", "R", "", 1, 0, "", 250, displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "no-owe");
+  state = noowe.replay_state("no-owe", 250, age, &has_age);
+  assert(state == 4 && has_age && age == 0);
+  state = noowe.replay_state("no-owe", 900, age, &has_age);
+  assert(state == 4 && has_age && age == 650);
+
+  // A command that reaches the terminal state 4 by DISARM (not displacement)
+  // has no displacement instant. replay_state must say so explicitly by
+  // clearing has_age rather than reporting a bogus age of 0.
+  TargetScheduler dis(35);
+  assert(dis.schedule("gone", "aabbcc:22:1", "D", "", 1, 60000, "SD", 0, displaced, reason));
+  raw = dis.next(0, started);
+  assert(raw && *raw == "D");
+  dis.disarm("gone");
+  has_age = true;  // must be cleared by replay_state
+  age = 12345;     // must be reset by replay_state
+  state = dis.replay_state("gone", 300, age, &has_age);
+  assert(state == 4 && !has_age && age == 0);
+
+  // The three-argument form still compiles and behaves for callers that do not
+  // need the has_age flag (the existing tests use it).
+  age = 7;
+  state = dis.replay_state("gone", 300, age);
+  assert(state == 4 && age == 0);
+
+  // The age-carrying factory mirrors started(): it flags has_age and has_clock
+  // so the JSON publisher emits age_ms/t/boot. The bare factory carries none,
+  // so no stale age is published.
+  auto ev = rf433::LifecycleEvent::displaced("cmd", 43, 123456, 7);
+  assert(std::string(ev.status()) == "displaced");
+  assert(ev.has_age && ev.age_ms == 43);
+  assert(ev.has_clock && ev.timestamp_ms == 123456 && ev.boot_id == 7);
+  auto bare = rf433::LifecycleEvent::displaced("cmd");
+  assert(std::string(bare.status()) == "displaced");
+  assert(!bare.has_age && !bare.has_clock);
+
+  // millis() rollover: a command displaced just before the 2^32 wrap and
+  // redelivered just after reports the true small elapsed age via unsigned
+  // subtraction, never a huge value or a signed-comparison artifact.
+  TargetScheduler wrap(35);
+  const uint32_t wrap_start = static_cast<uint32_t>(0xFFFFFFFFu) - 500u;
+  assert(wrap.schedule("w-old", "aabbcc:23:1", "W", "", 3, 0, "", wrap_start, displaced, reason));
+  raw = wrap.next(wrap_start, started);
+  assert(raw && *raw == "W" && started == "w-old");
+  const uint32_t disp_at = wrap_start + 300u;  // 0xFFFFFF37, still before the wrap
+  assert(wrap.schedule("w-new", "aabbcc:23:1", "Z", "", 1, 0, "", disp_at, displaced, reason));
+  assert(displaced.size() == 1 && displaced[0] == "w-old");
+  const uint32_t after_wrap = 50u;  // wrapped 50 ms past 0
+  state = wrap.replay_state("w-old", after_wrap, age, &has_age);
+  assert(state == 4 && has_age);
+  assert(age == static_cast<uint32_t>(after_wrap - disp_at));
+  assert(age == 251u);  // 201 ms to the wrap + 50 ms after it
+
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
