@@ -103,6 +103,13 @@ struct LifecycleEvent {
   // firmware clock exactly as started() does, so the controller can budget its
   // post-displacement flush window from the instant itself instead of inferring
   // it from other measurements.
+  //
+  // The anchored instant is the ADMISSION/decision instant, not the moment the
+  // owed fail-safe STOP actually reaches air -- that follows later, behind the
+  // in-flight frame's RF occupancy and any earlier displaced STOPs still
+  // draining. This mirrors started(), which anchors the UART handoff rather
+  // than the end of the train. A controller sizing a flush window from this
+  // field must add that drain latency, or it will open the window early.
   static LifecycleEvent displaced(const std::string &command_id, uint32_t age_ms,
                                   uint32_t timestamp_ms, uint32_t boot_id) {
     LifecycleEvent event = make_(LifecycleKind::DISPLACED, command_id);
@@ -780,6 +787,9 @@ class TargetScheduler {
     uint32_t airtime_ms{0};
     // millis() when the owning command was displaced, so a redelivery arriving
     // while the STOP still drains reports its age since that instant, not 0.
+    // Unlike RecentCommand below this does NOT land in existing padding: on the
+    // 4-aligned 32-bit target it costs a real 4 bytes. Bounded by MAX_TARGETS
+    // concurrent flush entries, so 64 bytes worst case against tens of KB free.
     uint32_t displaced_at_ms{0};
   };
 
