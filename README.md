@@ -155,8 +155,8 @@ simply your HA host; a standalone broker works identically.
 4. Validate and flash with the hardware-tested ESPHome release:
 
    ```shell
-   uvx --from "esphome==2026.6.5" esphome compile living-room.yaml
-   uvx --from "esphome==2026.6.5" esphome run living-room.yaml
+   uvx --from "esphome==2026.7.3" esphome compile living-room.yaml
+   uvx --from "esphome==2026.7.3" esphome run living-room.yaml
    ```
 
 First flash of a stock device requires serial (5-pin header beside the power switch, switch slid

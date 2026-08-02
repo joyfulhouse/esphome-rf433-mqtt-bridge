@@ -1,12 +1,16 @@
 # Vendored ESPHome mqtt component
 
 All 53 files in this directory were copied from `esphome/components/mqtt` in **ESPHome
-2026.6.5** (tag commit `3bfbaaebf378e61ac0012ab5ece0014eab4227e9` — the same release tag
-`components/rf_bridge/` is pinned to). The upstream component is licensed under ESPHome's
-MIT license.
+2026.7.3** (tag commit `985a08e2473d56c23f8ab31746a119fe5f5bbae9`). The upstream component
+is licensed under ESPHome's MIT license.
 
 This copy is currently **byte-identical to upstream**. No behavioural changes have been
 made yet.
+
+Note: the fleet's esphome-config CI currently builds against ESPHome 2026.7.2 and is
+scheduled to bump to 2026.7.3 at Batch B rollout; the `mqtt` component is byte-identical
+between those two releases, so this vendor commit's provenance and the fleet's eventual
+runtime match exactly.
 
 ## Why this exists
 
