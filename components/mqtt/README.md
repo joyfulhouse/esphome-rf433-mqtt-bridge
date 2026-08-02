@@ -4,8 +4,8 @@ All 53 files in this directory were copied from `esphome/components/mqtt` in **E
 2026.7.3** (tag commit `985a08e2473d56c23f8ab31746a119fe5f5bbae9`). The upstream component
 is licensed under ESPHome's MIT license.
 
-This copy is currently **byte-identical to upstream**. No behavioural changes have been
-made yet.
+This copy carries one behavioural change on top of upstream: the inbound payload guard
+described below.
 
 Note: the fleet's esphome-config CI currently builds against ESPHome 2026.7.2 and is
 scheduled to bump to 2026.7.3 at Batch B rollout; the `mqtt` component is byte-identical
@@ -21,20 +21,26 @@ oversized or malformed inbound message — malicious or not — has no legitimat
 reach `payload_buffer_.reserve()`. The stock component cannot express that cap; it has to
 be vendored to add it.
 
-## Forthcoming behavioural diff
+## Inbound payload guard patch
 
-A guard patch to `mqtt_client.cpp`'s inbound fragment-assembly path is described in
-`docs/design/2026-08-02-batch-b-safety-design.md` §1 and lands in a later task in this
-series, not this commit. Once applied, this README will be updated to record the diff in
-the same style as `components/rf_bridge/README.md`. In summary, the patch will:
+`mqtt_client.cpp`'s `setup()` installs an on-message lambda that reassembles fragmented
+MQTT publishes into `payload_buffer_`. Before this patch, that lambda called
+`payload_buffer_.reserve(total)` using the broker-declared `total` size with no upper
+bound, so a hostile or errant tens-of-KB publish could exhaust the heap or stall the loop
+past an armed fail-safe STOP deadline on the ESP8285.
 
-- drop any message whose declared total payload size exceeds `MAX_INBOUND_PAYLOAD`
-  (4096 bytes) before any buffer allocation, and discard subsequent fragments of the same
-  oversized message;
-- emit a throttled warning (topic + declared size) rather than one log line per fragment;
-- delegate the accept/reject decision to a pure function in a new header
-  (`rf433_mqtt_guard.h`), so host tests can pin the constant and boundary cases without
-  building the full ESPHome toolchain.
+The patch adds a check ahead of that `reserve()` call: any message whose declared `total`
+exceeds `rf433::MAX_INBOUND_PAYLOAD` (4096 bytes, see `rf433_inbound_guard.h`) is dropped
+before any buffer allocation happens, and the buffer is cleared so any further fragments
+of that same oversized message (which all carry the same `total`) are dropped too, rather
+than partially reassembled. A throttled warning (topic + declared size, once per 5 s) is
+emitted via `ESP_LOGW` instead of one log line per fragment, so a flood of oversized
+publishes cannot itself become log spam.
+
+The accept/reject decision (`rf433::accept_inbound_payload`) and the log throttle
+(`rf433::inbound_drop_log_due`) are pure functions in `rf433_inbound_guard.h`, so host
+tests in `tests/test_firmware.py` can pin the constant and boundary cases without
+building the full ESPHome toolchain.
 
 Broker `max_packet_size` configuration remains recommended as defense in depth
 independent of this guard.

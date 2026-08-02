@@ -16,6 +16,7 @@
 #include "lwip/dns.h"
 #include "lwip/err.h"
 #include "mqtt_component.h"
+#include "rf433_inbound_guard.h"
 
 #ifdef USE_API
 #include "esphome/components/api/api_server.h"
@@ -48,6 +49,19 @@ MQTTClientComponent::MQTTClientComponent() {
 void MQTTClientComponent::setup() {
   this->mqtt_backend_.set_on_message(
       [this](const char *topic, const char *payload, size_t len, size_t index, size_t total) {
+        // rf433 vendored patch (rf433_inbound_guard.h): drop oversized
+        // publishes before the broker-declared total forces a heap
+        // reservation. Every fragment of an oversized message carries the
+        // same total, so continuations die on the same test.
+        if (!rf433::accept_inbound_payload(total)) {
+          if (rf433::inbound_drop_log_due(millis())) {
+            ESP_LOGW(TAG, "Dropping inbound publish on '%s': declared %u bytes exceeds cap %u",
+                     topic, static_cast<unsigned>(total),
+                     static_cast<unsigned>(rf433::MAX_INBOUND_PAYLOAD));
+          }
+          this->payload_buffer_.clear();
+          return;
+        }
         if (index == 0) {
           this->payload_buffer_.clear();
           this->payload_buffer_.reserve(total);

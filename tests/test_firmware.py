@@ -1574,3 +1574,70 @@ int main() {
         env={**os.environ, "TMPDIR": str(tmp_path)},
     )
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+VENDORED_MQTT_CLIENT = PROJECT_ROOT / "components" / "mqtt" / "mqtt_client.cpp"
+
+
+def test_vendored_mqtt_carries_inbound_payload_guard() -> None:
+    """A re-vendor of the mqtt component must not silently drop the cap patch."""
+    client = VENDORED_MQTT_CLIENT.read_text()
+    assert '#include "rf433_inbound_guard.h"' in client
+    on_message = client.split("set_on_message", maxsplit=1)[1].split(
+        "set_on_disconnect", maxsplit=1
+    )[0]
+    # The guard must run before the broker-declared reserve() it exists to stop.
+    assert "rf433::accept_inbound_payload(total)" in on_message
+    assert on_message.index("accept_inbound_payload") < on_message.index("reserve(total)")
+
+
+def test_native_inbound_guard_boundaries_and_log_throttle(tmp_path: Path) -> None:
+    """Pin the 4 KiB cap boundary and the once-per-window drop log."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native guard test")
+    source = tmp_path / "guard_test.cpp"
+    binary = tmp_path / "guard_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include "components/mqtt/rf433_inbound_guard.h"
+
+int main() {
+  static_assert(rf433::MAX_INBOUND_PAYLOAD == 4096, "spec-pinned cap");
+  assert(rf433::accept_inbound_payload(0));
+  assert(rf433::accept_inbound_payload(4096));
+  assert(!rf433::accept_inbound_payload(4097));
+  assert(!rf433::accept_inbound_payload(60000));
+  // First drop logs; repeats inside the 5 s window stay quiet; the window
+  // reopens afterwards and survives a millis() rollover.
+  assert(rf433::inbound_drop_log_due(0));
+  assert(!rf433::inbound_drop_log_due(1));
+  assert(!rf433::inbound_drop_log_due(4999));
+  assert(rf433::inbound_drop_log_due(5000));
+  assert(!rf433::inbound_drop_log_due(5001));
+  assert(rf433::inbound_drop_log_due(0xFFFFFF00u));
+  assert(rf433::inbound_drop_log_due(0xFFFFFF00u + 5000u));
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
