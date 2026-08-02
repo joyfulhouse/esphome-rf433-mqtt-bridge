@@ -946,14 +946,14 @@ int main() {
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
-def test_generated_ota_begin_flushes_armed_stop_before_return(tmp_path: Path) -> None:
-    """Execute the shipped OTA begin lambda with physical occupancy waits."""
+def test_generated_ota_begin_pumps_dispatch_until_natural_deadline(tmp_path: Path) -> None:
+    """A deadline that lands inside the wait window fires at its real time, not early."""
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("a C++ compiler is required for the generated firmware test")
-    ota_lambda = _firmware_lambda("    on_begin:", "\n\nmqtt:")
-    source = tmp_path / "generated_ota_test.cpp"
-    binary = tmp_path / "generated_ota_test"
+    ota_lambda = _firmware_lambda("    on_begin:", "    on_error:")
+    source = tmp_path / "generated_ota_begin_natural_test.cpp"
+    binary = tmp_path / "generated_ota_begin_natural_test"
     source.write_text(
         r"""
 #include <cassert>
@@ -990,21 +990,160 @@ int main() {
   std::string reason;
   std::vector<std::string> displaced;
 
-  assert(scheduler.schedule("armed", "a1b2c3:01:1", action, "", 3, 60000, stop, 100,
+  // One started timed command, repeats=1: only its fail-safe STOP remains,
+  // due at 100 + 2000 = 2100.
+  assert(scheduler.schedule("armed", "a1b2c3:01:1", action, "", 1, 2000, stop, 100,
                             displaced, reason));
+  fake_now_ms = 100;
   auto raw = scheduler.next(100, started);
   assert(raw && *raw == action && started == "armed");
   portisch_rf_bridge.send_raw(*raw);
-  assert(scheduler.schedule("unstarted", "a1b2c3:02:1", action, "", 3, 60000, stop, 101,
-                            displaced, reason));
 
-  fake_now_ms = 101;
+  fake_now_ms = 200;
   generated_ota_begin();
   assert(ota_active);
+  // The pump let the STOP fire AT its deadline -- not early, not flushed.
   assert(portisch_rf_bridge.sent == std::vector<std::string>({action, stop}));
+  assert(fake_now_ms >= 2100);
+  assert(fake_now_ms < 2100 + 1000);  // and exited promptly once idle
   assert(scheduler.idle());
-  assert(fake_now_ms >= 116);  // wait for current frame, then drained STOP occupancy
   assert(scheduler.drain_armed_stops().empty());
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_generated_ota_begin_falls_back_to_flush_past_the_wait_window(tmp_path: Path) -> None:
+    """A deadline beyond the wait window still gets the early-STOP flush."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the generated firmware test")
+    ota_lambda = _firmware_lambda("    on_begin:", "    on_error:")
+    source = tmp_path / "generated_ota_begin_fallback_test.cpp"
+    binary = tmp_path / "generated_ota_begin_fallback_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "rf433_scheduler.h"
+
+struct FakeBridge {
+  std::vector<std::string> sent;
+  void send_raw(const std::string &raw) { this->sent.push_back(raw); }
+} portisch_rf_bridge;
+
+uint32_t fake_now_ms{0};
+bool ota_active{false};
+
+uint32_t millis() { return fake_now_ms; }
+void delay(uint32_t duration_ms) { fake_now_ms += duration_ms; }
+
+#define id(value) value
+
+void generated_ota_begin() {
+"""
+        + ota_lambda
+        + r"""
+}
+
+int main() {
+  const std::string action = "AAB005010100010055";
+  const std::string stop = "AAB005010100000055";
+  auto &scheduler = rf433::tx_scheduler(35);
+  std::string started;
+  std::string reason;
+  std::vector<std::string> displaced;
+
+  assert(scheduler.schedule("armed", "a1b2c3:01:1", action, "", 1, 60000, stop, 100,
+                            displaced, reason));
+  fake_now_ms = 100;
+  auto raw = scheduler.next(100, started);
+  assert(raw && *raw == action && started == "armed");
+  portisch_rf_bridge.send_raw(*raw);
+
+  fake_now_ms = 200;
+  generated_ota_begin();
+  assert(ota_active);
+  // Still armed at window end (due 60100 > 200 + 30000): early flush.
+  assert(portisch_rf_bridge.sent == std::vector<std::string>({action, stop}));
+  assert(fake_now_ms >= 200 + 30000);
+  assert(fake_now_ms < 60100);  // flushed early, NOT at the natural deadline
+  assert(scheduler.idle());
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_generated_ota_error_unlatches_tx(tmp_path: Path) -> None:
+    """A failed transfer must not leave /tx latched shut until a manual reboot."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the generated firmware test")
+    ota_error_lambda = _firmware_lambda("    on_error:", "\n\nmqtt:")
+    source = tmp_path / "generated_ota_error_test.cpp"
+    binary = tmp_path / "generated_ota_error_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+
+bool ota_active{false};
+
+#define id(value) value
+
+void generated_ota_error() {
+"""
+        + ota_error_lambda
+        + r"""
+}
+
+int main() {
+  ota_active = true;
+  generated_ota_error();
+  assert(!ota_active);
   return 0;
 }
 """
