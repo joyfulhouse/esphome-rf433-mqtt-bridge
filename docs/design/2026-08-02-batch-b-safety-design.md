@@ -12,7 +12,8 @@ lost at a boundary the scheduler cannot see:
 
 1. **Inbound MQTT payload assembly is unbounded** — ESPHome's stock `mqtt` component
    executes `payload_buffer_.reserve(total)` with a *broker-declared* size before any of
-   our validation runs (`mqtt_client.cpp:48-63` in ESPHome 2026.6.5). A tens-of-KB publish
+   our validation runs (`mqtt_client.cpp:48-63` in ESPHome 2026.6.5; verified unchanged
+   through 2026.7.3). A tens-of-KB publish
    during a timed move can exhaust ESP8285 heap or stall past a STOP deadline. The JSON
    layer's 5120-byte document cap applies only after assembly.
 2. **OTA has no scheduler interlock beyond the v1.3.0 early-STOP flush** — an update
@@ -26,7 +27,10 @@ lost at a boundary the scheduler cannot see:
 
 ## 1. Inbound MQTT payload cap (vendor now, upstream later)
 
-Vendor ESPHome 2026.6.5's `mqtt` component into `components/mqtt/`, following the exact
+Vendor ESPHome 2026.7.3's `mqtt` component into `components/mqtt/` (2026-08-02 amendment:
+originally 2026.6.5 per this repo's stale CI pin — the fleet's esphome-config CI builds with
+2026.7.2, whose mqtt component is byte-identical to 2026.7.3's; everything pins 2026.7.3 and
+the fleet CI bumps at rollout), following the exact
 precedent of `components/rf_bridge/` (README records the source commit and the full
 behavioural diff). The patch, in the inbound fragment-assembly path of `mqtt_client.cpp`:
 

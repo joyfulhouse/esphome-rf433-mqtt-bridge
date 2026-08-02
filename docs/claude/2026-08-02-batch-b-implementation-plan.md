@@ -4,16 +4,16 @@
 
 **Goal:** Close the three publication-gating safety blockers (MQTT inbound cap, OTA bounded wait-for-idle, retained-`/tx` boot binding) per the approved spec at `docs/design/2026-08-02-batch-b-safety-design.md`, across the firmware (v1.4.0) and the zemismart-blinds consumer (v0.8.0).
 
-**Architecture:** Blocker 1 vendors ESPHome 2026.6.5's `mqtt` component with a pre-allocation payload cap behind a host-testable guard header. Blocker 2 rewrites `ota.on_begin` to pump the scheduler's own dispatch path for up to 30 s before falling back to the existing early-STOP flush, and resets the `/tx` latch on OTA error. Blocker 3 adds a required `boot` field to `/tx` (contract v3), stamped by the consumer from its already-strict registry boot snapshot and enforced by the firmware.
+**Architecture:** Blocker 1 vendors ESPHome 2026.7.3's `mqtt` component with a pre-allocation payload cap behind a host-testable guard header. Blocker 2 rewrites `ota.on_begin` to pump the scheduler's own dispatch path for up to 30 s before falling back to the existing early-STOP flush, and resets the `/tx` latch on OTA error. Blocker 3 adds a required `boot` field to `/tx` (contract v3), stamped by the consumer from its already-strict registry boot snapshot and enforced by the firmware.
 
-**Tech Stack:** ESPHome 2026.6.5 YAML lambdas + header-only C++17 (host-tested via inline-compiled `.cpp` per test), pytest, `uv`; consumer is a Home Assistant custom integration (Python 3.13, pytest).
+**Tech Stack:** ESPHome 2026.7.3 YAML lambdas + header-only C++17 (host-tested via inline-compiled `.cpp` per test), pytest, `uv`; consumer is a Home Assistant custom integration (Python 3.13, pytest).
 
 ## Global Constraints
 
 - Firmware repo root: `/Users/bryanli/Projects/joyfulhouse/homeassistant-dev/esphome-rf433-mqtt-bridge` ("FW"); consumer repo root: `/Users/bryanli/Projects/joyfulhouse/homeassistant-dev/zemismart-blinds` ("HA"). Each task states which repo it runs in.
 - Python: always `uv` (`uv run pytest`, `uv run ruff check --fix`, `uv run ruff format`); never pip.
 - Host C++ tests compile with `c++ -std=c++17 -Wall -Wextra -Werror -I <PROJECT_ROOT>` (existing harness pattern; keep it).
-- ESPHome version is pinned: **2026.6.5** everywhere (vendor source, compile checks).
+- ESPHome version is pinned: **2026.7.3** everywhere (vendor source, compile checks, this repo's CI, README dev commands). Decided 2026-08-02: the fleet's esphome-config CI (currently 2026.7.2) bumps to 2026.7.3 at rollout — the mqtt component is byte-identical between 7.2 and 7.3. The old 2026.6.5 pin was stale.
 - Spec-pinned constants, verbatim: `MAX_INBOUND_PAYLOAD = 4096` (bytes), `OTA_IDLE_WAIT_MS = 30000` (ms), rejection reason string `"boot_mismatch"`, `/info` contract version `"v": 3`.
 - Never disable linter rules; fix root causes.
 - Commits end with: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
@@ -45,7 +45,7 @@ Expected: exactly 3 open issues. Note their numbers for Task 8's PR body (`Close
 
 ---
 
-### Task 2: Vendor the ESPHome 2026.6.5 mqtt component (FW, no behavior change yet)
+### Task 2: Vendor the ESPHome 2026.7.3 mqtt component (FW, no behavior change yet)
 
 **Files:**
 - Create: `components/mqtt/` (full vendored copy)
@@ -59,14 +59,14 @@ Expected: exactly 3 open issues. Note their numbers for Task 8's PR body (`Close
 
 ```bash
 cd /Users/bryanli/Projects/joyfulhouse/homeassistant-dev/esphome-rf433-mqtt-bridge
-SRC=$(uvx --from "esphome==2026.6.5" python -c "import esphome.components.mqtt as m, pathlib; print(pathlib.Path(m.__file__).parent)")
+SRC=$(uvx --from "esphome==2026.7.3" python -c "import esphome.components.mqtt as m, pathlib; print(pathlib.Path(m.__file__).parent)")
 cp -R "$SRC" components/mqtt
 find components/mqtt -name "__pycache__" -type d -exec rm -rf {} +
 ```
 
 - [ ] **Step 2: Write the vendor README**
 
-Create `components/mqtt/README.md` following the pattern of `components/rf_bridge/README.md` (state: vendored from ESPHome 2026.6.5, why — inbound payload cap the stock component cannot apply, see design doc — and that the only behavioural diff is the guard added in the next task; everything else is byte-identical to upstream).
+Create `components/mqtt/README.md` following the pattern of `components/rf_bridge/README.md` (state: vendored from ESPHome 2026.7.3, why — inbound payload cap the stock component cannot apply, see design doc — and that the only behavioural diff is the guard added in the next task; everything else is byte-identical to upstream).
 
 - [ ] **Step 3: Register the component**
 
@@ -87,17 +87,21 @@ external_components:
 ```bash
 cp secrets.example.yaml secrets.yaml
 cp examples/living-room.yaml .
-uvx --from "esphome==2026.6.5" esphome compile living-room.yaml
+uvx --from "esphome==2026.7.3" esphome compile living-room.yaml
 rm living-room.yaml secrets.yaml
 ```
 
 Expected: clean compile (this is the same staging CI performs). If ESPHome rejects the vendored layout, fix before proceeding — nothing else in this plan works without it.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Bump the repo's own ESPHome pin**
+
+Update every `esphome==2026.6.5` occurrence to `esphome==2026.7.3` in `.github/workflows/ci.yml` and `README.md` (dev commands ~lines 158-159; leave the historical rf_bridge vendor provenance note at README ~line 134 as-is — it records where that copy came from).
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add components/mqtt rf433-mqtt-bridge.yaml
-git commit -m "vendor: ESPHome 2026.6.5 mqtt component, byte-identical (pre-patch)"
+git add components/mqtt rf433-mqtt-bridge.yaml .github/workflows/ci.yml README.md
+git commit -m "vendor: ESPHome 2026.7.3 mqtt component, byte-identical (pre-patch); bump CI pin"
 ```
 
 ---
@@ -739,7 +743,7 @@ gh pr create --title "v0.8.0: contract v3 — stamp bridge boot into /tx" --body
 
 - [ ] **Step 1: Write the runbook** — concrete steps for the office-bridge canary per spec §4, with real bridge/broker names and a bogus-identity target (per the established probe technique) so nothing physically moves:
   1. Deploy blinds v0.8.0 fleet-wide first; confirm live moves still work against v1.3.0 firmware (boot ignored).
-  2. OTA the office bridge to the v1.4.0 candidate during an idle window (config source of truth: the Forgejo esphome-config repo, GitOps to `/config/esphome`).
+  2. Bump `ESPHOME_VERSION` 2026.7.2 → 2026.7.3 in the Forgejo esphome-config CI (config source of truth, GitOps to `/config/esphome`) in the same change that syncs the v1.4.0 sources; then OTA the office bridge to the v1.4.0 candidate during an idle window.
   3. Cap probe: `mosquitto_pub` a `/tx` whose payload pads past 20 KB → expect a single throttled drop log, bridge stays online, no status.
   4. OTA-interlock probe: start a bogus-identity timed move, immediately re-OTA → expect the transfer to wait, the STOP to fire at its natural deadline, update completes.
   5. Boot probe: publish a bogus `/tx` with `boot: 1` → expect `rejected/boot_mismatch` on `/status`. Then publish a **retained** bogus `/tx` with the CURRENT boot, reboot the bridge, confirm the replay is rejected (new boot) and nothing schedules; clear the retained message with `mosquitto_pub -r -n`.
