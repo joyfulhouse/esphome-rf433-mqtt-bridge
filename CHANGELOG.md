@@ -13,7 +13,7 @@ Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is d
 ### Added
 
 - **`/tx` requires the current boot id (contract v3,
-  [#8](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/8)/[#9](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/9)/[#10](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/10))**:
+  [#10](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/10))**:
   every `/tx` command must now carry a `boot` field equal to the bridge's current boot id, as
   advertised on retained `/info` (`v` bumps to `3`). Missing, mistyped, and mismatched values are
   all rejected with `"reason":"boot_mismatch"`, giving a controller exactly one recovery path —
