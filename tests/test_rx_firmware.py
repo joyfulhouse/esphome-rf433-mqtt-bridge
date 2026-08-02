@@ -15,7 +15,7 @@ BRIDGE_YAML = PROJECT_ROOT / "rf433-mqtt-bridge.yaml"
 RX_HEADER = PROJECT_ROOT / "rf433_rx.h"
 RF_BRIDGE_DIR = PROJECT_ROOT / "components" / "rf_bridge"
 RF_BRIDGE_PROTOCOL = RF_BRIDGE_DIR / "rf_bridge_protocol.h"
-TX_SEND_PATHS = 2
+TX_SEND_PATHS = 3
 
 
 def _compile_and_run(tmp_path: Path, source_text: str) -> None:
@@ -1284,7 +1284,8 @@ def test_firmware_wires_state_sync_contract_without_rx_to_tx() -> None:
     assert "rf433::rx_state().should_publish()" in rx_handler
     assert 'root["boot"] = id(boot_id);' in rx_handler
     assert "}, 1, false)" in rx_handler
-    # Normal interval TX plus the OTA begin STOP-flush path; RX itself has none.
+    # Normal interval TX, the OTA begin wait-for-idle dispatch pump, and the
+    # OTA begin STOP-flush path; RX itself has none.
     assert package.count(".send_raw(") == TX_SEND_PATHS
 
     cmd_handler = package.split("- topic: rf433/${bridge_id}/cmd", maxsplit=1)[1].split(
@@ -1322,7 +1323,7 @@ def test_firmware_state_sync_payloads_and_deferred_surface() -> None:
     ].split("}, 0, true)", maxsplit=1)[0]
     assert 'root["boot"] = id(boot_id);' in info_publish
     assert 'root["listen"] = ${listen_enabled};' in info_publish
-    assert 'root["v"] = 2;' in info_publish
+    assert 'root["v"] = 3;' in info_publish
 
     # Both the handler and interval outbox publishers serialize measured age
     # and bridge-clock/session fields when the lifecycle event carries them.
@@ -1419,7 +1420,7 @@ def test_rx_docs_publish_state_sync_contract_and_vendored_version() -> None:
     assert "QoS 1, non-retained" in readme
     assert "`handoff = t - age_ms`" in readme
     assert '"listen":false' in readme
-    assert '"v":2' in readme
+    assert '"v":3' in readme
     assert '{"action":"disarm","command_id":"move:42"}' in readme
     assert '"status":"disarmed"' in readme
     assert "monotonic modulo `2^32`" in readme

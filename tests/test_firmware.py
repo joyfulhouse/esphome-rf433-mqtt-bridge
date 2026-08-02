@@ -946,14 +946,14 @@ int main() {
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
-def test_generated_ota_begin_flushes_armed_stop_before_return(tmp_path: Path) -> None:
-    """Execute the shipped OTA begin lambda with physical occupancy waits."""
+def test_generated_ota_begin_pumps_dispatch_until_natural_deadline(tmp_path: Path) -> None:
+    """A deadline that lands inside the wait window fires at its real time, not early."""
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("a C++ compiler is required for the generated firmware test")
-    ota_lambda = _firmware_lambda("    on_begin:", "\n\nmqtt:")
-    source = tmp_path / "generated_ota_test.cpp"
-    binary = tmp_path / "generated_ota_test"
+    ota_lambda = _firmware_lambda("    on_begin:", "    on_error:")
+    source = tmp_path / "generated_ota_begin_natural_test.cpp"
+    binary = tmp_path / "generated_ota_begin_natural_test"
     source.write_text(
         r"""
 #include <cassert>
@@ -990,21 +990,160 @@ int main() {
   std::string reason;
   std::vector<std::string> displaced;
 
-  assert(scheduler.schedule("armed", "a1b2c3:01:1", action, "", 3, 60000, stop, 100,
+  // One started timed command, repeats=1: only its fail-safe STOP remains,
+  // due at 100 + 2000 = 2100.
+  assert(scheduler.schedule("armed", "a1b2c3:01:1", action, "", 1, 2000, stop, 100,
                             displaced, reason));
+  fake_now_ms = 100;
   auto raw = scheduler.next(100, started);
   assert(raw && *raw == action && started == "armed");
   portisch_rf_bridge.send_raw(*raw);
-  assert(scheduler.schedule("unstarted", "a1b2c3:02:1", action, "", 3, 60000, stop, 101,
-                            displaced, reason));
 
-  fake_now_ms = 101;
+  fake_now_ms = 200;
   generated_ota_begin();
   assert(ota_active);
+  // The pump let the STOP fire AT its deadline -- not early, not flushed.
   assert(portisch_rf_bridge.sent == std::vector<std::string>({action, stop}));
+  assert(fake_now_ms >= 2100);
+  assert(fake_now_ms < 2100 + 1000);  // and exited promptly once idle
   assert(scheduler.idle());
-  assert(fake_now_ms >= 116);  // wait for current frame, then drained STOP occupancy
   assert(scheduler.drain_armed_stops().empty());
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_generated_ota_begin_falls_back_to_flush_past_the_wait_window(tmp_path: Path) -> None:
+    """A deadline beyond the wait window still gets the early-STOP flush."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the generated firmware test")
+    ota_lambda = _firmware_lambda("    on_begin:", "    on_error:")
+    source = tmp_path / "generated_ota_begin_fallback_test.cpp"
+    binary = tmp_path / "generated_ota_begin_fallback_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "rf433_scheduler.h"
+
+struct FakeBridge {
+  std::vector<std::string> sent;
+  void send_raw(const std::string &raw) { this->sent.push_back(raw); }
+} portisch_rf_bridge;
+
+uint32_t fake_now_ms{0};
+bool ota_active{false};
+
+uint32_t millis() { return fake_now_ms; }
+void delay(uint32_t duration_ms) { fake_now_ms += duration_ms; }
+
+#define id(value) value
+
+void generated_ota_begin() {
+"""
+        + ota_lambda
+        + r"""
+}
+
+int main() {
+  const std::string action = "AAB005010100010055";
+  const std::string stop = "AAB005010100000055";
+  auto &scheduler = rf433::tx_scheduler(35);
+  std::string started;
+  std::string reason;
+  std::vector<std::string> displaced;
+
+  assert(scheduler.schedule("armed", "a1b2c3:01:1", action, "", 1, 60000, stop, 100,
+                            displaced, reason));
+  fake_now_ms = 100;
+  auto raw = scheduler.next(100, started);
+  assert(raw && *raw == action && started == "armed");
+  portisch_rf_bridge.send_raw(*raw);
+
+  fake_now_ms = 200;
+  generated_ota_begin();
+  assert(ota_active);
+  // Still armed at window end (due 60100 > 200 + 30000): early flush.
+  assert(portisch_rf_bridge.sent == std::vector<std::string>({action, stop}));
+  assert(fake_now_ms >= 200 + 30000);
+  assert(fake_now_ms < 60100);  // flushed early, NOT at the natural deadline
+  assert(scheduler.idle());
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_generated_ota_error_unlatches_tx(tmp_path: Path) -> None:
+    """A failed transfer must not leave /tx latched shut until a manual reboot."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the generated firmware test")
+    ota_error_lambda = _firmware_lambda("    on_error:", "\n\nmqtt:")
+    source = tmp_path / "generated_ota_error_test.cpp"
+    binary = tmp_path / "generated_ota_error_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+
+bool ota_active{false};
+
+#define id(value) value
+
+void generated_ota_error() {
+"""
+        + ota_error_lambda
+        + r"""
+}
+
+int main() {
+  ota_active = true;
+  generated_ota_error();
+  assert(!ota_active);
   return 0;
 }
 """
@@ -1166,7 +1305,7 @@ def test_generated_tx_and_tick_replay_started_once_after_reconnect(tmp_path: Pat
 #include "rf433_scheduler.h"
 
 struct JsonValueData {
-  std::variant<std::monostate, std::string, int, bool> value;
+  std::variant<std::monostate, std::string, int, bool, uint32_t> value;
 };
 
 struct JsonValue {
@@ -1184,6 +1323,10 @@ struct JsonValue {
       return std::holds_alternative<std::string>(this->data->value);
     if constexpr (std::is_same_v<T, int>)
       return std::holds_alternative<int>(this->data->value);
+    if constexpr (std::is_same_v<T, uint32_t>)
+      return std::holds_alternative<uint32_t>(this->data->value) ||
+             (std::holds_alternative<int>(this->data->value) &&
+              std::get<int>(this->data->value) >= 0);
     return false;
   }
 
@@ -1192,6 +1335,10 @@ struct JsonValue {
       return std::get<std::string>(this->data->value).c_str();
     if constexpr (std::is_same_v<T, int>)
       return std::get<int>(this->data->value);
+    if constexpr (std::is_same_v<T, uint32_t>)
+      return std::holds_alternative<uint32_t>(this->data->value)
+                 ? std::get<uint32_t>(this->data->value)
+                 : static_cast<uint32_t>(std::get<int>(this->data->value));
   }
 
   int operator|(int fallback) const {
@@ -1214,6 +1361,10 @@ struct FakeJson {
   }
 
   void set_int(const std::string &key, int value) {
+    this->values[key].value = value;
+  }
+
+  void set_uint(const std::string &key, uint32_t value) {
     this->values[key].value = value;
   }
 };
@@ -1313,6 +1464,56 @@ void generated_tick() {
 
 int main() {
   const std::string frame = "AAB005010100010055";
+
+  // Contract v3: missing, mistyped, and mismatched boot all reject with the
+  // single reason "boot_mismatch" and never reach the scheduler.
+  mqtt_client.connected = true;
+  FakeJson no_boot;
+  no_boot.set_string("command_id", "no-boot-1");
+  no_boot.set_string("target", "a1b2c3:01:1");
+  no_boot.set_string("raw", frame);
+  generated_tx_handler(no_boot);
+  assert(mqtt_client.messages.back().payload.at("status") == "rejected");
+  assert(mqtt_client.messages.back().payload.at("reason") == "boot_mismatch");
+
+  FakeJson stale_boot;
+  stale_boot.set_string("command_id", "stale-boot-1");
+  stale_boot.set_string("target", "a1b2c3:01:1");
+  stale_boot.set_string("raw", frame);
+  stale_boot.set_uint("boot", 41);  // previous boot: the retained-replay shape
+  generated_tx_handler(stale_boot);
+  assert(mqtt_client.messages.back().payload.at("status") == "rejected");
+  assert(mqtt_client.messages.back().payload.at("reason") == "boot_mismatch");
+  assert(rf433::tx_scheduler(35).idle());
+
+  // Production boot_id is random_uint32, so real values exceed INT32_MAX
+  // roughly half the time. Prove the boot check accepts a matching value up
+  // there too, not just the small literal 42 the rest of this test uses.
+  boot_id = 3000000000u;
+  FakeJson big_boot;
+  big_boot.set_string("command_id", "big-boot-1");
+  big_boot.set_string("target", "a1b2c3:01:1");
+  big_boot.set_string("raw", frame);
+  big_boot.set_uint("boot", 3000000000u);
+  generated_tx_handler(big_boot);
+  assert(mqtt_client.messages.back().payload.at("status") == "accepted");
+  assert(mqtt_client.messages.back().payload.at("command_id") == "big-boot-1");
+  rf433::tx_scheduler(35).disarm("big-boot-1");
+
+  FakeJson stale_big_boot;
+  stale_big_boot.set_string("command_id", "stale-big-boot-1");
+  stale_big_boot.set_string("target", "a1b2c3:01:1");
+  stale_big_boot.set_string("raw", frame);
+  stale_big_boot.set_uint("boot", 3000000001u);
+  generated_tx_handler(stale_big_boot);
+  assert(mqtt_client.messages.back().payload.at("status") == "rejected");
+  assert(mqtt_client.messages.back().payload.at("reason") == "boot_mismatch");
+  assert(rf433::tx_scheduler(35).idle());
+  boot_id = 42;
+
+  mqtt_client.messages.clear();
+  mqtt_client.connected = false;
+
   FakeJson command;
   command.set_string("command_id", "move-1");
   command.set_string("target", "a1b2c3:01:1");
@@ -1320,6 +1521,7 @@ int main() {
   command.set_int("repeats", 1);
   command.set_int("stop_after_ms", 1000);
   command.set_string("stop_raw", frame);
+  command.set_uint("boot", 42);
 
   fake_now_ms = 100;
   generated_tx_handler(command);
@@ -1346,6 +1548,14 @@ int main() {
   assert(statuses[1].payload.at("command_id") == "move-1");
   assert(statuses[1].payload.at("boot") == "42");
   assert(rf433::lifecycle_outbox().empty());
+  bool saw_info = false;
+  for (const Message &message : mqtt_client.messages) {
+    if (message.topic == "rf433/test-bridge/info") {
+      assert(message.payload.at("v") == "3");
+      saw_info = true;
+    }
+  }
+  assert(saw_info);
 
   fake_now_ms = 110;
   generated_tick();
@@ -1551,6 +1761,73 @@ int main() {
   assert(age == static_cast<uint32_t>(after_wrap - disp_at));
   assert(age == 251u);  // 201 ms to the wrap + 50 ms after it
 
+  return 0;
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+VENDORED_MQTT_CLIENT = PROJECT_ROOT / "components" / "mqtt" / "mqtt_client.cpp"
+
+
+def test_vendored_mqtt_carries_inbound_payload_guard() -> None:
+    """A re-vendor of the mqtt component must not silently drop the cap patch."""
+    client = VENDORED_MQTT_CLIENT.read_text()
+    assert '#include "rf433_inbound_guard.h"' in client
+    on_message = client.split("set_on_message", maxsplit=1)[1].split(
+        "set_on_disconnect", maxsplit=1
+    )[0]
+    # The guard must run before the broker-declared reserve() it exists to stop.
+    assert "rf433::accept_inbound_payload(total)" in on_message
+    assert on_message.index("accept_inbound_payload") < on_message.index("reserve(total)")
+
+
+def test_native_inbound_guard_boundaries_and_log_throttle(tmp_path: Path) -> None:
+    """Pin the 4 KiB cap boundary and the once-per-window drop log."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native guard test")
+    source = tmp_path / "guard_test.cpp"
+    binary = tmp_path / "guard_test"
+    source.write_text(
+        r"""
+#include <cassert>
+#include "components/mqtt/rf433_inbound_guard.h"
+
+int main() {
+  static_assert(rf433::MAX_INBOUND_PAYLOAD == 4096, "spec-pinned cap");
+  assert(rf433::accept_inbound_payload(0));
+  assert(rf433::accept_inbound_payload(4096));
+  assert(!rf433::accept_inbound_payload(4097));
+  assert(!rf433::accept_inbound_payload(60000));
+  // First drop logs; repeats inside the 5 s window stay quiet; the window
+  // reopens afterwards and survives a millis() rollover.
+  assert(rf433::inbound_drop_log_due(0));
+  assert(!rf433::inbound_drop_log_due(1));
+  assert(!rf433::inbound_drop_log_due(4999));
+  assert(rf433::inbound_drop_log_due(5000));
+  assert(!rf433::inbound_drop_log_due(5001));
+  assert(rf433::inbound_drop_log_due(0xFFFFFF00u));
+  assert(rf433::inbound_drop_log_due(0xFFFFFF00u + 5000u));
   return 0;
 }
 """

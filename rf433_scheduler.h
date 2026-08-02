@@ -54,6 +54,10 @@ constexpr uint32_t MAX_FIRST_STOP_OCCUPANCY_MS = 4000;
 // schedule() dedup consult live scheduler state), but the headroom keeps the
 // completed-id window intact even at peak occupancy.
 constexpr size_t COMMAND_ID_RING_SIZE = 64;
+// OTA begin blocks the main loop, so the 5 ms dispatch tick cannot run;
+// on_begin pumps dispatch itself for at most this long waiting for natural
+// idle before falling back to the early-STOP flush.
+static constexpr uint32_t OTA_IDLE_WAIT_MS = 30000;
 
 enum class LifecycleKind : uint8_t {
   ACCEPTED,
