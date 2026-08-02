@@ -1485,6 +1485,32 @@ int main() {
   assert(mqtt_client.messages.back().payload.at("status") == "rejected");
   assert(mqtt_client.messages.back().payload.at("reason") == "boot_mismatch");
   assert(rf433::tx_scheduler(35).idle());
+
+  // Production boot_id is random_uint32, so real values exceed INT32_MAX
+  // roughly half the time. Prove the boot check accepts a matching value up
+  // there too, not just the small literal 42 the rest of this test uses.
+  boot_id = 3000000000u;
+  FakeJson big_boot;
+  big_boot.set_string("command_id", "big-boot-1");
+  big_boot.set_string("target", "a1b2c3:01:1");
+  big_boot.set_string("raw", frame);
+  big_boot.set_uint("boot", 3000000000u);
+  generated_tx_handler(big_boot);
+  assert(mqtt_client.messages.back().payload.at("status") == "accepted");
+  assert(mqtt_client.messages.back().payload.at("command_id") == "big-boot-1");
+  rf433::tx_scheduler(35).disarm("big-boot-1");
+
+  FakeJson stale_big_boot;
+  stale_big_boot.set_string("command_id", "stale-big-boot-1");
+  stale_big_boot.set_string("target", "a1b2c3:01:1");
+  stale_big_boot.set_string("raw", frame);
+  stale_big_boot.set_uint("boot", 3000000001u);
+  generated_tx_handler(stale_big_boot);
+  assert(mqtt_client.messages.back().payload.at("status") == "rejected");
+  assert(mqtt_client.messages.back().payload.at("reason") == "boot_mismatch");
+  assert(rf433::tx_scheduler(35).idle());
+  boot_id = 42;
+
   mqtt_client.messages.clear();
   mqtt_client.connected = false;
 
