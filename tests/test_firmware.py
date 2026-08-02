@@ -1305,7 +1305,7 @@ def test_generated_tx_and_tick_replay_started_once_after_reconnect(tmp_path: Pat
 #include "rf433_scheduler.h"
 
 struct JsonValueData {
-  std::variant<std::monostate, std::string, int, bool> value;
+  std::variant<std::monostate, std::string, int, bool, uint32_t> value;
 };
 
 struct JsonValue {
@@ -1323,6 +1323,10 @@ struct JsonValue {
       return std::holds_alternative<std::string>(this->data->value);
     if constexpr (std::is_same_v<T, int>)
       return std::holds_alternative<int>(this->data->value);
+    if constexpr (std::is_same_v<T, uint32_t>)
+      return std::holds_alternative<uint32_t>(this->data->value) ||
+             (std::holds_alternative<int>(this->data->value) &&
+              std::get<int>(this->data->value) >= 0);
     return false;
   }
 
@@ -1331,6 +1335,10 @@ struct JsonValue {
       return std::get<std::string>(this->data->value).c_str();
     if constexpr (std::is_same_v<T, int>)
       return std::get<int>(this->data->value);
+    if constexpr (std::is_same_v<T, uint32_t>)
+      return std::holds_alternative<uint32_t>(this->data->value)
+                 ? std::get<uint32_t>(this->data->value)
+                 : static_cast<uint32_t>(std::get<int>(this->data->value));
   }
 
   int operator|(int fallback) const {
@@ -1353,6 +1361,10 @@ struct FakeJson {
   }
 
   void set_int(const std::string &key, int value) {
+    this->values[key].value = value;
+  }
+
+  void set_uint(const std::string &key, uint32_t value) {
     this->values[key].value = value;
   }
 };
@@ -1452,6 +1464,30 @@ void generated_tick() {
 
 int main() {
   const std::string frame = "AAB005010100010055";
+
+  // Contract v3: missing, mistyped, and mismatched boot all reject with the
+  // single reason "boot_mismatch" and never reach the scheduler.
+  mqtt_client.connected = true;
+  FakeJson no_boot;
+  no_boot.set_string("command_id", "no-boot-1");
+  no_boot.set_string("target", "a1b2c3:01:1");
+  no_boot.set_string("raw", frame);
+  generated_tx_handler(no_boot);
+  assert(mqtt_client.messages.back().payload.at("status") == "rejected");
+  assert(mqtt_client.messages.back().payload.at("reason") == "boot_mismatch");
+
+  FakeJson stale_boot;
+  stale_boot.set_string("command_id", "stale-boot-1");
+  stale_boot.set_string("target", "a1b2c3:01:1");
+  stale_boot.set_string("raw", frame);
+  stale_boot.set_uint("boot", 41);  // previous boot: the retained-replay shape
+  generated_tx_handler(stale_boot);
+  assert(mqtt_client.messages.back().payload.at("status") == "rejected");
+  assert(mqtt_client.messages.back().payload.at("reason") == "boot_mismatch");
+  assert(rf433::tx_scheduler(35).idle());
+  mqtt_client.messages.clear();
+  mqtt_client.connected = false;
+
   FakeJson command;
   command.set_string("command_id", "move-1");
   command.set_string("target", "a1b2c3:01:1");
@@ -1459,6 +1495,7 @@ int main() {
   command.set_int("repeats", 1);
   command.set_int("stop_after_ms", 1000);
   command.set_string("stop_raw", frame);
+  command.set_uint("boot", 42);
 
   fake_now_ms = 100;
   generated_tx_handler(command);
@@ -1485,6 +1522,14 @@ int main() {
   assert(statuses[1].payload.at("command_id") == "move-1");
   assert(statuses[1].payload.at("boot") == "42");
   assert(rf433::lifecycle_outbox().empty());
+  bool saw_info = false;
+  for (const Message &message : mqtt_client.messages) {
+    if (message.topic == "rf433/test-bridge/info") {
+      assert(message.payload.at("v") == "3");
+      saw_info = true;
+    }
+  }
+  assert(saw_info);
 
   fake_now_ms = 110;
   generated_tick();

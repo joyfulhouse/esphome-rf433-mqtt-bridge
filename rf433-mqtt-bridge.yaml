@@ -258,6 +258,18 @@ mqtt:
             return;
           }
 
+          // Contract v3 session binding: a command must present this boot's
+          // id (learned from retained /info). A retained /tx replayed after
+          // a reboot carries the previous boot and dies here -- the RAM
+          // dedup ring cannot survive the reboot; this check does not need
+          // to. Missing, mistyped, and mismatched all collapse to one reason
+          // so a controller has exactly one recovery path: re-read /info,
+          // re-issue with the current boot.
+          if (!x["boot"].is<uint32_t>() || x["boot"].as<uint32_t>() != id(boot_id)) {
+            reject("boot_mismatch");
+            return;
+          }
+
           // QoS-1 broker redelivery of an already-seen command replays the
           // original lifecycle idempotently. Rejecting an admitted duplicate
           // would tell a controller whose `accepted` was lost in an MQTT
@@ -550,7 +562,7 @@ interval:
                        root["default"] = ${default_bridge};
                        root["boot"] = id(boot_id);
                        root["listen"] = ${listen_enabled};
-                       root["v"] = 2;
+                       root["v"] = 3;
                      }, 0, true)) {
             id(next_info_ms) = now_ms + 60000;
           }

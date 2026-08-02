@@ -1323,7 +1323,7 @@ def test_firmware_state_sync_payloads_and_deferred_surface() -> None:
     ].split("}, 0, true)", maxsplit=1)[0]
     assert 'root["boot"] = id(boot_id);' in info_publish
     assert 'root["listen"] = ${listen_enabled};' in info_publish
-    assert 'root["v"] = 2;' in info_publish
+    assert 'root["v"] = 3;' in info_publish
 
     # Both the handler and interval outbox publishers serialize measured age
     # and bridge-clock/session fields when the lifecycle event carries them.
