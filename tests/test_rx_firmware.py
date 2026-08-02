@@ -1420,7 +1420,7 @@ def test_rx_docs_publish_state_sync_contract_and_vendored_version() -> None:
     assert "QoS 1, non-retained" in readme
     assert "`handoff = t - age_ms`" in readme
     assert '"listen":false' in readme
-    assert '"v":2' in readme
+    assert '"v":3' in readme
     assert '{"action":"disarm","command_id":"move:42"}' in readme
     assert '"status":"disarmed"' in readme
     assert "monotonic modulo `2^32`" in readme

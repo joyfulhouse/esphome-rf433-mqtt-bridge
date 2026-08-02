@@ -63,8 +63,10 @@ transmits Portisch **B0** raw frames. All the smarts about blinds live in the co
   targets can therefore put the last first-STOP copy roughly N physical frame-occupancy intervals
   after `displaced`; the status is not an on-air timestamp.
 - **Duplicate suppression** — a ring of recent `command_id`s suppresses QoS-1 broker redeliveries
-  and same-boot retained replays. The ring lives in RAM, so a retained `tx` command *can* replay
-  after a reboot: **retained `tx` publishes are unsupported and dangerous — never publish them.**
+  and same-boot retained replays. Since v1.4.0 (contract v3), every `/tx` command must also carry
+  the current `boot` id; a retained `tx` republished after a reboot carries the previous boot and
+  is rejected structurally, not just deduplicated by the RAM ring. **Retained `tx` publishes are
+  still unsupported and dangerous — never publish them.**
 - **Bounded memory and latency** — admission enforces both a stored-frame heap budget and a
   4,000 ms aggregate first-STOP occupancy budget. Lifecycle statuses use a 32-event FIFO outbox;
   duplicate command/status transitions coalesce, sustained overflow drops the oldest event, and
@@ -133,6 +135,8 @@ simply your HA host; a standalone broker works identically.
    `rf433-mqtt-bridge.yaml` loads `components/rf_bridge/` as a local external component. Keep that
    directory intact rather than flattening it. It is vendored from ESPHome 2026.6.5's
    `esphome/components/rf_bridge` and extended with the B1 receive callback used by this package.
+   `components/mqtt/` is a second, separate vendored component (ESPHome 2026.7.3) carrying the
+   inbound payload guard described in [components/mqtt/README.md](components/mqtt/README.md).
 
    <details>
    <summary><b>Using only the hardened <code>rf_bridge</code> component elsewhere</b></summary>
@@ -171,7 +175,7 @@ payloads. All topics live under the fixed `rf433/` root.
 | Topic | Direction | Payload |
 |---|---|---|
 | `rf433/<bridge_id>/availability` | bridge → broker (QoS 0, retained) | `online` / `offline` |
-| `rf433/<bridge_id>/info` | bridge → broker (QoS 0, retained) | `{"bridge":"rf433-bridge","area":"living_room","default":false,"boot":2718281828,"listen":false,"v":2}` |
+| `rf433/<bridge_id>/info` | bridge → broker (QoS 0, retained) | `{"bridge":"rf433-bridge","area":"living_room","default":false,"boot":2718281828,"listen":false,"v":3}` |
 | `rf433/<bridge_id>/tx` | controller → bridge (QoS 1, non-retained) | JSON transmit command (below) |
 | `rf433/<bridge_id>/status` | bridge → controller (QoS 1, non-retained) | `{"status","command_id"[,"reason"][,"age_ms"][,"t"][,"boot"]}` |
 | `rf433/<bridge_id>/rx` | bridge → broker (QoS 1, non-retained) | `{"frame":"AAB1...55","t":123456,"boot":2718281828}` |
@@ -181,8 +185,8 @@ payloads. All topics live under the fixed `rf433/` root.
 `displaced` (a newer overlapping command replaced this one), or `disarmed`.
 
 > ⚠️ **Authenticated MQTT is required.** Never grant anonymous access, and apply the least-privilege
-> broker ACL matrix below. `retained tx` publishes are unsupported and dangerous — never publish
-> them.
+> broker ACL matrix below. `retained tx` publishes are unsupported and dangerous — since v1.4.0 they
+> are structurally rejected by the boot check below, and you should still never publish them.
 
 <details>
 <summary><b>Broker security and least-privilege ACL matrix</b></summary>
@@ -246,16 +250,21 @@ by the outbox.
   "trailer_raw": "AAB0...55",
   "repeats": 5,
   "stop_after_ms": 8000,
-  "stop_raw": "AAB0...55"
+  "stop_raw": "AAB0...55",
+  "boot": 2718281828
 }
 ```
 
 `target` is `prefix:remote_id:channels`. Hex parsing is case-insensitive and canonical uppercase
 is used internally; channels must be strictly increasing values from 1 through 16.
 `trailer_raw`, `stop_after_ms`, and `stop_raw` are optional; a timed command requires `stop_raw`.
-The bridge validates JSON shape, bounds, and B0 structure, but deliberately trusts the authenticated
-controller for frame semantics: it cannot prove that `raw`, `trailer_raw`, and `stop_raw` address
-the same physical blind or match the declared `target`.
+`boot` is required as of contract v3 (v1.4.0): it must equal the bridge's current boot id, as
+advertised on retained `/info`. Missing, mistyped, and mismatched values are all rejected with
+the same `"reason":"boot_mismatch"` so a controller has exactly one recovery path — re-read
+`/info`, then re-issue with the current boot. The bridge validates JSON shape, bounds, and B0
+structure, but deliberately trusts the authenticated controller for frame semantics: it cannot
+prove that `raw`, `trailer_raw`, and `stop_raw` address the same physical blind or match the
+declared `target`.
 
 </details>
 
@@ -326,11 +335,17 @@ STOPs bypass that floor but never physical occupancy. A typical AOK frame with t
 embedded repeat of 8 occupies ~560 ms of air, and controller-level `repeats` multiply that — keep
 the product modest, since the bridge cannot listen while transmitting.
 
-At an ESPHome OTA `on_begin`, the bridge stops accepting new `/tx`, synchronously sends one early
-STOP for every already-armed timed command (waiting through physical RF occupancy between frames),
-and clears the scheduler before the blocking transfer. This mitigates requested OTA updates; it is
-not durable STOP persistence or a full idle-only OTA interlock. Armed STOP state is RAM-only by
-design, so an unexpected reset or power loss still cannot preserve it.
+At an ESPHome OTA `on_begin`, the bridge stops accepting new `/tx` and, as of v1.4.0, waits up to
+30 s (`OTA_IDLE_WAIT_MS`) for the scheduler to reach natural idle before the blocking transfer
+begins. Because the callback blocks the normal 5 ms dispatch tick, `on_begin` pumps the
+scheduler's own dispatch path itself during the wait, so in-flight trains complete normally and
+their armed STOPs fire at their real deadlines instead of early. Anything still armed once the
+wait expires falls back to the v1.3.0 behavior: one immediate STOP per still-armed command,
+waiting through physical RF occupancy between frames, before the scheduler is cleared for the
+transfer. An `on_error` handler unlatches `/tx` if the transfer fails, so a failed OTA no longer
+leaves the bridge refusing commands until a manual reboot. This mitigates requested OTA updates;
+it is not durable STOP persistence or a full idle-only OTA interlock. Armed STOP state is RAM-only
+by design, so an unexpected reset or power loss still cannot preserve it.
 
 </details>
 

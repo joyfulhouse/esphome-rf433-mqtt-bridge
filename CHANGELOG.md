@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is documented in
 [README.md](README.md#mqtt-topic-contract).
 
+## [1.4.0] - 2026-08-02
+
+### Added
+
+- **`/tx` requires the current boot id (contract v3,
+  [#8](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/8)/[#9](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/9)/[#10](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/10))**:
+  every `/tx` command must now carry a `boot` field equal to the bridge's current boot id, as
+  advertised on retained `/info` (`v` bumps to `3`). Missing, mistyped, and mismatched values are
+  all rejected with `"reason":"boot_mismatch"`, giving a controller exactly one recovery path —
+  re-read `/info`, then re-issue with the current boot. Because the RAM dedup ring cannot survive
+  a reboot, this closes the last structural gap in retained-`tx` rejection: a retained command
+  republished after a reboot now dies on the boot check instead of merely being unsupported by
+  convention. This requires a controller that stamps `boot` — zemismart-blinds ≥ 0.8.0. The
+  integration deploys first; firmware ≤ 1.3.0 ignores the stamped `boot` field, and this release
+  is the first to enforce it.
+- **OTA waits for natural idle before flushing armed STOPs** ([#9](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/9)):
+  the previous OTA `on_begin` fired every armed command's fail-safe STOP immediately, early
+  instead of at its scheduled deadline. `on_begin` now pumps the scheduler's own dispatch (the
+  5 ms tick cannot run while the callback blocks) for up to 30 s (`OTA_IDLE_WAIT_MS`), letting
+  in-flight trains complete and their STOPs fire at their real time; anything still armed past the
+  window falls back to the v1.3.0 immediate flush. A new `on_error` handler unlatches `/tx` so a
+  failed transfer no longer leaves the bridge refusing commands until a manual reboot.
+- **Vendored `mqtt` component caps inbound payload assembly at 4 KiB**
+  ([#8](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/8)): the stock `mqtt`
+  component reserves the broker-declared total size for a fragmented publish before any
+  integration-level validation runs, so a hostile or errant tens-of-KB publish could exhaust the
+  heap or stall past an armed fail-safe STOP deadline on the ESP8285. The vendored component
+  (ESPHome 2026.7.3, see [components/mqtt/README.md](components/mqtt/README.md)) drops any
+  message whose declared total exceeds 4 KiB before the `reserve()` call, discards subsequent
+  fragments of the same oversized message, and logs the drop throttled to once per 5 s.
+
 ## [1.3.0] - 2026-07-26
 
 ### Added
