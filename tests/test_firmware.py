@@ -25,6 +25,7 @@ def _firmware_lambda(section_start: str, section_end: str) -> str:
         "${bridge_area}": "test-area",
         "${default_bridge}": "false",
         "${default_repeats}": "5",
+        "${hardware_variant}": "test-hw",
         "${listen_enabled}": "false",
         "${repeat_gap_ms}": "35",
     }
@@ -1552,6 +1553,8 @@ int main() {
   for (const Message &message : mqtt_client.messages) {
     if (message.topic == "rf433/test-bridge/info") {
       assert(message.payload.at("v") == "3");
+      // hw is additive to contract v3: hardware_variant flows through verbatim.
+      assert(message.payload.at("hw") == "test-hw");
       saw_info = true;
     }
   }
@@ -1596,6 +1599,9 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     scheduler = SCHEDULER_HEADER.read_text()
 
     assert "rf433_scheduler.h" in package
+    # The esphome-compile gate overrides ${hardware_variant} and only catches a
+    # MISSING key, not a wrong/typo'd default, so pin the shipped default here.
+    assert "hardware_variant: efm8bb1-portisch" in package
     assert "TargetScheduler" in scheduler
     assert "rf433::tx_scheduler" in package
     assert 'x["command_id"]' in package

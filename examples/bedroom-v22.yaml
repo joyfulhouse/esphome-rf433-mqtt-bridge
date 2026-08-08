@@ -1,0 +1,47 @@
+# Example per-device file for one Sonoff RF Bridge R2 v2.2 (OB38S003 RF MCU
+# flashed with mightymos RF-Bridge-OB38S003, a faithful Portisch UART-protocol
+# port — same component, same protocol, inventory tag only).
+# Copy this next to rf433-mqtt-bridge.yaml, rf433_scheduler.h, and rf433_rx.h;
+# copy the local components/ directory alongside them without flattening it:
+#
+#   bedroom-v22.yaml              components/
+#   rf433-mqtt-bridge.yaml          rf_bridge/
+#   rf433_scheduler.h
+#   rf433_rx.h
+#
+# Adjust the substitutions, then flash:
+#
+#   esphome run bedroom-v22.yaml
+#
+# Networking uses DHCP by default. To pin a static IP instead, uncomment the
+# wifi: block below (RFC 5737 documentation addresses shown — use your own).
+
+substitutions:
+  bridge_id: rf433-bridge-bedroom
+  friendly_name: Bedroom RF Bridge
+  bridge_area: bedroom         # Home Assistant area ID, not its display name
+  default_bridge: "false"      # "true" on exactly one bridge in your home
+  listen_enabled: "false"
+  # R2 v2.2 boards carry the OB38S003 RF MCU running RF-Bridge-OB38S003.
+  # Published as "hw" in retained /info so a heterogeneous fleet is auditable.
+  hardware_variant: ob38s003-mightymos
+  # With Home Assistant's Mosquitto add-on, the broker is your HA host.
+  # Use an authenticated, least-privilege bridge account; anonymous MQTT is
+  # outside the firmware's safety contract.
+  mqtt_broker: homeassistant.local
+  mqtt_username: !secret mqtt_username
+  mqtt_password: !secret mqtt_password
+  api_encryption_key: !secret rf433_bridge_bedroom_api_key
+  ota_password: !secret rf433_bridge_bedroom_ota_password
+
+# This file, both headers, rf433-mqtt-bridge.yaml, and components/ share one
+# config root (see README install step 1); the package include is same-dir.
+packages:
+  rf433_bridge: !include rf433-mqtt-bridge.yaml
+
+# wifi:
+#   manual_ip:
+#     static_ip: 192.0.2.51
+#     gateway: 192.0.2.1
+#     subnet: 255.255.255.0
+#     dns1: 192.0.2.1

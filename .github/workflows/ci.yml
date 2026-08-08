@@ -28,8 +28,11 @@ jobs:
       - name: Compile example firmware
         # The install instructions place the package, both headers, local
         # component, and per-device YAML in one directory; mirror that layout
-        # (ESPHome resolves `includes:` relative to the device YAML).
+        # (ESPHome resolves `includes:` relative to the device YAML). Both
+        # hardware variants compile: EFM8BB1/Portisch and R2 v2.2
+        # OB38S003/mightymos (identical firmware; inventory tag only).
         run: |
           cp secrets.example.yaml secrets.yaml
-          cp examples/living-room.yaml .
+          cp examples/living-room.yaml examples/bedroom-v22.yaml .
           uvx --from "esphome==2026.7.3" esphome compile living-room.yaml
+          uvx --from "esphome==2026.7.3" esphome compile bedroom-v22.yaml
