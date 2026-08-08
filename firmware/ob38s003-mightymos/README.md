@@ -18,7 +18,7 @@ Read the caveats there before you erase anything — the first flash is one-way.
 | **Download URL** | <https://github.com/mightymos/RF-Bridge-OB38S003/releases/download/v0.4.16/portisch_main_OB38S003_BUCKET_SNIFFING_INCLUDED.hex> |
 | **Size** | 22,384 bytes (Intel HEX; 8,048 bytes of code spanning `0x0000–0x1F8E`) |
 | **SHA256** | `1648f9f5d1e5077dd71aed82a80035ad6aa4311d443caf0e65546d990dbd2f26` |
-| **License** | BSD-2-Clause, © 2023 Jonathan Armstrong (upstream `LICENSE`) |
+| **License** | BSD-2-Clause — full text in [LICENSE](LICENSE); © 2023 Jonathan Armstrong (upstream, vendored verbatim) |
 
 Verify before flashing:
 
@@ -86,8 +86,8 @@ HARDWARE.md; summarised here so this directory is self-contained.
 
 | Issue | Effect | Handling |
 |---|---|---|
-| [#27](https://github.com/mightymos/RF-Bridge-OB38S003/issues/27) (open) | Transmitted `B0` bucket timings run long on air — reporters measured roughly **+30 µs** and **+76 µs** per bucket versus the requested values | **Re-capture and re-tune every bucket timing on the V2.2 board itself.** Codes captured on an EFM8BB1 Portisch bridge may not replay. |
-| [#19](https://github.com/mightymos/RF-Bridge-OB38S003/issues/19) (open) | The firmware can freeze after 24–48 h of uptime | Mitigate with a scheduled power cycle; there is no firmware fix. |
+| [#27](https://github.com/mightymos/RF-Bridge-OB38S003/issues/27) (open) | Transmitted `B0` bucket timings run long on air — roughly **+30 µs** per bucket measured with a Flipper Zero, and **+76 µs** measured against a calibrated RTL-SDR | **Re-capture and re-tune every bucket timing on the V2.2 board itself.** Codes captured on an EFM8BB1 Portisch bridge may not replay. |
+| [#19](https://github.com/mightymos/RF-Bridge-OB38S003/issues/19) (open) | After ~24–48 h the radio MCU's **receive** path stops decoding codes. Transmit and the ESP8285/Wi-Fi keep working normally, and restarting the ESP does not clear it | Reset the radio MCU on a schedule (`AA FE 55`) or power-cycle the board; there is no firmware fix. Alarm on missing **inbound** traffic — availability stays `online` throughout. |
 | No stock image published | Stock OB38S003 firmware is read-protected and is destroyed by the `erase` that unprotects the chip | There is nothing to roll back to. Unlike the EFM8BB1 path, no vendor original `.hex` exists. |
 
 ## Updating this pin

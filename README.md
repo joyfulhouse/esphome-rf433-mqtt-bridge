@@ -115,8 +115,9 @@ you are setting up a bridge for the first time.
   flashing needs an **external programmer** and is **not reversible** (stock firmware is
   read-protected and destroyed by the erase that unprotects the chip), transmitted bucket timings
   run long enough that **B0 codes captured on an EFM8BB1 bridge may not replay — plan to
-  re-capture and re-tune on the V2.2 board**, and the firmware can **freeze after 24–48 h**, which
-  a scheduled power cycle works around. Upstream is unmaintained.
+  re-capture and re-tune on the V2.2 board**, and the radio's **receive path can stall after
+  24–48 h** while transmit and Wi-Fi keep working, which a scheduled MCU reset or power cycle works
+  around. Upstream is unmaintained.
   [HARDWARE.md → Alternate path](HARDWARE.md#alternate-path--r2-v22-with-the-ob38s003-radio) is
   the full runbook.
 - New stock may be either revision and listings rarely say which, so check before buying.

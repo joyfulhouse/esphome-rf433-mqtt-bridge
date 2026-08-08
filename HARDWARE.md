@@ -258,17 +258,18 @@ reason not to do it — they are reasons to do it with your eyes open.
 > `RF_Bridge_iTead_Original.hex` and you can always put the board back to stock. **No equivalent
 > stock image exists for the OB38S003** — not from Sonoff, not from Tasmota, not from upstream.
 >
-> **Attempt a read-back before you erase anything.** In the flasher's serial monitor, after a
-> successful `handshake`, try `readhex` and `readconfigs`. On a protected chip these will fail
-> with a NACK — that is the expected outcome and it confirms you are about to cross a one-way
-> door. If they *do* succeed, keep the output: `readhex` prints a checksum over the flash block
-> rather than an image you can re-flash, so even a successful read-back is a record, not a backup.
-> Either way, once you type `erase` the board is a V2.2-with-Portisch board permanently.
+> **There is no read-back that gets you a backup**, and it is worth understanding why before you
+> reach for one. The flasher's `readhex` sums all 8192 flash bytes and prints a single
+> `Checksum: 0x…` line; `readconfigs` prints 64 config bytes and their checksum. Neither writes a
+> `.hex` file, and neither reports read failures — both discard the return status of the underlying
+> block read, so they print a checksum on a protected chip exactly as they do on an open one. That
+> checksum is a record, not an image: **there is nothing to re-flash from, whatever they print.**
+> Once you type `erase` the board is a V2.2-with-Portisch board permanently.
 
 > ⏱️ **2. Your existing B0 codes probably will not replay. Budget for re-capturing them.**
 >
-> This firmware transmits bucket timings **longer than requested** — reporters measured roughly
-> **+30 µs** and **+76 µs** per bucket against an SDR and a Flipper Zero
+> This firmware transmits bucket timings **longer than requested** — one reporter measured roughly
+> **+30 µs** per bucket with a Flipper Zero, another **+76 µs** against a calibrated RTL-SDR
 > ([issue #27][issue27], open). Receivers with tight timing windows reject the result, and a code
 > captured on an EFM8BB1 Portisch bridge is exactly such a code.
 >
@@ -283,15 +284,24 @@ reason not to do it — they are reasons to do it with your eyes open.
 > onboarding capture (`{"action":"sniff","seconds":30}`, see
 > [README.md → MQTT topic contract](README.md#mqtt-topic-contract)) once Step 2 is done.
 
-> 🧊 **3. It can freeze after 24–48 h, and upstream is unmaintained.**
+> 🧊 **3. Receive can stall after 24–48 h, and upstream is unmaintained.**
 >
-> [Issue #19][issue19] (open) reports the firmware becoming unresponsive after a day or two of
-> uptime. There is no firmware fix and there will not be one — the v0.4.16 notes say *"This will
-> likely be the last release… I no longer own this hardware."*
+> [Issue #19][issue19] (open) reports that after a day or two of uptime the radio MCU **stops
+> receiving** — it no longer decodes inbound codes. **Transmit keeps working, and so do the
+> ESP8285 and Wi-Fi**: *"For receive only. Transmit keeps working fine!"* Restarting the ESP does
+> not clear it; only the radio MCU itself has to be reset. There is no firmware fix and there will
+> not be one — the v0.4.16 notes say *"This will likely be the last release… I no longer own this
+> hardware."*
 >
-> Mitigate it operationally: put the bridge on a smart plug or a scheduled reboot, and treat
-> `rf433/<bridge_id>/availability` going stale as the trigger. The bridge's retained availability
-> topic makes this easy to alarm on from Home Assistant.
+> Mitigate it operationally, with a **prophylactic reset on a timer** rather than a reaction to a
+> fault signal: send the MCU reset `AA FE 55` (the workaround named in issue #19, schedulable from
+> Home Assistant or ESPHome) on a schedule, or power-cycle the board from a smart plug.
+>
+> ⚠️ **Do not alarm on `rf433/<bridge_id>/availability` for this.** The ESP stays connected through
+> an RX-only stall, so availability remains `online` and never goes stale — it cannot detect this
+> failure. If inbound codes matter to you, alarm instead on the *absence of expected receive
+> activity*: watch `rf433/<bridge_id>/rx` and alert when a sensor that normally reports on a known
+> cadence goes quiet.
 
 ### What you need
 
@@ -310,6 +320,7 @@ This repo vendors the exact image to flash, with its hash:
 firmware/ob38s003-mightymos/
 ├── portisch_main_OB38S003_BUCKET_SNIFFING_INCLUDED.hex
 ├── SHA256SUMS
+├── LICENSE
 └── README.md
 ```
 
@@ -393,9 +404,9 @@ either way, and it avoids brown-outs from a weak on-board regulator.)
 
 ✅ **Done when** SDA, SCL and GND are connected and 3V3 is loose.
 
-### A5. Attempt the read-back, then erase
+### A5. Record what you can, then erase
 
-This is the point of no return. Do the read-back first — see caveat 1.
+This is the point of no return — and there is no backup to take first. See caveat 1.
 
 1. In the serial monitor, type `handshake`.
 2. Apply power to the radio chip (plug the 3V3 wire in, or power the bridge by USB).
@@ -404,9 +415,10 @@ This is the point of no return. Do the read-back first — see caveat 1.
    > On fresh boards the handshake often succeeds while reporting the **wrong chip type**, or the
    > chip read appears to fail with a NACK. Both are expected on a **protected** chip. Continue.
 
-4. **Attempt the read-back now:** run `readhex`, then `readconfigs`. Save whatever they print.
-   Expect them to fail on a protected chip — that failure *is* the confirmation that no stock
-   backup is obtainable.
+4. Optionally run `readhex`, then `readconfigs`, and save what they print. Both will print a
+   `Checksum: 0x…` line whether or not the chip is protected — that output is a record for your own
+   notes, **not** a backup, and it is not a protection check. There is no stock image to preserve
+   either way (caveat 1).
 5. Type `erase`. This unprotects the chip **and destroys the stock firmware permanently.**
 6. Type `signature` — it should now report the chip type correctly.
 
