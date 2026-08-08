@@ -135,8 +135,11 @@ def _compile_and_run(tmp_path: Path, name: str, body: str) -> None:
 
 
 def test_concurrent_targets_interleave_round_robin(tmp_path: Path) -> None:
-    """Three concurrent DIFFERENT-remote targets dispatch round-robin, not as
-    consecutive whole trains, and no repeats are dropped."""
+    """Interleave concurrent different-remote targets round-robin, dropping no repeats.
+
+    Three concurrent DIFFERENT-remote targets dispatch round-robin, not as
+    consecutive whole trains, and no repeats are dropped.
+    """
     _compile_and_run(
         tmp_path,
         "interleave",
@@ -189,10 +192,13 @@ def test_concurrent_targets_interleave_round_robin(tmp_path: Path) -> None:
 
 
 def test_inter_repeat_gap_stretches_3x_with_real_airtime(tmp_path: Path) -> None:
-    """With production-weight airtime frames the per-dispatch slot is the
+    """Stretch a target's inter-repeat gap to N x the real-airtime dispatch slot.
+
+    With production-weight airtime frames the per-dispatch slot is the
     frame's physical occupancy, and a shared bridge stretches one target's
     inter-repeat gap to N x that slot. Frames are three distinct-but-equal
-    airtime B0 frames so each target's dispatches are individually observable."""
+    airtime B0 frames so each target's dispatches are individually observable.
+    """
     _compile_and_run(
         tmp_path,
         "airtime_stretch",
@@ -248,10 +254,13 @@ def test_inter_repeat_gap_stretches_3x_with_real_airtime(tmp_path: Path) -> None
 
 
 def test_armed_stop_preempts_own_train_but_not_peers(tmp_path: Path) -> None:
-    """An armed fail-safe STOP that comes due mid-run truncates only its OWN
+    """Truncate only the armed STOP's own train, delaying peers rather than dropping them.
+
+    An armed fail-safe STOP that comes due mid-run truncates only its OWN
     command's remaining repeats; peer targets' trains are delayed, not
     dropped. STOP copies dispatch consecutively (physical pacing only),
-    bypassing both the round-robin interleave and the user gap floor."""
+    bypassing both the round-robin interleave and the user gap floor.
+    """
     _compile_and_run(
         tmp_path,
         "stop_preempt",
@@ -299,11 +308,14 @@ def test_armed_stop_preempts_own_train_but_not_peers(tmp_path: Path) -> None:
 
 
 def test_staggered_admission_reproduces_on_air_run1(tmp_path: Path) -> None:
-    """Validation against live-hardware ground truth: three commands admitted a
+    """Reproduce the live-hardware run-1 on-air sequence from staggered admission.
+
+    Validation against live-hardware ground truth: three commands admitted a
     little apart (as MQTT delivers them) reproduce the on-air heard sequence
     A A B C A B C B C with started stamps at slots 0, 2, 3. The 'A A' opening
     is round-robin with one target alone in the rotation for two slots before
-    the others join -- not a deviation from round-robin."""
+    the others join -- not a deviation from round-robin.
+    """
     _compile_and_run(
         tmp_path,
         "staggered_run1",
@@ -339,12 +351,15 @@ def test_staggered_admission_reproduces_on_air_run1(tmp_path: Path) -> None:
 def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
     tmp_path: Path,
 ) -> None:
-    """Validation against live-hardware run 3: a timed command's fail-safe STOP
+    """Wait out the in-flight frame, then truncate only the timed command's own train.
+
+    Validation against live-hardware run 3: a timed command's fail-safe STOP
     is promoted ahead of queued peer ACTION work but still waits out the
     in-flight frame's physical RF occupancy, and it truncates only ITS OWN
     remaining action repeats -- never the peer's. Interleaving can push the
     timed command's later action repeats past its own stop deadline, so it
-    delivers FEWER action repeats under concurrency than it would solo."""
+    delivers FEWER action repeats under concurrency than it would solo.
+    """
     _compile_and_run(
         tmp_path,
         "staggered_run3",
