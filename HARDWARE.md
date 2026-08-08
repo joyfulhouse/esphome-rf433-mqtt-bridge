@@ -313,10 +313,11 @@ firmware/ob38s003-mightymos/
 └── README.md
 ```
 
-Verify it before you flash:
+Verify it before you flash (the checksum file lists a bare filename, so run the check from
+inside the firmware directory):
 
 ```shell
-shasum -a 256 -c firmware/ob38s003-mightymos/SHA256SUMS
+(cd firmware/ob38s003-mightymos && shasum -a 256 -c SHA256SUMS)
 ```
 
 **Use this file, not whatever the releases page offers today.** Three reasons, and the first is
