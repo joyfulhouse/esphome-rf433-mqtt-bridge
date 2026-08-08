@@ -1590,6 +1590,10 @@ int main() {
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
+# The replayed `started` and the replayed `displaced`.
+AGE_ANCHORED_REPLAY_SITES = 2
+
+
 def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     """Firmware reports admission plus the first actual RF ACTION dispatch."""
     package = BRIDGE_YAML.read_text()
@@ -1642,15 +1646,18 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     # Two sites emit an age-anchored status through the shared replay variable:
     # the replayed `started` and the replayed `displaced`. Reverting either to a
     # bare, ageless publish drops this count.
-    assert package.count("replay_age_ms, replay_ms, id(boot_id)") == 2
+    assert package.count("replay_age_ms, replay_ms, id(boot_id)") == AGE_ANCHORED_REPLAY_SITES
     # The fresh-admission path anchors each displacement on the admission millis,
     # mirroring `started`'s `status_ms - dispatch_ms, status_ms` shape.
     assert "displaced_status_ms - admit_ms, displaced_status_ms, id(boot_id)" in package
 
 
 def test_native_scheduler_stamps_age_on_displaced(tmp_path: Path) -> None:
-    """`displaced` carries age since the ORIGINAL displacement, from both the
-    live flush queue and the ring, and withholds it when no instant exists."""
+    """Stamp `displaced` with age since the original displacement.
+
+    `displaced` carries age since the ORIGINAL displacement, from both the
+    live flush queue and the ring, and withholds it when no instant exists.
+    """
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("a C++ compiler is required for the native firmware scheduler test")
