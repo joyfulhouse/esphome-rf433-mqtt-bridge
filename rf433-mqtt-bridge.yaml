@@ -30,6 +30,9 @@ substitutions:
   # RF coprocessor inventory tag published in retained /info as "hw". Purely
   # informational: "ob38s003-mightymos" (R2 v2.2, RF-Bridge-OB38S003) speaks
   # the same Portisch UART protocol, so no component or protocol switch.
+  # Keep this a lowercase slug [a-z0-9-] with no quotes or backslashes: it is
+  # emitted verbatim into the generated JSON/C++ string carrying "hw", so a `\`
+  # or `"` would malform that literal.
   hardware_variant: efm8bb1-portisch
   mqtt_broker: homeassistant.local
   mqtt_port: "1883"

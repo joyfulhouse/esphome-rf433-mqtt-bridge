@@ -1599,6 +1599,9 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     scheduler = SCHEDULER_HEADER.read_text()
 
     assert "rf433_scheduler.h" in package
+    # The esphome-compile gate overrides ${hardware_variant} and only catches a
+    # MISSING key, not a wrong/typo'd default, so pin the shipped default here.
+    assert "hardware_variant: efm8bb1-portisch" in package
     assert "TargetScheduler" in scheduler
     assert "rf433::tx_scheduler" in package
     assert 'x["command_id"]' in package

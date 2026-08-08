@@ -33,12 +33,6 @@ jobs:
         # OB38S003/mightymos (identical firmware; inventory tag only).
         run: |
           cp secrets.example.yaml secrets.yaml
-          # secrets.example.yaml ships living-room placeholders only; add the
-          # bedroom example's per-device keys with the same placeholder values.
-          cat >> secrets.yaml <<'EOF'
-          rf433_bridge_bedroom_api_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-          rf433_bridge_bedroom_ota_password: "REPLACE_WITH_OTA_PASSWORD"
-          EOF
           cp examples/living-room.yaml examples/bedroom-v22.yaml .
           uvx --from "esphome==2026.7.3" esphome compile living-room.yaml
           uvx --from "esphome==2026.7.3" esphome compile bedroom-v22.yaml
