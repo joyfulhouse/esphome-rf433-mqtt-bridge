@@ -46,7 +46,7 @@ transmits Portisch **B0** raw frames. All the smarts about blinds live in the co
 - **Correlated acknowledgements** — every command carries a `command_id`; the bridge answers
   `accepted`/`rejected` on admission and `started` on the first actual RF dispatch. `started`
   means the frame was handed to the RF coprocessor over UART (ESPHome's `send_raw` does not wait
-  for an EFM8BB1 ack); it is proof of dispatch, not of RF emission.
+  for a coprocessor ack); it is proof of dispatch, not of RF emission.
 - **Per-target scheduling** — one RF frame on air at a time, while each target keeps its own
   repeat phase and an **absolute monotonic STOP due time** (`stop_after_ms` + `stop_raw`) so a
   partial movement is stopped by the bridge itself even if the controller disappears. The due
@@ -88,23 +88,38 @@ transmits Portisch **B0** raw frames. All the smarts about blinds live in the co
 flashing Portisch onto the RF coprocessor, and replacing Tasmota with this package. Start there if
 you are setting up a bridge for the first time.
 
-> ⚠️ **Check the board revision before you buy.** Only R2 **V1.0/V2.0** boards (Silicon Labs
-> **EFM8BB1** chip) work. The 2022+ **R2 V2.2** uses an **OB38S003**, which cannot run the required
-> Portisch firmware. Listings rarely say which revision they ship, so new stock is a gamble —
-> secondhand V1.0/V2.0 units are the safe buy. Full detail in
+> ⚠️ **Check the board revision before you buy — the two revisions take different paths.**
+> R2 **V1.0/V2.0** (Silicon Labs **EFM8BB1**) is the validated path: upstream Portisch, flashed
+> through Tasmota. The 2022+ **R2 V2.2** (**OB38S003**) cannot run upstream Portisch, but it *is*
+> supported through an alternate path — [mightymos/RF-Bridge-OB38S003][mightymos], a port of
+> Portisch to that chip, [vendored in this repo](firmware/ob38s003-mightymos/). It needs an
+> external programmer, its first flash is **one-way**, and its bucket timings differ enough that
+> **every code must be re-captured on the V2.2 board itself**. Listings rarely say which revision
+> they ship, so if you want the easy path, buy secondhand V1.0/V2.0. Full detail in
 > [HARDWARE.md → Will my board work?](HARDWARE.md#will-my-board-work).
 
 <details>
 <summary><b>The short version of the hardware requirements</b></summary>
 
 - **Sonoff RF Bridge R2** ([itead.cc](https://itead.cc/product/sonoff-rf-bridge-433/), 433 MHz
-  variant) with the EFM8BB1 RF coprocessor flashed to
-  [Portisch firmware](https://github.com/Portisch/RF-Bridge-EFM8BB1) — required, because the stock
-  RF firmware cannot transmit raw B0 buckets.
-- **Supported board revisions: R2 V1.0/V2.0 (EFM8BB1)** — what this project is validated on. The
-  2022+ **R2 V2.2** replaced the EFM8BB1 with an OB38S003, which cannot run Portisch and is
-  unsupported. New stock may be either revision and listings rarely say which, so check before
-  buying.
+  variant) with the RF coprocessor flashed to Portisch firmware — required on either revision,
+  because the stock RF firmware cannot transmit raw B0 buckets.
+- **R2 V1.0/V2.0 (EFM8BB1) — the validated path.** What this project is developed and tested on,
+  running [Portisch](https://github.com/Portisch/RF-Bridge-EFM8BB1), flashed through Tasmota with
+  no extra hardware.
+- **R2 V2.2 (OB38S003) — supported through an alternate path, not validated as a drop-in.** The
+  2022+ boards replaced the EFM8BB1 with an OB38S003, which cannot run upstream Portisch.
+  [mightymos/RF-Bridge-OB38S003][mightymos] is a faithful port of Portisch to that chip with
+  working B0 bucket transmit, and this repo [vendors the exact image](firmware/ob38s003-mightymos/)
+  to flash. Three things differ from the EFM8BB1 path and you should read them before committing:
+  flashing needs an **external programmer** and is **not reversible** (stock firmware is
+  read-protected and destroyed by the erase that unprotects the chip), transmitted bucket timings
+  run long enough that **B0 codes captured on an EFM8BB1 bridge may not replay — plan to
+  re-capture and re-tune on the V2.2 board**, and the firmware can **freeze after 24–48 h**, which
+  a scheduled power cycle works around. Upstream is unmaintained.
+  [HARDWARE.md → Alternate path](HARDWARE.md#alternate-path--r2-v22-with-the-ob38s003-radio) is
+  the full runbook.
+- New stock may be either revision and listings rarely say which, so check before buying.
 - The ESP8285 runs this ESPHome package (`rf_bridge:` UART @ 19200; GPIO1/GPIO3 belong to the RF
   coprocessor, so serial logging is disabled). Tasmota is used only as a one-time tool to flash
   the coprocessor — it cannot drive the [zemismart-blinds][zemismart-blinds] integration itself.
@@ -274,7 +289,7 @@ declared `target`.
 Continuous receive is **default OFF** because `listen_enabled` defaults to `"false"`. This is a
 privacy boundary: ambient 433 MHz traffic can identify nearby remotes and activity. On startup the
 bridge unconditionally sends Portisch stop-sniff (A7) and clears any partial B1 capture, including
-after an ESP-only restart where the independently running EFM8BB1 may still be sniffing.
+after an ESP-only restart where the independently running RF coprocessor may still be sniffing.
 
 `/cmd` accepts exactly one action. Publish `{"action":"sniff","seconds":30}` at QoS 1 with retain
 disabled to start or extend a bucket sniff. Integer values from 1 through 60 select the window;
@@ -327,7 +342,7 @@ state when that session value changes.
 <details>
 <summary><b>Frame dispatch pacing and OTA behaviour</b></summary>
 
-Frame dispatch is paced by computed airtime: the EFM8BB1 transmits each B0 frame blocking
+Frame dispatch is paced by computed airtime: the RF coprocessor transmits each B0 frame blocking
 (embedded repeats included) behind a small UART ring, so the scheduler holds the next handoff
 until the previous frame's UART serialization and air complete. For normal ACTION/TRAILER work,
 `repeat_gap_ms` is an additional discretionary floor, clamped to `0…60,000 ms`; due and displaced
@@ -415,6 +430,7 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 [zemismart-blinds]: https://github.com/joyfulhouse/zemismart-blinds
+[mightymos]: https://github.com/mightymos/RF-Bridge-OB38S003
 [license-shield]: https://img.shields.io/github/license/joyfulhouse/esphome-rf433-mqtt-bridge?style=for-the-badge
 [ci-shield]: https://img.shields.io/github/actions/workflow/status/joyfulhouse/esphome-rf433-mqtt-bridge/ci.yml?branch=main&label=CI&style=for-the-badge
 [ci]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/actions/workflows/ci.yml
