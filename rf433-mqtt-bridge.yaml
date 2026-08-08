@@ -27,6 +27,10 @@ substitutions:
   bridge_area: unassigned
   default_bridge: "false"
   listen_enabled: "false"
+  # RF coprocessor inventory tag published in retained /info as "hw". Purely
+  # informational: "ob38s003-mightymos" (R2 v2.2, RF-Bridge-OB38S003) speaks
+  # the same Portisch UART protocol, so no component or protocol switch.
+  hardware_variant: efm8bb1-portisch
   mqtt_broker: homeassistant.local
   mqtt_port: "1883"
   mqtt_username: ""
@@ -562,6 +566,9 @@ interval:
                        root["default"] = ${default_bridge};
                        root["boot"] = id(boot_id);
                        root["listen"] = ${listen_enabled};
+                       // Additive to contract v3: consumers that ignore
+                       // unknown fields are unaffected.
+                       root["hw"] = "${hardware_variant}";
                        root["v"] = 3;
                      }, 0, true)) {
             id(next_info_ms) = now_ms + 60000;
