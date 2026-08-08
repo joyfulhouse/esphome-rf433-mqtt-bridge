@@ -7,6 +7,15 @@ is licensed under ESPHome's MIT license.
 This copy carries one behavioural change on top of upstream: the inbound payload guard
 described below.
 
+`__init__.py` additionally carries a **non-behavioural** restyle: it is the only Python file
+in this directory, so the repository's `ruff` gate (`select = ["ALL"]`) reaches it. It gained
+a module docstring, type annotations, per-function docstrings, and 100-column formatting, and
+its `to_code` was split into `_add_platform_libraries`, `_add_discovery`,
+`_add_lifecycle_messages`, `_add_idf_options`, and `_add_triggers` to clear the complexity
+rules. The split is pure code motion -- the order of `cg.add(...)` emissions, and therefore
+the generated C++, is unchanged. Upstream's `AUTO_LOAD` callable is preserved as a module
+attribute aliasing `_auto_load`, because ESPHome's loader resolves that name by string.
+
 Note: the fleet's esphome-config CI currently builds against ESPHome 2026.7.2 and is
 scheduled to bump to 2026.7.3 at Batch B rollout; the `mqtt` component is byte-identical
 between those two releases, so this vendor commit's provenance and the fleet's eventual
@@ -50,3 +59,8 @@ independent of this guard.
 Rebase these files deliberately when changing the pinned ESPHome version; a local
 external component shadows the complete upstream `mqtt` implementation, so an upstream
 security fix or behavioural change will not reach this bridge automatically.
+
+When rebasing `__init__.py`, take upstream's file wholesale and re-apply the restyle noted
+above rather than merging into the restyled copy -- the diff against upstream is formatting
+plus the `to_code` split, so a clean re-copy followed by `ruff check --fix` and
+`ruff format` is cheaper and safer than resolving conflicts hunk by hunk.

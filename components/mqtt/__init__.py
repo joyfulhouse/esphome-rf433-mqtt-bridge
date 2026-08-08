@@ -1,6 +1,14 @@
+"""Vendored ESPHome 2026.7.3 mqtt component codegen.
+
+The bridge's only behavioural change to this component -- the bounded inbound
+payload guard -- lives in `mqtt_client.cpp`. This module is upstream's codegen
+entry point, restyled to this repository's lint standard; see README.md.
+"""
+
+import esphome.codegen as cg
+import esphome.config_validation as cv
 from esphome import automation
 from esphome.automation import Condition
-import esphome.codegen as cg
 from esphome.components import logger, socket
 from esphome.components.esp32 import (
     add_idf_component,
@@ -9,7 +17,6 @@ from esphome.components.esp32 import (
     include_builtin_idf_component,
 )
 from esphome.config_helpers import filter_source_files_from_platform
-import esphome.config_validation as cv
 from esphome.const import (
     CONF_AVAILABILITY,
     CONF_BIRTH_MESSAGE,
@@ -67,10 +74,16 @@ from esphome.types import ConfigType
 DEPENDENCIES = ["network"]
 
 
-def AUTO_LOAD():
+def _auto_load() -> list[str]:
+    """Return the components auto-loaded alongside MQTT on this platform."""
     if CORE.is_esp8266 or CORE.is_libretiny:
         return ["async_tcp", "json"]
     return ["json"]
+
+
+# ESPHome's loader resolves this module attribute by name, so the upstream
+# spelling is a framework contract rather than a style choice.
+AUTO_LOAD = _auto_load
 
 
 CONF_DISCOVER_IP = "discover_ip"
@@ -85,7 +98,8 @@ TOPIC_PREFIX_MAX_LEN = 64  # Default is device name, typically short
 DISCOVERY_PREFIX_MAX_LEN = 64  # Default is "homeassistant" (13 chars)
 
 
-def validate_message_just_topic(value):
+def validate_message_just_topic(value: object) -> ConfigType:
+    """Expand a bare topic string into a full message schema."""
     value = cv.publish_topic(value)
     return MQTT_MESSAGE_BASE({CONF_TOPIC: value})
 
@@ -98,9 +112,7 @@ MQTT_MESSAGE_BASE = cv.Schema(
     }
 )
 
-MQTT_MESSAGE_TEMPLATE_SCHEMA = cv.Any(
-    None, MQTT_MESSAGE_BASE, validate_message_just_topic
-)
+MQTT_MESSAGE_TEMPLATE_SCHEMA = cv.Any(None, MQTT_MESSAGE_BASE, validate_message_just_topic)
 
 MQTT_MESSAGE_SCHEMA = cv.Any(
     None,
@@ -125,18 +137,14 @@ MQTTMessageTrigger = mqtt_ns.class_(
 MQTTJsonMessageTrigger = mqtt_ns.class_(
     "MQTTJsonMessageTrigger", automation.Trigger.template(cg.JsonObjectConst)
 )
-MQTTConnectTrigger = mqtt_ns.class_(
-    "MQTTConnectTrigger", automation.Trigger.template(cg.bool_)
-)
+MQTTConnectTrigger = mqtt_ns.class_("MQTTConnectTrigger", automation.Trigger.template(cg.bool_))
 MQTTDisconnectTrigger = mqtt_ns.class_(
     "MQTTDisconnectTrigger", automation.Trigger.template(MQTTClientDisconnectReason)
 )
 MQTTComponent = mqtt_ns.class_("MQTTComponent", cg.Component)
 MQTTConnectedCondition = mqtt_ns.class_("MQTTConnectedCondition", Condition)
 
-MQTTAlarmControlPanelComponent = mqtt_ns.class_(
-    "MQTTAlarmControlPanelComponent", MQTTComponent
-)
+MQTTAlarmControlPanelComponent = mqtt_ns.class_("MQTTAlarmControlPanelComponent", MQTTComponent)
 MQTTBinarySensorComponent = mqtt_ns.class_("MQTTBinarySensorComponent", MQTTComponent)
 MQTTClimateComponent = mqtt_ns.class_("MQTTClimateComponent", MQTTComponent)
 MQTTCoverComponent = mqtt_ns.class_("MQTTCoverComponent", MQTTComponent)
@@ -170,12 +178,13 @@ MQTT_DISCOVERY_OBJECT_ID_GENERATOR_OPTIONS = {
 }
 
 
-def validate_config(value):
-    # Populate default fields
+def validate_config(value: ConfigType) -> ConfigType:
+    """Populate birth, will, shutdown, and log defaults from the topic prefix."""
     out = value.copy()
     topic_prefix = value[CONF_TOPIC_PREFIX]
-    # If the topic prefix is not null and these messages are not configured, then set them to the default
-    # If the topic prefix is null and these messages are not configured, then set them to null
+    # If the topic prefix is not null and these messages are not configured, then
+    # set them to the default. If the topic prefix is null and these messages are
+    # not configured, then set them to null.
     if CONF_BIRTH_MESSAGE not in value:
         if topic_prefix != "":
             out[CONF_BIRTH_MESSAGE] = {
@@ -236,12 +245,8 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PASSWORD, default=""): cv.sensitive(),
             cv.Optional(CONF_CLEAN_SESSION, default=False): cv.boolean,
             cv.Optional(CONF_CLIENT_ID): cv.string,
-            cv.SplitDefault(CONF_IDF_SEND_ASYNC, esp32=False): cv.All(
-                cv.boolean, cv.only_on_esp32
-            ),
-            cv.Optional(CONF_CERTIFICATE_AUTHORITY): cv.All(
-                cv.string, cv.only_on_esp32
-            ),
+            cv.SplitDefault(CONF_IDF_SEND_ASYNC, esp32=False): cv.All(cv.boolean, cv.only_on_esp32),
+            cv.Optional(CONF_CERTIFICATE_AUTHORITY): cv.All(cv.string, cv.only_on_esp32),
             cv.Inclusive(CONF_CLIENT_CERTIFICATE, "cert-key-pair"): cv.All(
                 cv.string, cv.only_on_esp32
             ),
@@ -282,9 +287,7 @@ CONFIG_SCHEMA = cv.All(
                 validate_message_just_topic,
             ),
             cv.Optional(CONF_KEEPALIVE, default="15s"): cv.positive_time_period_seconds,
-            cv.Optional(
-                CONF_REBOOT_TIMEOUT, default="15min"
-            ): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_REBOOT_TIMEOUT, default="15min"): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_ON_CONNECT): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(MQTTConnectTrigger),
@@ -292,9 +295,7 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_ON_DISCONNECT): automation.validate_automation(
                 {
-                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
-                        MQTTDisconnectTrigger
-                    ),
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(MQTTDisconnectTrigger),
                 }
             ),
             cv.Optional(CONF_ON_MESSAGE): automation.validate_automation(
@@ -307,9 +308,7 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_ON_JSON_MESSAGE): automation.validate_automation(
                 {
-                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
-                        MQTTJsonMessageTrigger
-                    ),
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(MQTTJsonMessageTrigger),
                     cv.Required(CONF_TOPIC): cv.subscribe_topic,
                     cv.Optional(CONF_QOS, default=0): cv.mqtt_qos,
                 }
@@ -332,7 +331,8 @@ CONFIG_SCHEMA = cv.All(
 )
 
 
-def exp_mqtt_message(config):
+def exp_mqtt_message(config: ConfigType | None) -> object:
+    """Render a message config as a C++ struct initializer."""
     if config is None:
         return cg.optional(cg.TemplateArguments(MQTTMessage))
     return cg.StructInitializer(
@@ -344,11 +344,8 @@ def exp_mqtt_message(config):
     )
 
 
-@coroutine_with_priority(CoroPriority.WEB)
-async def to_code(config):
-    var = cg.new_Pvariable(config[CONF_ID])
-    await cg.register_component(var, config)
-
+def _add_platform_libraries() -> None:
+    """Pull in the per-platform MQTT client implementation."""
     # Add required libraries for ESP8266 and LibreTiny
     if CORE.is_esp8266 or CORE.is_libretiny:
         # https://github.com/heman/async-mqtt-client/blob/master/library.json
@@ -362,18 +359,9 @@ async def to_code(config):
         else:
             include_builtin_idf_component("mqtt")
 
-    cg.add_define("USE_MQTT")
-    cg.add_global(mqtt_ns.using)
 
-    cg.add(var.set_broker_address(config[CONF_BROKER]))
-    cg.add(var.set_enable_on_boot(config[CONF_ENABLE_ON_BOOT]))
-    cg.add(var.set_broker_port(config[CONF_PORT]))
-    cg.add(var.set_username(config[CONF_USERNAME]))
-    cg.add(var.set_password(config[CONF_PASSWORD]))
-    cg.add(var.set_clean_session(config[CONF_CLEAN_SESSION]))
-    if CONF_CLIENT_ID in config:
-        cg.add(var.set_client_id(config[CONF_CLIENT_ID]))
-
+def _add_discovery(var: object, config: ConfigType) -> None:
+    """Apply the Home Assistant discovery configuration."""
     discovery = config[CONF_DISCOVERY]
     discovery_retain = config[CONF_DISCOVERY_RETAIN]
     discovery_prefix = config[CONF_DISCOVERY_PREFIX]
@@ -387,6 +375,9 @@ async def to_code(config):
     if not discovery and not discover_ip:
         cg.add(var.disable_discovery())
     elif discovery == "CLEAN":
+        # Sixth positional argument is upstream's `clean_retained` flag; it is
+        # generated straight into C++, so it cannot be passed by keyword.
+        clean_retained = True
         cg.add(
             var.set_discovery_info(
                 discovery_prefix,
@@ -394,7 +385,7 @@ async def to_code(config):
                 discovery_object_id_generator,
                 discovery_retain,
                 discover_ip,
-                True,
+                clean_retained,
             )
         )
     elif CONF_DISCOVERY_RETAIN in config or CONF_DISCOVERY_PREFIX in config:
@@ -408,11 +399,9 @@ async def to_code(config):
             )
         )
 
-    cg.add(var.set_topic_prefix(config[CONF_TOPIC_PREFIX], CORE.name))
 
-    if config[CONF_USE_ABBREVIATIONS]:
-        cg.add_define("USE_MQTT_ABBREVIATIONS")
-
+def _add_lifecycle_messages(var: object, config: ConfigType) -> None:
+    """Apply the birth, will, shutdown, and log-topic messages."""
     birth_message = config[CONF_BIRTH_MESSAGE]
     if not birth_message:
         cg.add(var.disable_birth_message())
@@ -440,11 +429,9 @@ async def to_code(config):
         if CONF_LEVEL in log_topic:
             cg.add(var.set_log_level(logger.LOG_LEVELS[log_topic[CONF_LEVEL]]))
 
-    cg.add(var.set_keep_alive(config[CONF_KEEPALIVE]))
 
-    cg.add(var.set_reboot_timeout(config[CONF_REBOOT_TIMEOUT]))
-
-    # esp-idf only
+def _add_idf_options(var: object, config: ConfigType) -> None:
+    """Apply the esp-idf-only TLS and async-send options."""
     if CONF_CERTIFICATE_AUTHORITY in config:
         cg.add(var.set_ca_certificate(config[CONF_CERTIFICATE_AUTHORITY]))
         cg.add(var.set_skip_cert_cn_check(config[CONF_SKIP_CERT_CN_CHECK]))
@@ -454,12 +441,15 @@ async def to_code(config):
 
         # prevent error -0x428e
         # See https://github.com/espressif/esp-idf/issues/139
-        add_idf_sdkconfig_option("CONFIG_MBEDTLS_HARDWARE_MPI", False)
+        hardware_mpi_enabled = False
+        add_idf_sdkconfig_option("CONFIG_MBEDTLS_HARDWARE_MPI", hardware_mpi_enabled)
 
-    if CONF_IDF_SEND_ASYNC in config and config[CONF_IDF_SEND_ASYNC]:
+    if config.get(CONF_IDF_SEND_ASYNC):
         cg.add_define("USE_MQTT_IDF_ENQUEUE")
-    # end esp-idf
 
+
+async def _add_triggers(var: object, config: ConfigType) -> None:
+    """Build the inbound-message and connection-state automations."""
     for conf in config.get(CONF_ON_MESSAGE, []):
         trig = cg.new_Pvariable(conf[CONF_TRIGGER_ID], conf[CONF_TOPIC])
         cg.add(trig.set_qos(conf[CONF_QOS]))
@@ -474,15 +464,49 @@ async def to_code(config):
 
     for conf in config.get(CONF_ON_CONNECT, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
-        await automation.build_automation(
-            trigger, [(cg.bool_, "session_present")], conf
-        )
+        await automation.build_automation(trigger, [(cg.bool_, "session_present")], conf)
 
     for conf in config.get(CONF_ON_DISCONNECT, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
-        await automation.build_automation(
-            trigger, [(MQTTClientDisconnectReason, "reason")], conf
-        )
+        await automation.build_automation(trigger, [(MQTTClientDisconnectReason, "reason")], conf)
+
+
+@coroutine_with_priority(CoroPriority.WEB)
+async def to_code(config: ConfigType) -> None:
+    """Generate the MQTT client component."""
+    var = cg.new_Pvariable(config[CONF_ID])
+    await cg.register_component(var, config)
+
+    _add_platform_libraries()
+
+    cg.add_define("USE_MQTT")
+    cg.add_global(mqtt_ns.using)
+
+    cg.add(var.set_broker_address(config[CONF_BROKER]))
+    cg.add(var.set_enable_on_boot(config[CONF_ENABLE_ON_BOOT]))
+    cg.add(var.set_broker_port(config[CONF_PORT]))
+    cg.add(var.set_username(config[CONF_USERNAME]))
+    cg.add(var.set_password(config[CONF_PASSWORD]))
+    cg.add(var.set_clean_session(config[CONF_CLEAN_SESSION]))
+    if CONF_CLIENT_ID in config:
+        cg.add(var.set_client_id(config[CONF_CLIENT_ID]))
+
+    _add_discovery(var, config)
+
+    cg.add(var.set_topic_prefix(config[CONF_TOPIC_PREFIX], CORE.name))
+
+    if config[CONF_USE_ABBREVIATIONS]:
+        cg.add_define("USE_MQTT_ABBREVIATIONS")
+
+    _add_lifecycle_messages(var, config)
+
+    cg.add(var.set_keep_alive(config[CONF_KEEPALIVE]))
+
+    cg.add(var.set_reboot_timeout(config[CONF_REBOOT_TIMEOUT]))
+
+    _add_idf_options(var, config)
+
+    await _add_triggers(var, config)
 
     cg.add(var.set_publish_nan_as_none(config[CONF_PUBLISH_NAN_AS_NONE]))
 
@@ -503,7 +527,13 @@ MQTT_PUBLISH_ACTION_SCHEMA = cv.Schema(
 @automation.register_action(
     "mqtt.publish", MQTTPublishAction, MQTT_PUBLISH_ACTION_SCHEMA, synchronous=True
 )
-async def mqtt_publish_action_to_code(config, action_id, template_arg, args):
+async def mqtt_publish_action_to_code(
+    config: ConfigType,
+    action_id: object,
+    template_arg: object,
+    args: list[tuple[object, str]],
+) -> object:
+    """Build the raw-payload publish action."""
     paren = await cg.get_variable(config[CONF_ID])
     var = cg.new_Pvariable(action_id, template_arg, paren)
     template_ = await cg.templatable(config[CONF_TOPIC], args, cg.std_string)
@@ -535,13 +565,19 @@ MQTT_PUBLISH_JSON_ACTION_SCHEMA = cv.Schema(
     MQTT_PUBLISH_JSON_ACTION_SCHEMA,
     synchronous=True,
 )
-async def mqtt_publish_json_action_to_code(config, action_id, template_arg, args):
+async def mqtt_publish_json_action_to_code(
+    config: ConfigType,
+    action_id: object,
+    template_arg: object,
+    args: list[tuple[object, str]],
+) -> object:
+    """Build the JSON-payload publish action."""
     paren = await cg.get_variable(config[CONF_ID])
     var = cg.new_Pvariable(action_id, template_arg, paren)
     template_ = await cg.templatable(config[CONF_TOPIC], args, cg.std_string)
     cg.add(var.set_topic(template_))
 
-    args_ = args + [(cg.JsonObject, "root")]
+    args_ = [*args, (cg.JsonObject, "root")]
     lambda_ = await cg.process_lambda(config[CONF_PAYLOAD], args_, return_type=cg.void)
     cg.add(var.set_payload(lambda_))
     template_ = await cg.templatable(config[CONF_QOS], args, cg.uint8)
@@ -551,15 +587,15 @@ async def mqtt_publish_json_action_to_code(config, action_id, template_arg, args
     return var
 
 
-def get_default_topic_for(data, component_type, name, suffix):
+def get_default_topic_for(data: object, component_type: str, name: str, suffix: str) -> str:
+    """Build the default topic for a component from its sanitized name."""
     allowlist = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-    sanitized_name = "".join(
-        x for x in name.lower().replace(" ", "_") if x in allowlist
-    )
+    sanitized_name = "".join(x for x in name.lower().replace(" ", "_") if x in allowlist)
     return f"{data.topic_prefix}/{component_type}/{sanitized_name}/{suffix}"
 
 
-async def register_mqtt_component(var, config):
+async def register_mqtt_component(var: object, config: ConfigType) -> None:
+    """Apply the shared MQTT component options to a platform component."""
     await cg.register_component(var, {})
 
     if CONF_QOS in config:
@@ -574,9 +610,7 @@ async def register_mqtt_component(var, config):
         state_topic = await cg.templatable(config[CONF_STATE_TOPIC], [], cg.std_string)
         cg.add(var.set_custom_state_topic(state_topic))
     if CONF_COMMAND_TOPIC in config:
-        command_topic = await cg.templatable(
-            config[CONF_COMMAND_TOPIC], [], cg.std_string
-        )
+        command_topic = await cg.templatable(config[CONF_COMMAND_TOPIC], [], cg.std_string)
         cg.add(var.set_custom_command_topic(command_topic))
     if CONF_COMMAND_RETAIN in config:
         cg.add(var.set_command_retain(config[CONF_COMMAND_RETAIN]))
@@ -603,7 +637,13 @@ async def register_mqtt_component(var, config):
         }
     ),
 )
-async def mqtt_connected_to_code(config, condition_id, template_arg, args):
+async def mqtt_connected_to_code(
+    config: ConfigType,
+    condition_id: object,
+    template_arg: object,
+    _args: list[tuple[object, str]],
+) -> object:
+    """Build the broker-connected condition."""
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(condition_id, template_arg, paren)
 
@@ -618,7 +658,13 @@ async def mqtt_connected_to_code(config, condition_id, template_arg, args):
     ),
     synchronous=True,
 )
-async def mqtt_enable_to_code(config, action_id, template_arg, args):
+async def mqtt_enable_to_code(
+    config: ConfigType,
+    action_id: object,
+    template_arg: object,
+    _args: list[tuple[object, str]],
+) -> object:
+    """Build the client-enable action."""
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(action_id, template_arg, paren)
 
@@ -633,7 +679,13 @@ async def mqtt_enable_to_code(config, action_id, template_arg, args):
     ),
     synchronous=True,
 )
-async def mqtt_disable_to_code(config, action_id, template_arg, args):
+async def mqtt_disable_to_code(
+    config: ConfigType,
+    action_id: object,
+    template_arg: object,
+    _args: list[tuple[object, str]],
+) -> object:
+    """Build the client-disable action."""
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(action_id, template_arg, paren)
 

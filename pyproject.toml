@@ -22,6 +22,11 @@ ignore = [
     "S101",    # pytest asserts
     "S603",    # subprocess without shell is the point of the native test
     "COM812",  # formatter-managed
+    # `select = ["ALL"]` enables rule pairs that cannot both be satisfied. Ruff
+    # already resolves each pair itself and warns; these entries pin the same
+    # choice explicitly so the config is deterministic and warning-free.
+    "D203",    # conflicts with D211 (no-blank-line-before-class) -- D211 wins
+    "D213",    # conflicts with D212 (multi-line-summary-first-line) -- D212 wins
 ]
 
 [tool.pytest.ini_options]
