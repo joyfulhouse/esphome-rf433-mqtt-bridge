@@ -2307,11 +2307,15 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     # what stops the next reader from "simplifying" a one-line lambda back into
     # place -- a change that would look obviously correct.
     component_sources = sorted(RF_BRIDGE_DIR.glob("*.h")) + sorted(RF_BRIDGE_DIR.glob("*.cpp"))
-    # (1) The serializer routes through the shared rule. Comments are stripped
-    # first: a developer inlining the rule would naturally leave one naming it
-    # ("// Inlined equivalent of serialized_nibble() ..."), which contains this
-    # very substring and satisfied the raw-body form of this assertion.
+    # (1) The serializer routes through the shared rule. Comments -- BOTH line
+    # and block -- are stripped first: a developer inlining the rule would
+    # naturally leave one naming it ("Inlined equivalent of serialized_nibble()
+    # ..."), which contains this very substring and satisfied the raw-body form
+    # of this assertion in either spelling. Line comments go first, so that an
+    # unterminated `/*` inside one cannot make the block pattern span forward
+    # and swallow the real call.
     serializer_code = re.sub(r"//[^\n]*", "", members["write_byte_str_"])
+    serializer_code = re.sub(r"/\*.*?\*/", "", serializer_code, flags=re.DOTALL)
     assert "serialized_nibble(" in serializer_code
     # (2) No second copy of invalid-nibble-becomes-0 in its TERNARY shape.
     # Matched by shape, not by name: the reverted form is an anonymous lambda
