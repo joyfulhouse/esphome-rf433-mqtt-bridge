@@ -242,14 +242,8 @@ inline std::string compact_hex(const std::vector<uint8_t> &raw) {
 // frame is a valid B0 frame on the wire and must be compensated like `AAB0...`,
 // not silently transmitted raw.
 inline bool has_b0_magic(const std::string &frame) {
-  constexpr int magic[]{0xA, 0xA, 0xB, 0x0};
-  if (frame.size() < sizeof(magic) / sizeof(magic[0]))
-    return false;
-  for (size_t index = 0; index < 4U; index++) {
-    if (hex_nibble(frame[index]) != magic[index])
-      return false;
-  }
-  return true;
+  return frame.size() >= 4U && hex_nibble(frame[0]) == 0xA && hex_nibble(frame[1]) == 0xA &&
+         hex_nibble(frame[2]) == 0xB && hex_nibble(frame[3]) == 0x0;
 }
 
 // Subtract a fixed per-bucket microsecond offset from an outbound B0 frame.
