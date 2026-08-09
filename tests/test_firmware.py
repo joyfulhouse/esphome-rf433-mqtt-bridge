@@ -2266,6 +2266,79 @@ def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path)
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "must_survive", "must_not_survive"),
+    [
+        pytest.param(
+            "  /* Inlined equivalent of serialized_nibble(); see\n"
+            "     https://github.com/mightymos/RF-Bridge-OB38S003/issues/27 */\n"
+            "  this->write(nibble(codes[i]));\n",
+            ("this->write(nibble(codes[i]));",),
+            ("serialized_nibble(",),
+            id="url-after-token-no-later-close",
+        ),
+        pytest.param(
+            "  /* upstream https://github.com/mightymos/RF-Bridge-OB38S003/issues/27 */\n"
+            "  this->write(serialized_nibble(codes[i]));\n"
+            "  /* end of hot loop */\n",
+            ("this->write(serialized_nibble(codes[i]));",),
+            ("upstream", "end of hot loop"),
+            id="url-with-later-close",
+        ),
+        pytest.param(
+            "  // plain line comment\n  keep_me();\n",
+            ("keep_me();",),
+            ("plain line comment",),
+            id="plain-line-comment",
+        ),
+        pytest.param(
+            "  /* plain block\n     comment spanning lines */\n  keep_me();\n",
+            ("keep_me();",),
+            ("plain block", "comment spanning lines"),
+            id="plain-block-comment",
+        ),
+        pytest.param(
+            "  // TODO: /* revisit\n  keep_me();\n",
+            ("keep_me();",),
+            ("TODO", "revisit"),
+            id="unterminated-open-inside-line-comment",
+        ),
+    ],
+)
+def test_without_comments_strips_prose_without_eating_code(
+    source: str,
+    must_survive: tuple[str, ...],
+    must_not_survive: tuple[str, ...],
+) -> None:
+    """Pure-function cover for the strip that assertions (1) and (3) rely on.
+
+    Those two assertions are only as good as this helper, and the component
+    carries no URL-bearing comment for a broken strip to bite on -- so a
+    regression here would leave every shipped test green while the pin silently
+    stopped pinning. That is the same by-convention-not-by-enforcement gap the
+    pin itself exists to close, one level up.
+
+    It stops here rather than regressing further: this helper is a PURE
+    FUNCTION, so its correctness is behavior -- string in, string out -- and an
+    ordinary unit test covers it. Nothing needs to pin this test in turn.
+
+    The first two cases are the fixtures that proved a two-pass line-then-block
+    strip wrong in both directions; the rest are the ordinary shapes plus the
+    case a block-first order would get wrong.
+    """
+    stripped = _without_comments(source)
+    for fragment in must_survive:
+        assert fragment in stripped
+    for fragment in must_not_survive:
+        assert fragment not in stripped
+
+
+def test_without_comments_leaves_comment_free_source_untouched() -> None:
+    """No comments in, byte-identical out: the strip never rewrites code."""
+    source = "  const size_t size = codes.length();\n  this->write(serialized_nibble(codes[i]));\n"
+    assert _without_comments(source) == source
+
+
 def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     tmp_path: Path,
 ) -> None:
