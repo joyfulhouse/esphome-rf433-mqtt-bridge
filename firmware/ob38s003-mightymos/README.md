@@ -86,9 +86,30 @@ HARDWARE.md; summarised here so this directory is self-contained.
 
 | Issue | Effect | Handling |
 |---|---|---|
-| [#27](https://github.com/mightymos/RF-Bridge-OB38S003/issues/27) (open) | Transmitted `B0` bucket timings run long on air — roughly **+30 µs** per bucket measured with a Flipper Zero, and **+76 µs** measured against a calibrated RTL-SDR | **Re-capture and re-tune every bucket timing on the V2.2 board itself.** Codes captured on an EFM8BB1 Portisch bridge may not replay. |
+| [#27](https://github.com/mightymos/RF-Bridge-OB38S003/issues/27) (open) | Transmitted `B0` bucket timings run long on air — roughly **+30 µs** per bucket measured with a Flipper Zero, and **+76 µs** measured against a calibrated RTL-SDR. The port dropped Portisch's per-bucket startup-delay compensation, does a 16-bit division *after* asserting the RF edge (~38–40 µs charged to the pulse already on air), and reloads Timer-1 one interval long — an **additive** error, the same few microseconds on every bucket | **Re-capture and re-tune every bucket timing on the V2.2 board itself**; codes captured on an EFM8BB1 Portisch bridge may not replay. Optionally then set the package's `tx_bucket_offset_us` substitution (**default `"0"`, a byte-for-byte no-op**) to subtract a fixed per-bucket correction at the UART boundary — see the notes below the table. |
 | [#19](https://github.com/mightymos/RF-Bridge-OB38S003/issues/19) (open) | After ~24–48 h the radio MCU's **receive** path stops decoding codes. Transmit and the ESP8285/Wi-Fi keep working normally, and restarting the ESP does not clear it | Reset the radio MCU on a schedule (`AA FE 55`) or power-cycle the board; there is no firmware fix. Alarm on missing **inbound** traffic — availability stays `online` throughout. |
 | No stock image published | Stock OB38S003 firmware is read-protected and is destroyed by the `erase` that unprotects the chip | There is nothing to roll back to. Unlike the EFM8BB1 path, no vendor original `.hex` exists. |
+
+### Why issue #27 is corrected in the host, not here
+
+Fixing the timing properly means editing this firmware, and we cannot: upstream is unmaintained
+(see above), and calibrating a timing fix needs RF measurement hardware this project does not
+have. Because the error is additive, the host can cancel it exactly as well by subtracting a
+constant from every bucket before the frame goes out over UART — no rebuild of an 8051 image, no
+new binary to trust, and the correction stays per-board where the measurement actually lives.
+
+That is `tx_bucket_offset_us`, a package substitution documented in
+[HARDWARE.md → caveat 2a](../../HARDWARE.md#alternate-path--r2-v22-with-the-ob38s003-radio):
+
+- **Default `"0"`, opt-in, and a byte-for-byte no-op** — a bridge that does not set it emits
+  exactly the bytes it always did. EFM8BB1 boards must leave it at `"0"`; stock Portisch already
+  compensates.
+- **Never combine it with hand-tuned codes.** If you already subtracted the overshoot from your
+  bucket values yourself, this knob subtracts it a second time, the buckets fall as far short of
+  the receiver's window as they were long, and **blinds silently stop responding** — the bridge
+  still publishes `started`, which only proves UART dispatch, never RF emission.
+- **Found empirically per board** (reported values span 30–90 µs) and **compile-time**: changing
+  it requires a recompile and an OTA, not a runtime setting.
 
 ## Updating this pin
 

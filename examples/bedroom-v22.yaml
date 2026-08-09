@@ -25,6 +25,13 @@ substitutions:
   # R2 v2.2 boards carry the OB38S003 RF MCU running RF-Bridge-OB38S003.
   # Published as "hw" in retained /info so a heterogeneous fleet is auditable.
   hardware_variant: ob38s003-mightymos
+  # OB38S003-only transmit compensation, OFF by default. This firmware holds
+  # every B0 bucket longer than commanded (upstream issue #27); if freshly
+  # captured codes still do not move a blind, raise this a few microseconds at
+  # a time — reporters landed between 30 and 90 — recompiling and re-flashing
+  # for each value. Leave it at "0" if you hand-tuned your bucket values by
+  # subtracting the overshoot yourself, or you will over-correct.
+  tx_bucket_offset_us: "0"
   # With Home Assistant's Mosquitto add-on, the broker is your HA host.
   # Use an authenticated, least-privilege bridge account; anonymous MQTT is
   # outside the firmware's safety contract.

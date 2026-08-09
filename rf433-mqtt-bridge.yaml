@@ -34,6 +34,20 @@ substitutions:
   # emitted verbatim into the generated JSON/C++ string carrying "hw", so a `\`
   # or `"` would malform that literal.
   hardware_variant: efm8bb1-portisch
+  # OFF by default ("0" is a byte-for-byte no-op) and for OB38S003 / R2 V2.2
+  # boards ONLY: microseconds subtracted from every bucket of an outbound B0
+  # frame to compensate that firmware's long transmit timing (upstream
+  # mightymos/RF-Bridge-OB38S003#27). EFM8BB1 boards run stock Portisch, which
+  # already compensates -- a non-zero value there breaks working transmits.
+  #
+  # DO NOT combine with hand-tuned codes. If you already subtracted the
+  # measured overshoot from your bucket values, leave this at "0" or you will
+  # over-correct and your blinds will silently stop responding: `started` still
+  # fires, because it only proves UART dispatch, not RF emission.
+  #
+  # Compile-time (recompile + OTA to change) and found empirically per board;
+  # field evidence spans 30-90 us. See HARDWARE.md.
+  tx_bucket_offset_us: "0"
   mqtt_broker: homeassistant.local
   mqtt_port: "1883"
   mqtt_username: ""
@@ -81,6 +95,10 @@ uart:
 rf_bridge:
   id: portisch_rf_bridge
   uart_id: rf_uart
+  # Applied inside send_raw, the single UART choke point every transmit path
+  # reaches. Airtime accounting keeps using the UNcompensated durations on
+  # purpose, so RF pacing stays conservative.
+  tx_bucket_offset_us: ${tx_bucket_offset_us}
   on_bucket_received:
     then:
       - lambda: |-

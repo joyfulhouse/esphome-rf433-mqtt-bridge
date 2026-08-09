@@ -186,13 +186,8 @@ void RFBridgeComponent::write_byte_str_(const std::string &codes) {
   // previous substr+strtol form heap-allocated a temporary string per byte,
   // ~130 allocations for a production frame on every repeat of every dispatch.
   const auto nibble = [](char value) -> uint8_t {
-    if (value >= '0' && value <= '9')
-      return static_cast<uint8_t>(value - '0');
-    if (value >= 'A' && value <= 'F')
-      return static_cast<uint8_t>(value - 'A' + 10);
-    if (value >= 'a' && value <= 'f')
-      return static_cast<uint8_t>(value - 'a' + 10);
-    return 0;
+    const int parsed = hex_nibble(value);
+    return parsed < 0 ? 0 : static_cast<uint8_t>(parsed);
   };
   const size_t size = codes.length();
   for (size_t i = 0; i + 1 < size; i += 2)
@@ -315,7 +310,17 @@ void RFBridgeComponent::start_bucket_sniffing() {
 void RFBridgeComponent::send_raw(const std::string &raw_code) {
   ESP_LOGD(TAG, "Sending Raw Code: %s", raw_code.c_str());
 
-  this->write_byte_str_(raw_code);
+  // The single transmit choke point: scheduler dispatch, the OTA
+  // wait-for-idle pump, and the fail-safe STOP drain all reach the UART
+  // through here, so OB38S003 bucket compensation is applied once, at the last
+  // moment before serialization, and no transmit path can bypass it. The
+  // default offset of 0 skips it entirely -- a default build runs exactly the
+  // code it always did and writes exactly the bytes it always wrote.
+  if (this->tx_bucket_offset_us_ == 0) {
+    this->write_byte_str_(raw_code);
+  } else {
+    this->write_byte_str_(b0_with_bucket_offset(raw_code, this->tx_bucket_offset_us_));
+  }
   this->flush();
 }
 

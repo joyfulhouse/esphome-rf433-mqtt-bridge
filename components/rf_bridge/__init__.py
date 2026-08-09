@@ -52,6 +52,14 @@ RFBridgeSendRawAction = rf_bridge_ns.class_("RFBridgeSendRawAction", automation.
 CONF_ON_CODE_RECEIVED = "on_code_received"
 CONF_ON_ADVANCED_CODE_RECEIVED = "on_advanced_code_received"
 CONF_ON_BUCKET_RECEIVED = "on_bucket_received"
+CONF_TX_BUCKET_OFFSET_US = "tx_bucket_offset_us"
+
+# Microseconds subtracted from every bucket of an outbound B0 frame to
+# compensate the OB38S003 port's long transmit timing (upstream
+# mightymos/RF-Bridge-OB38S003#27). Off by default; field-observed error spans
+# 30-90 us, so the range is bounded well above any plausible value rather than
+# left open to a substitution typo that would gut every bucket.
+MAX_TX_BUCKET_OFFSET_US = 255
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
@@ -60,6 +68,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_CODE_RECEIVED): automation.validate_automation({}),
             cv.Optional(CONF_ON_ADVANCED_CODE_RECEIVED): automation.validate_automation({}),
             cv.Optional(CONF_ON_BUCKET_RECEIVED): automation.validate_automation({}),
+            cv.Optional(CONF_TX_BUCKET_OFFSET_US, default=0): cv.int_range(
+                min=0, max=MAX_TX_BUCKET_OFFSET_US
+            ),
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -91,6 +102,7 @@ async def to_code(config: dict[str, object]) -> None:
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
+    cg.add(var.set_tx_bucket_offset_us(config[CONF_TX_BUCKET_OFFSET_US]))
 
     await automation.build_callback_automations(var, config, _CALLBACK_AUTOMATIONS)
 

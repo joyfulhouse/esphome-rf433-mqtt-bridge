@@ -63,6 +63,10 @@ class RFBridgeComponent : public uart::UARTDevice, public Component {
   void stop_advanced_sniffing();
   void start_bucket_sniffing();
   void send_raw(const std::string &code);
+  // Compile-time OB38S003 transmit compensation, in microseconds subtracted
+  // from every bucket of an outbound B0 frame. 0 (the default) is a byte-for-
+  // byte no-op; see b0_with_bucket_offset in rf_bridge_protocol.h.
+  void set_tx_bucket_offset_us(uint16_t offset_us) { this->tx_bucket_offset_us_ = offset_us; }
   void beep(uint16_t ms);
   // True while no received frame is mid-parse. The package's B1 keepalive
   // re-arm gates on this so it never clips a capture that is being delivered.
@@ -77,6 +81,7 @@ class RFBridgeComponent : public uart::UARTDevice, public Component {
   std::vector<uint8_t> rx_buffer_;
   uint32_t last_bridge_byte_{0};
   bool bucket_candidate_{false};
+  uint16_t tx_bucket_offset_us_{0};
 
   CallbackManager<void(RFBridgeData)> data_callback_;
   CallbackManager<void(RFBridgeAdvancedData)> advanced_data_callback_;

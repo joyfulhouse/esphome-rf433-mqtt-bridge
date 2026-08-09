@@ -29,6 +29,31 @@ constexpr size_t AOK_CAPTURE_PADDING_PULSES = 2;
 constexpr size_t AOK_PAYLOAD_BITS = 64;
 constexpr size_t AOK_TRAILER_BITS = 2;
 
+// Outbound B0 layout, as validated by rf433_scheduler.h's normalize_b0 before
+// any frame reaches the transmitter: bucket count at hex chars 6..7, embedded
+// repeat at 8..9, then one 4-hex-char big-endian microsecond duration per
+// bucket, then the data nibbles.
+constexpr size_t B0_BUCKET_TABLE_START = 10;
+// Floor for a compensated bucket duration. The OB38S003's Timer-1 ISR
+// decrements its remaining-interval counter BEFORE testing it for zero, so a
+// bucket that reaches zero wraps to 65,535 intervals -- roughly 659 ms of
+// stuck carrier on a shared 433.92 MHz band. This floor sits far above any
+// plausible timer quantum and far below the shortest real AOK bucket (280 us),
+// so it only ever engages on a duration compensation would otherwise destroy.
+constexpr uint16_t B0_MIN_BUCKET_US = 100;
+
+static constexpr char HEX_DIGITS[] = "0123456789ABCDEF";
+
+inline int hex_nibble(char value) {
+  if (value >= '0' && value <= '9')
+    return value - '0';
+  if (value >= 'A' && value <= 'F')
+    return value - 'A' + 10;
+  if (value >= 'a' && value <= 'f')
+    return value - 'a' + 10;
+  return -1;
+}
+
 enum class B1FrameStatus : uint8_t {
   INCOMPLETE,
   CANDIDATE,
@@ -198,12 +223,69 @@ inline B1FrameStatus b1_frame_status(const std::vector<uint8_t> &raw) {
 }
 
 inline std::string compact_hex(const std::vector<uint8_t> &raw) {
-  static constexpr char HEX_DIGITS[] = "0123456789ABCDEF";
   std::string output;
   output.reserve(raw.size() * 2U);
   for (const uint8_t byte : raw) {
     output.push_back(HEX_DIGITS[byte >> 4]);
     output.push_back(HEX_DIGITS[byte & 0x0F]);
+  }
+  return output;
+}
+
+// Subtract a fixed per-bucket microsecond offset from an outbound B0 frame.
+//
+// Sonoff R2 V2.2 boards run the vendored mightymos OB38S003 port, whose B0
+// transmitter holds every bucket LONGER than commanded (upstream
+// mightymos/RF-Bridge-OB38S003#27): the port dropped Portisch's startup-delay
+// compensation, performs a 16-bit division after asserting the RF edge, and
+// reloads Timer-1 one tick long. The measured error is additive (~+90 us on
+// pulses and ~+56 us on gaps against a calibrated RTL-SDR; ~+30 us for another
+// reporter), so subtracting one empirically-found constant from every bucket
+// restores on-air timing for receivers with tight windows.
+//
+// This is applied at the UART boundary and NOWHERE else. The scheduler's
+// airtime and RF-pacing math deliberately keeps using the UNcompensated
+// durations: compensating at frame admission would shrink the computed airtime
+// of a production AOK frame by ~96 ms at a 90 us offset -- against a 5 ms
+// margin -- and reopen the UART-ring corruption fixed in field testing.
+// Over-reserving air is safe; under-reserving is not.
+//
+// Returns `frame` unchanged when `offset_us` is 0 -- the shipped default, so a
+// default build emits byte-for-byte what it always has -- and when `frame` is
+// not a B0 bucket frame. Only the 4-hex-char bucket table is rewritten, in the
+// same zero-padded uppercase hex the normalizer produces; the length byte,
+// embedded repeat, data nibbles, and trailer are copied verbatim.
+//
+// Every emitted bucket is floored at B0_MIN_BUCKET_US and can never reach 0 --
+// see that constant for the 659 ms stuck-carrier hazard it exists to prevent.
+inline std::string b0_with_bucket_offset(const std::string &frame, uint16_t offset_us) {
+  if (offset_us == 0 || frame.size() < B0_BUCKET_TABLE_START || frame.compare(0, 4, "AAB0") != 0)
+    return frame;
+  const int count_high = hex_nibble(frame[6]);
+  const int count_low = hex_nibble(frame[7]);
+  if (count_high < 0 || count_low < 0)
+    return frame;
+  const size_t bucket_count = static_cast<size_t>((count_high << 4) | count_low);
+  // The data nibbles begin where the bucket table ends. A frame too short to
+  // hold the table it declares is passed through whole rather than partially
+  // rewritten.
+  if (frame.size() < B0_BUCKET_TABLE_START + bucket_count * 4U)
+    return frame;
+  std::string output = frame;
+  for (size_t bucket = 0; bucket < bucket_count; bucket++) {
+    const size_t start = B0_BUCKET_TABLE_START + bucket * 4U;
+    uint32_t duration_us = 0;
+    for (size_t index = 0; index < 4U; index++) {
+      const int value = hex_nibble(frame[start + index]);
+      if (value < 0)
+        return frame;
+      duration_us = (duration_us << 4) | static_cast<uint32_t>(value);
+    }
+    const uint32_t reduced = duration_us > offset_us ? duration_us - offset_us : 0U;
+    const uint16_t emitted =
+        reduced < B0_MIN_BUCKET_US ? B0_MIN_BUCKET_US : static_cast<uint16_t>(reduced);
+    for (size_t index = 0; index < 4U; index++)
+      output[start + index] = HEX_DIGITS[(emitted >> (12U - index * 4U)) & 0x0F];
   }
   return output;
 }
