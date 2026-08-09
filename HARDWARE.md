@@ -381,7 +381,9 @@ reason not to do it — they are reasons to do it with your eyes open.
 > warning; nothing reaches the coprocessor. The serializer would otherwise turn an unparseable
 > nibble into `0` — manufacturing exactly the zero-length bucket, and the 659 ms stuck carrier,
 > that the floor above exists to prevent. This check runs whatever `tx_bucket_offset_us` is set to,
-> including `"0"`. Frames without the `AAB0` magic are not judged and still transmit as written.
+> including `"0"`. It is a serialization check, not a frame validator: frames without the `AAB0`
+> magic are not judged at all, and a `B0` frame whose bucket is a legitimate `0000` in valid hex is
+> not malformed — only the floor would raise that one, and only when compensation is on.
 >
 > This is **compile-time**, not runtime-settable: changing it needs `esphome run` (recompile plus
 > OTA), so budget a flash per trial value. It applies only to the bucket table — data nibbles,
