@@ -304,7 +304,8 @@ reason not to do it — they are reasons to do it with your eyes open.
 > both a *pulse* and a *gap* inside the same frame, and each index carries exactly one 16-bit
 > duration, so one number cannot hold two corrections. With the measured +90 µs on pulses and
 > +56 µs on gaps, a single constant nulls only their **mean**: the best available setting still
-> leaves roughly **±17 µs on every edge** — pulses short by ~17 µs, gaps long by ~17 µs. That is a
+> leaves roughly **±17 µs on every edge** — pulses **still long** by ~17 µs (90 − 73), gaps
+> **short** by ~17 µs (56 − 73). That is a
 > real improvement on an uncorrected +56 µs to +90 µs, and it is the whole of what this knob buys
 > you. If a receiver rejects your frames at ±17 µs, the fix is not a different offset.
 >
@@ -357,16 +358,30 @@ reason not to do it — they are reasons to do it with your eyes open.
 > validator — so on a default install a hand-crafted zero-bucket frame still reaches the
 > coprocessor verbatim. And when the floor does engage it means the offset has eaten the bucket:
 > the frame goes out no longer encoding your code. The bridge logs a warning naming the number of
-> floored buckets on every send where that happens, so it is loud rather than silent. On a real
+> floored buckets — immediately, then at most once a minute, because the condition is a property
+> of the configured offset and would otherwise repeat on every repeat of every dispatch. On a real
 > AOK capture (shortest bucket 280 µs) the floor cannot engage below an offset of 181 µs — which
 > is why the accepted range stops at 120.
 >
-> **Not every transmit is compensated, and the uncompensated ones are fine.** This applies to the
-> bucket table of `B0` frames sent through `rf_bridge.send_raw`, which is every transmit this
-> package performs. The stock `rf_bridge.send_code` (`0xA5`) and `rf_bridge.send_advanced_code`
-> (`0xA8`) actions write to the UART without passing through it, so a YAML that calls them stays
-> uncompensated on OB38S003 — correctly: those frames carry no host-supplied bucket timings at all,
-> the coprocessor generates the edges from its own protocol table.
+> **Not every transmit is compensated.** This applies to the bucket table of `B0` frames sent
+> through `rf_bridge.send_raw`, which is every transmit this package performs. The two stock
+> transmit actions write to the UART without passing through it, and they are not in the same
+> position as each other:
+>
+> - `rf_bridge.send_advanced_code` (`0xA8`) carries a protocol **ID**. The coprocessor generates
+>   the edges from its own protocol table, so there are no host-supplied timings to correct.
+> - `rf_bridge.send_code` (`0xA5`) is different: its `sync`, `low`, and `high` fields **are**
+>   host-supplied microsecond timings, written straight from your YAML. They are **not** corrected
+>   by `tx_bucket_offset_us`, and whether they suffer issue #27 the way bucket timings do has
+>   **not been measured**. Treat A5 transmits on OB38S003 as unverified rather than as either
+>   working or broken.
+>
+> **A malformed `B0` frame is dropped, not transmitted.** If a frame carries the `AAB0` magic but
+> contains a non-hex character or an odd number of characters, the bridge refuses it and logs a
+> warning; nothing reaches the coprocessor. The serializer would otherwise turn an unparseable
+> nibble into `0` — manufacturing exactly the zero-length bucket, and the 659 ms stuck carrier,
+> that the floor above exists to prevent. This check runs whatever `tx_bucket_offset_us` is set to,
+> including `"0"`. Frames without the `AAB0` magic are not judged and still transmit as written.
 >
 > This is **compile-time**, not runtime-settable: changing it needs `esphome run` (recompile plus
 > OTA), so budget a flash per trial value. It applies only to the bucket table — data nibbles,

@@ -327,7 +327,7 @@ The additional MQTT surface is:
   original UART handoff instant. `displaced` carries the same fields anchored on the displacement
   instant (`displacement = t - age_ms`) — except when the terminal state was reached by `disarm`,
   which has no such instant and so omits them.
-- Retained `/info` advertises `boot`, `listen`, and `v` (`2` for this contract), allowing a controller
+- Retained `/info` advertises `boot`, `listen`, and `v` (`3` for this contract), allowing a controller
   to discover which bridges participate without waiting for traffic. It also carries two additive
   inventory fields: `hw`, the RF coprocessor variant tag, and `tx_offset_us`, the microseconds this
   bridge subtracts from every outbound bucket (`0` on a stock build — see
