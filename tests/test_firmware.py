@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_rx_firmware import _compile_and_run, _write_rf_bridge_stubs
+
 PROJECT_ROOT = Path(__file__).parents[1]
 SCHEDULER_HEADER = PROJECT_ROOT / "rf433_scheduler.h"
 BRIDGE_YAML = PROJECT_ROOT / "rf433-mqtt-bridge.yaml"
@@ -1602,6 +1604,10 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     # The esphome-compile gate overrides ${hardware_variant} and only catches a
     # MISSING key, not a wrong/typo'd default, so pin the shipped default here.
     assert "hardware_variant: efm8bb1-portisch" in package
+    # OB38S003 transmit compensation ships OFF, and reaches the component (not
+    # a lambda) so it lands at the single send_raw UART choke point.
+    assert 'tx_bucket_offset_us: "0"' in package
+    assert "tx_bucket_offset_us: ${tx_bucket_offset_us}" in package
     assert "TargetScheduler" in scheduler
     assert "rf433::tx_scheduler" in package
     assert 'x["command_id"]' in package
@@ -1861,3 +1867,185 @@ int main() {
         env={**os.environ, "TMPDIR": str(tmp_path)},
     )
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) -> None:
+    """OB38S003 compensation: no-op at 0, exact subtraction above it, safe floor."""
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+        #include <string>
+        #include "components/rf_bridge/rf_bridge_protocol.h"
+
+        using esphome::rf_bridge::b0_with_bucket_offset;
+
+        int main() {
+          // Production AOK frame: 4 buckets (5140, 620, 280, 5140 us) at hex chars
+          // 10..25, then 134 data nibbles, then the 55 trailer.
+          const std::string frame =
+              "AAB04D04081414026C01181414381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+              "192929292A192A1A1A1A1A1A19292A1A1A1A1A1A1A1A1A1A1A1A192A1929292A1A19292A1A1A1A1955";
+          assert(frame.size() == 162);
+
+          // (a) The shipped default is a provable byte-for-byte no-op. Existing
+          // deployments must serialize exactly the bytes they always have -- including
+          // the safety floor, which must not "fix" a bucket while compensation is off.
+          assert(b0_with_bucket_offset(frame, 0) == frame);
+          assert(b0_with_bucket_offset("AAB005010800000055", 0) == "AAB005010800000055");
+
+          // (b) A non-zero offset subtracts from EVERY bucket and touches nothing
+          // else: 5140-90=0x13BA, 620-90=0x0212, 280-90=0x00BE, 5140-90=0x13BA.
+          const std::string compensated = b0_with_bucket_offset(frame, 90);
+          assert(compensated.size() == frame.size());
+          assert(compensated.compare(10, 16, "13BA021200BE13BA") == 0);
+          // Header (AAB0, length byte, bucket count, embedded repeat) is verbatim...
+          assert(compensated.compare(0, 10, frame, 0, 10) == 0);
+          // ...as are every data nibble and the trailer beyond the bucket table.
+          assert(compensated.compare(26, std::string::npos, frame, 26, std::string::npos) == 0);
+          // Uppercase, zero-padded, four hex chars per bucket, exactly as the
+          // normalizer emits: 0x00BE must not collapse to "BE".
+          assert(compensated.find("00BE") == 18);
+
+          // (c) Underflow can never emit a zero-or-negative bucket. The OB38S003
+          // Timer-1 ISR decrements before testing zero, so a 0 bucket wraps to 65,535
+          // intervals (~659 ms of stuck carrier). One bucket of 0 us, 1 data nibble.
+          const std::string zero_bucket = "AAB005010800000055";
+          assert(b0_with_bucket_offset(zero_bucket, 90) == "AAB005010800640055");  // 0 -> 100 us
+          // A bucket that would land below the floor is raised to it, not wrapped.
+          const std::string small_bucket = "AAB005010800640055";  // 100 us
+          assert(b0_with_bucket_offset(small_bucket, 90) == small_bucket);  // 10 -> 100 us
+          // 200 -> 110 us: a bucket clear of the floor is reduced exactly.
+          assert(b0_with_bucket_offset("AAB005010800C80055", 90) == "AAB0050108006E0055");
+          // The maximum accepted offset still cannot drive any bucket to zero.
+          for (uint16_t offset = 1; offset <= 255; offset++) {
+            const std::string floored = b0_with_bucket_offset(zero_bucket, offset);
+            assert(floored.compare(10, 4, "0000") != 0);
+          }
+
+          // Anything that is not a B0 bucket frame is passed through whole rather
+          // than partially rewritten: send_raw is a public ESPHome action.
+          assert(b0_with_bucket_offset("", 90).empty());
+          assert(b0_with_bucket_offset("AAA55", 90) == "AAA55");
+          // Declared bucket table runs past the end of the frame.
+          assert(b0_with_bucket_offset("AAB0050108", 90) == "AAB0050108");
+          assert(b0_with_bucket_offset("AAB005ZZ0800000055", 90) == "AAB005ZZ0800000055");
+          assert(b0_with_bucket_offset("AAB0050108ZZZZ0055", 90) == "AAB0050108ZZZZ0055");
+          return 0;
+        }
+        """,
+    )
+
+
+def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path) -> None:
+    """Compensation lives at the UART boundary, never in the admission path.
+
+    Compensating during normalize_b0_with_airtime would shrink the airtime the
+    scheduler paces on by ~96 ms against a 5 ms margin and reopen the UART-ring
+    corruption fixed in field testing. The scheduler must keep dispatching, and
+    accounting for, UNcompensated durations.
+    """
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+        #include <string>
+        #include <vector>
+        #include "components/rf_bridge/rf_bridge_protocol.h"
+        #include "rf433_scheduler.h"
+
+        using esphome::rf_bridge::b0_with_bucket_offset;
+        using rf433::TargetScheduler;
+
+        int main() {
+          const std::string frame =
+              "AAB04D04081414026C01181414381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+              "192929292A192A1A1A1A1A1A19292A1A1A1A1A1A1A1A1A1A1A1A192A1929292A1A19292A1A1A1A1955";
+          std::string normalized;
+          std::string reason;
+          uint64_t airtime_us = 0;
+          assert(rf433::normalize_b0_with_airtime(frame, normalized, reason, airtime_us));
+          // Pinned to the frame's LITERAL bucket durations: 134 pulses drawn from
+          // 5140/620/280/5140 us buckets, times the embedded repeat of 8. Subtracting
+          // any offset inside the admission path moves this number, and moving it is
+          // exactly the change that must never happen.
+          assert(airtime_us == 560160);
+
+          // The scheduler dispatches the frame it admitted, byte for byte. The
+          // compensated bytes exist only past send_raw, so pacing keeps its
+          // conservative (longer) airtime estimate.
+          std::vector<std::string> displaced;
+          std::string started;
+          TargetScheduler sched(35);
+          assert(sched.schedule("c1", "a1b2c3:20:1", frame, "", 1, 0, "", 0, displaced, reason));
+          const auto raw = sched.next(0, started);
+          assert(raw && *raw == frame && started == "c1");
+
+          // Had the offset been applied at admission instead, the airtime driving the
+          // RF pacing gate would have collapsed by offset * pulses * embedded repeat
+          // = 90 * 134 * 8 = 96,480 us, far past the 5 ms margin.
+          uint64_t compensated_airtime_us = 0;
+          assert(rf433::normalize_b0_with_airtime(b0_with_bucket_offset(frame, 90), normalized,
+                                                  reason, compensated_airtime_us));
+          assert(compensated_airtime_us == 463680 && compensated_airtime_us + 96480 == airtime_us);
+          return 0;
+        }
+        """,
+    )
+
+
+def test_native_send_raw_is_the_single_compensation_choke_point(tmp_path: Path) -> None:
+    """send_raw is where compensation happens, and only there.
+
+    Drives the real vendored component against the host UART stub: the default
+    build must serialize the caller's bytes untouched, and a configured offset
+    must reach the wire through the one call every transmit path makes.
+    """
+    _write_rf_bridge_stubs(tmp_path)
+    _compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+        #include <string>
+        #include <vector>
+
+        #include "components/rf_bridge/rf_bridge.cpp"
+
+        using esphome::rf_bridge::RFBridgeComponent;
+
+        // The component's UART writes are protected; a test-only subclass reads
+        // them back exactly as the coprocessor would receive them.
+        struct ProbeBridge : RFBridgeComponent {
+          std::string serialized() const {
+            return esphome::rf_bridge::compact_hex(this->written_bytes());
+          }
+        };
+
+        int main() {
+          const std::string frame = "AAB005010801180055";
+
+          // Default build: no offset configured, bytes pass through verbatim.
+          ProbeBridge plain;
+          plain.send_raw(frame);
+          assert(plain.serialized() == frame);
+
+          // Configured build: 280 - 90 = 190 = 0x00BE reaches the wire, and
+          // nothing outside the bucket table moves.
+          ProbeBridge compensated;
+          compensated.set_tx_bucket_offset_us(90);
+          compensated.send_raw(frame);
+          assert(compensated.serialized() == "AAB005010800BE0055");
+
+          // Explicit zero stays the no-op, so a per-board override of "0" is
+          // indistinguishable from an unconfigured bridge.
+          ProbeBridge zeroed;
+          zeroed.set_tx_bucket_offset_us(0);
+          zeroed.send_raw(frame);
+          assert(zeroed.serialized() == frame);
+          return 0;
+        }
+        """,
+    )

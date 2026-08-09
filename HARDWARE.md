@@ -273,6 +273,14 @@ reason not to do it — they are reasons to do it with your eyes open.
 > ([issue #27][issue27], open). Receivers with tight timing windows reject the result, and a code
 > captured on an EFM8BB1 Portisch bridge is exactly such a code.
 >
+> The cause is in the port, not in your codes. It dropped the startup-delay compensation upstream
+> Portisch applies before each bucket, it performs a 16-bit division *after* asserting the RF edge
+> (~38–40 µs of arithmetic charged to the pulse already on air), and its Timer-1 reload is off by
+> one interval. The three add up to a roughly **additive** per-bucket error — the same handful of
+> microseconds on every bucket regardless of its length — which is why a fixed correction works
+> and a percentage one does not. We do not patch the firmware: it is an unmaintained upstream
+> binary and calibrating a fix needs measurement hardware this project does not have.
+>
 > **Re-capture every code on the V2.2 board itself, with the original remote in hand.** This is
 > not optional cleanup you can defer — it is the step that makes transmit work. Upstream
 > [issue #36][issue36] is the worked example: old EFM8BB1-captured codes did nothing until the
@@ -283,6 +291,43 @@ reason not to do it — they are reasons to do it with your eyes open.
 > Keep the original remotes until every blind is confirmed working. Use this package's own
 > onboarding capture (`{"action":"sniff","seconds":30}`, see
 > [README.md → MQTT topic contract](README.md#mqtt-topic-contract)) once Step 2 is done.
+
+> 🎛️ **2a. `tx_bucket_offset_us` — opt-in host-side correction, OFF by default.**
+>
+> If freshly captured codes *still* do not move a blind, the package can subtract a fixed number
+> of microseconds from every bucket of every outbound `B0` frame, cancelling the overshoot above.
+> Set it in your per-device YAML:
+>
+> ```yaml
+> substitutions:
+>   hardware_variant: ob38s003-mightymos
+>   tx_bucket_offset_us: "60"   # OB38S003 / R2 V2.2 boards ONLY
+> ```
+>
+> **Default is `"0"`, which is a byte-for-byte no-op** — an existing bridge that does not set it
+> transmits exactly the bytes it always did. **EFM8BB1 boards (R2 V1.0/V2.0) must leave it at
+> `"0"`**: they run stock Portisch, which already compensates, so a non-zero value there breaks
+> transmits that currently work.
+>
+> > ⚠️ **Do not double-compensate.** Caveat 2 above notes that some users hand-tune by subtracting
+> > the measured overshoot from each bucket value. **If you did that, leave this at `"0"`.**
+> > Applying both corrections subtracts the overshoot twice, the buckets land as far *short* of
+> > the receiver's window as they were long, and **your blinds silently stop responding** — the
+> > bridge keeps publishing `started` for every command, because `started` only proves the frame
+> > reached the coprocessor over UART, never that it was emitted or received. Pick one correction:
+> > untouched codes plus this knob, or hand-tuned codes plus `"0"`.
+>
+> The right value is **found empirically, per board** — reported measurements span 30–90 µs, and
+> silicon, supply, and temperature all move it. Start at 0, raise it in small steps, and confirm
+> movement at each step. Buckets are floored at 100 µs and can never reach zero: a zero-length
+> bucket makes the coprocessor's Timer-1 ISR wrap to 65,535 intervals — about **659 ms of stuck
+> carrier** on a shared band.
+>
+> This is **compile-time**, not runtime-settable: changing it needs `esphome run` (recompile plus
+> OTA), so budget a flash per trial value. It applies only to the bucket table — data nibbles,
+> lengths, and trailers are untouched — and it is applied at the UART boundary, *after* the
+> scheduler has computed its RF pacing from the uncompensated durations, so airtime accounting
+> deliberately stays conservative.
 
 > 🧊 **3. Receive can stall after 24–48 h, and upstream is unmaintained.**
 >
