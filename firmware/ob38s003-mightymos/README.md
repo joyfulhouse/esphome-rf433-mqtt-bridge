@@ -109,8 +109,9 @@ That is `tx_bucket_offset_us`, a package substitution documented in
 - **Default `"0"`, opt-in, and byte-identical for every well-formed frame** — a bridge that does
   not set it emits exactly the bytes it always did. EFM8BB1 boards must leave it at `"0"`; stock
   Portisch already compensates. One deliberate exception applies at every offset including `"0"`:
-  a frame carrying the `AAB0` magic that is not valid, even-length hex is dropped rather than
-  transmitted, because the serializer would otherwise invent nibbles the author never wrote.
+  a frame carrying the `AAB0` magic that is not valid, even-length hex — or is too short to carry
+  the header that magic implies — is dropped rather than transmitted, because the serializer would
+  otherwise invent nibbles the author never wrote.
 - **It replaces hand-tuning; it does not follow it.** These are two ways to apply the same
   correction, so pick one. If you already subtracted the overshoot from your bucket values, this
   knob subtracts it a second time, the buckets fall as far short of the receiver's window as they

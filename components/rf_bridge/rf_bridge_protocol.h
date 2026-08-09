@@ -65,6 +65,8 @@ constexpr uint16_t B0_MIN_BUCKET_US = 100;
 // ill-formed, no diagnostic required ([basic.def.odr]/12).
 inline constexpr char HEX_DIGITS[] = "0123456789ABCDEF";
 
+// Parse one hex character, or -1 if it is not one. Use this to ASK whether a
+// character is valid hex.
 inline int hex_nibble(char value) {
   if (value >= '0' && value <= '9')
     return value - '0';
@@ -73,6 +75,23 @@ inline int hex_nibble(char value) {
   if (value >= 'a' && value <= 'f')
     return value - 'a' + 10;
   return -1;
+}
+
+// The nibble a character actually becomes ON THE WIRE. write_byte_str_ cannot
+// signal failure mid-frame, so it coerces anything unparseable to 0; this
+// function IS that rule, and it is the only expression of it in the codebase.
+//
+// Anything deciding what a frame WILL BE must use this, never hex_nibble.
+// Judging characters while the UART emits bytes is what let
+// `AABZ050108ZZZZ0055` through: hex_nibble('Z') is -1, so it failed the AAB0
+// magic and was waved past every check as "not a B0 frame", then serialized to
+// AA B0 05 01 08 00 00 00 55 -- a well-formed B0 frame carrying a zero bucket,
+// and with it the ~659 ms stuck carrier, from untrusted MQTT input at every
+// offset. One shared rule is what keeps the classifier's model of the wire from
+// drifting away from the wire again.
+inline uint8_t serialized_nibble(char value) {
+  const int parsed = hex_nibble(value);
+  return parsed < 0 ? 0U : static_cast<uint8_t>(parsed);
 }
 
 enum class B1FrameStatus : uint8_t {
@@ -288,12 +307,17 @@ enum class B0FrameStatus : uint8_t {
 inline B0FrameStatus b0_frame_status(const std::string &frame) {
   // The magic, and ONLY the magic, decides whether a frame is ours to judge --
   // length must not, or a truncated `AAB0Z` would skip every check below and
-  // reach the UART as a fragment. It is compared as decoded nibbles rather than
-  // characters because hex_nibble accepts lowercase everywhere else: a
-  // lambda-authored `aab0...` frame is a valid B0 frame on the wire and must be
-  // judged as one, not waved through as an unrecognized string.
-  if (frame.size() < B0_MAGIC_CHARS || hex_nibble(frame[0]) != 0xA ||
-      hex_nibble(frame[1]) != 0xA || hex_nibble(frame[2]) != 0xB || hex_nibble(frame[3]) != 0x0)
+  // reach the UART as a fragment.
+  //
+  // It is matched on SERIALIZED nibbles, not characters: the question is not
+  // "does this look like AAB0?" but "will the coprocessor receive AA B0?", and
+  // only the bytes write_byte_str_ actually emits can answer that. This is why
+  // lowercase `aab0...` is judged (hex is case-insensitive) and, less
+  // obviously, why `AABZ...` is too -- the serializer coerces Z to 0, so that
+  // frame IS a B0 frame once it reaches the wire.
+  if (frame.size() < B0_MAGIC_CHARS || serialized_nibble(frame[0]) != 0xA ||
+      serialized_nibble(frame[1]) != 0xA || serialized_nibble(frame[2]) != 0xB ||
+      serialized_nibble(frame[3]) != 0x0)
     return B0FrameStatus::PASSTHROUGH;
   // From here the frame claims to be a B0, so its characters are held to what
   // write_byte_str_ can serialize without silently altering them: a frame too

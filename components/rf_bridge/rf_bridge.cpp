@@ -191,13 +191,14 @@ void RFBridgeComponent::write_byte_str_(const std::string &codes) {
   // advanced-code action is config-authored). Convert nibbles in place -- the
   // previous substr+strtol form heap-allocated a temporary string per byte,
   // ~130 allocations for a production frame on every repeat of every dispatch.
-  const auto nibble = [](char value) -> uint8_t {
-    const int parsed = hex_nibble(value);
-    return parsed < 0 ? 0 : static_cast<uint8_t>(parsed);
-  };
+  // serialized_nibble, not a local copy of its rule: b0_frame_status matches the
+  // AAB0 magic through the same function, so the classifier's model of the wire
+  // and the wire cannot drift apart. See its comment for the frame that got
+  // through when they did.
   const size_t size = codes.length();
   for (size_t i = 0; i + 1 < size; i += 2)
-    this->write(static_cast<uint8_t>((nibble(codes[i]) << 4) | nibble(codes[i + 1])));
+    this->write(
+        static_cast<uint8_t>((serialized_nibble(codes[i]) << 4) | serialized_nibble(codes[i + 1])));
 }
 
 void RFBridgeComponent::loop() {
@@ -366,11 +367,17 @@ void RFBridgeComponent::send_raw(const std::string &raw_code) {
 
   const B0FrameStatus status = b0_frame_status(frame);
   if (status == B0FrameStatus::MALFORMED) {
-    // Not merely uncompensatable -- unserializable. write_byte_str_ turns an
-    // unparseable nibble into 0 and drops a trailing odd one, so transmitting
-    // this frame would put timings on air that the caller never wrote, and a
-    // zeroed bucket is the 659 ms stuck carrier the floor exists to prevent.
-    // Dropping it is the only outcome that cannot occupy the band.
+    // Not merely uncompensatable -- unserializable. write_byte_str_ coerces an
+    // unparseable nibble to 0 and drops a trailing odd one, so transmitting
+    // this frame would put on air a code its author never wrote.
+    //
+    // The line drawn here is AUTHORSHIP, not safety: the serializer must not
+    // invent nibbles. It is deliberately not a ban on zero-length buckets -- a
+    // literal `0000` is valid hex and exactly what its author wrote, so it is
+    // accepted and, at the default offset where the floor does not run, still
+    // reaches the coprocessor as a 0. That residual is documented in
+    // HARDWARE.md caveat 2a; see B0FrameStatus for why closing it here would be
+    // over-strict.
     ESP_LOGW(TAG, "Refusing malformed B0 frame (non-hex, odd length, or truncated), nothing sent: %s",
              frame.c_str());
     return;

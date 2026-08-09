@@ -320,8 +320,9 @@ reason not to do it — they are reasons to do it with your eyes open.
 > **Default is `"0"`, which leaves every well-formed frame byte-identical** — an existing bridge
 > that does not set it transmits exactly the bytes it always did. The one exception is deliberate
 > and applies at every offset including `"0"`: a frame carrying the `AAB0` magic that is *not*
-> valid, even-length hex is now **dropped rather than transmitted**, because the serializer would
-> otherwise invent nibbles the author never wrote (see the malformed-frame note below).
+> valid, even-length hex — or is too short to carry the header that magic implies — is now
+> **dropped rather than transmitted**, because the serializer would otherwise invent nibbles the
+> author never wrote (see the malformed-frame note below).
 > **EFM8BB1 boards (R2 V1.0/V2.0) must leave it at
 > `"0"`**: they run stock Portisch, which already compensates, so a non-zero value there breaks
 > transmits that currently work.

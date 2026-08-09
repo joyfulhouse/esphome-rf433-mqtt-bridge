@@ -2157,6 +2157,21 @@ def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) 
           assert(b0_frame_status("aab0") == B0FrameStatus::MALFORMED);
           // Shorter than the magic itself cannot claim to be a B0 at all.
           assert(b0_frame_status("AAB") == B0FrameStatus::PASSTHROUGH);
+          // The magic is matched on SERIALIZED nibbles: an invalid 4th character
+          // is coerced to 0 by write_byte_str_, so these ARE AAB0 frames on the
+          // wire and must be judged as such. Judging characters instead let them
+          // through as "not a B0 frame" while the UART emitted AA B0 ... 00 00.
+          assert(b0_frame_status("AABZ050108ZZZZ0055") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AABG050108ZZZZ0055") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("aabZ050108ZZZZ0055") == B0FrameStatus::MALFORMED);
+          // ...and the coercion widens ONLY the 4th position. A non-hex byte
+          // coerces to 0, and 0 is neither 0xA nor 0xB, so the first three still
+          // demand A/a, A/a, B/b exactly -- this cannot over-match. In
+          // particular the B1 capture prefix keeps its old verdict.
+          assert(b0_frame_status("ZAB0050108011800CF") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AZB0050108011800CF") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAZ0050108011800CF") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAB1050108011800CF") == B0FrameStatus::PASSTHROUGH);
           // A literal zero bucket is valid hex, self-consistent, and exactly
           // what its author wrote, so it is COMPENSABLE rather than MALFORMED.
           // The MALFORMED line is authorship -- the serializer must not INVENT
@@ -2255,8 +2270,14 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     # sync/low/high timings that this knob does NOT correct and that nobody has
     # measured against issue #27. Keeping both out of the package keeps that
     # question academic.
+    # Both spellings. The trailing `(` matches only a lambda call, so the YAML
+    # action form (`- rf_bridge.send_code:`) slips past it -- a package that
+    # added the A5 action that way would ship an uncompensated, and per
+    # HARDWARE.md explicitly unmeasured, transmit with this guard still green.
     assert ".send_advanced_code(" not in package
     assert ".send_code(" not in package
+    assert "rf_bridge.send_advanced_code" not in package
+    assert "rf_bridge.send_code" not in package
 
     # Inside the component, the members that serialize a host-supplied hex STRING
     # are exactly these two. This does not cover raw byte writers: send_code
@@ -2339,10 +2360,21 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
           // header it implies. Length must NOT decide whether a frame is judged:
           // screening on size before the magic let these skip every check and
           // reach the coprocessor as a truncated fragment.
+          // The last three of the first group claim the AAB0 magic but are too
+          // short to carry the header it implies. The AABZ group is the one the
+          // classifier could not see at all: hex_nibble('Z') is -1, so the magic
+          // did not match and the frame was waved past every check as "not a B0
+          // frame" -- yet write_byte_str_ coerces Z to 0, so it reached the
+          // coprocessor as AA B0 05 01 08 00 00 00 55: a well-formed B0 frame
+          // carrying a ZERO bucket, and with it the ~659 ms stuck carrier. The
+          // magic is now matched on serialized nibbles, so what the classifier
+          // judges and what the UART emits cannot disagree.
           for (const uint16_t configured : {static_cast<uint16_t>(0), static_cast<uint16_t>(73)}) {
             for (const char *bad : {"AAB00501080118ZZ55", "AAB0050108ZZZZ0055",
                                     "AAB005ZZ0800000055", "AAB0050108011800555",
-                                    "AAB0Z", "AAB0", "AAB005"}) {
+                                    "AAB0Z", "AAB0", "AAB005",
+                                    "AABZ050108ZZZZ0055", "AABG050108ZZZZ0055",
+                                    "aabZ050108ZZZZ0055", "AAB_050108011800CF"}) {
               reset_warnings();
               ProbeBridge refused;
               refused.set_tx_bucket_offset_us(configured);
@@ -2379,6 +2411,21 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
               assert(padded_bridge.flush_count() == 1);
               assert(warnings_since_reset() == 0);
             }
+          }
+
+          // Nothing at all, and nothing but whitespace, must reach neither the
+          // UART nor a substr() with a npos offset -- that throws
+          // std::out_of_range, which on an ESP8266 build without exceptions is a
+          // device reset rather than a dropped frame.
+          // `send_raw(id(some_text).state)` on an empty or unavailable sensor is
+          // an ordinary way to get here.
+          for (const char *blank : {"", " ", "\t\r\n", "   "}) {
+            reset_warnings();
+            ProbeBridge empty_bridge;
+            empty_bridge.send_raw(blank);
+            assert(empty_bridge.serialized().empty());
+            // Not a B0 frame, so not refused -- just nothing to write.
+            assert(warnings_since_reset() == 0);
           }
 
           // Interior whitespace is NOT stripped, and that is deliberate: the
