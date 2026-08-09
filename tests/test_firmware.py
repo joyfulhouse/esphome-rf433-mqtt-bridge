@@ -2356,10 +2356,6 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
           // the serializer out of a frame the caller never wrote. Assert at the
           // wire, because every check above this point cannot see it.
           //
-          // The last three claim the AAB0 magic but are too short to carry the
-          // header it implies. Length must NOT decide whether a frame is judged:
-          // screening on size before the magic let these skip every check and
-          // reach the coprocessor as a truncated fragment.
           // The last three of the first group claim the AAB0 magic but are too
           // short to carry the header it implies. The AABZ group is the one the
           // classifier could not see at all: hex_nibble('Z') is -1, so the magic
