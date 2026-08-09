@@ -1871,92 +1871,71 @@ int main() {
 
 def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) -> None:
     """OB38S003 compensation: no-op at 0, exact subtraction above it, safe floor."""
-    compiler = shutil.which("c++")
-    if compiler is None:
-        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
-    source = tmp_path / "tx_bucket_offset.cpp"
-    binary = tmp_path / "tx_bucket_offset"
-    source.write_text(
+    _compile_and_run(
+        tmp_path,
         r"""
-#include <cassert>
-#include <cstdint>
-#include <string>
-#include "components/rf_bridge/rf_bridge_protocol.h"
+        #include <cassert>
+        #include <cstdint>
+        #include <string>
+        #include "components/rf_bridge/rf_bridge_protocol.h"
 
-using esphome::rf_bridge::b0_with_bucket_offset;
+        using esphome::rf_bridge::b0_with_bucket_offset;
 
-int main() {
-  // Production AOK frame: 4 buckets (5140, 620, 280, 5140 us) at hex chars
-  // 10..25, then 134 data nibbles, then the 55 trailer.
-  const std::string frame =
-      "AAB04D04081414026C01181414381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
-      "192929292A192A1A1A1A1A1A19292A1A1A1A1A1A1A1A1A1A1A1A192A1929292A1A19292A1A1A1A1955";
-  assert(frame.size() == 162);
+        int main() {
+          // Production AOK frame: 4 buckets (5140, 620, 280, 5140 us) at hex chars
+          // 10..25, then 134 data nibbles, then the 55 trailer.
+          const std::string frame =
+              "AAB04D04081414026C01181414381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+              "192929292A192A1A1A1A1A1A19292A1A1A1A1A1A1A1A1A1A1A1A192A1929292A1A19292A1A1A1A1955";
+          assert(frame.size() == 162);
 
-  // (a) The shipped default is a provable byte-for-byte no-op. Existing
-  // deployments must serialize exactly the bytes they always have -- including
-  // the safety floor, which must not "fix" a bucket while compensation is off.
-  assert(b0_with_bucket_offset(frame, 0) == frame);
-  assert(b0_with_bucket_offset("AAB005010800000055", 0) == "AAB005010800000055");
+          // (a) The shipped default is a provable byte-for-byte no-op. Existing
+          // deployments must serialize exactly the bytes they always have -- including
+          // the safety floor, which must not "fix" a bucket while compensation is off.
+          assert(b0_with_bucket_offset(frame, 0) == frame);
+          assert(b0_with_bucket_offset("AAB005010800000055", 0) == "AAB005010800000055");
 
-  // (b) A non-zero offset subtracts from EVERY bucket and touches nothing
-  // else: 5140-90=0x13BA, 620-90=0x0212, 280-90=0x00BE, 5140-90=0x13BA.
-  const std::string compensated = b0_with_bucket_offset(frame, 90);
-  assert(compensated.size() == frame.size());
-  assert(compensated.compare(10, 16, "13BA021200BE13BA") == 0);
-  // Header (AAB0, length byte, bucket count, embedded repeat) is verbatim...
-  assert(compensated.compare(0, 10, frame, 0, 10) == 0);
-  // ...as are every data nibble and the trailer beyond the bucket table.
-  assert(compensated.compare(26, std::string::npos, frame, 26, std::string::npos) == 0);
-  // Uppercase, zero-padded, four hex chars per bucket, exactly as the
-  // normalizer emits: 0x00BE must not collapse to "BE".
-  assert(compensated.find("00BE") == 18);
+          // (b) A non-zero offset subtracts from EVERY bucket and touches nothing
+          // else: 5140-90=0x13BA, 620-90=0x0212, 280-90=0x00BE, 5140-90=0x13BA.
+          const std::string compensated = b0_with_bucket_offset(frame, 90);
+          assert(compensated.size() == frame.size());
+          assert(compensated.compare(10, 16, "13BA021200BE13BA") == 0);
+          // Header (AAB0, length byte, bucket count, embedded repeat) is verbatim...
+          assert(compensated.compare(0, 10, frame, 0, 10) == 0);
+          // ...as are every data nibble and the trailer beyond the bucket table.
+          assert(compensated.compare(26, std::string::npos, frame, 26, std::string::npos) == 0);
+          // Uppercase, zero-padded, four hex chars per bucket, exactly as the
+          // normalizer emits: 0x00BE must not collapse to "BE".
+          assert(compensated.find("00BE") == 18);
 
-  // (c) Underflow can never emit a zero-or-negative bucket. The OB38S003
-  // Timer-1 ISR decrements before testing zero, so a 0 bucket wraps to 65,535
-  // intervals (~659 ms of stuck carrier). One bucket of 0 us, 1 data nibble.
-  const std::string zero_bucket = "AAB005010800000055";
-  assert(b0_with_bucket_offset(zero_bucket, 90) == "AAB005010800640055");  // 0 -> 100 us
-  // A bucket that would land below the floor is raised to it, not wrapped.
-  const std::string small_bucket = "AAB005010800640055";  // 100 us
-  assert(b0_with_bucket_offset(small_bucket, 90) == small_bucket);  // 10 -> 100 us
-  assert(b0_with_bucket_offset("AAB005010800C80055", 90) == "AAB0050108006E0055");  // 200 -> 110
-  // The maximum accepted offset still cannot drive any bucket to zero.
-  for (uint16_t offset = 1; offset <= 255; offset++) {
-    const std::string floored = b0_with_bucket_offset(zero_bucket, offset);
-    assert(floored.compare(10, 4, "0000") != 0);
-  }
+          // (c) Underflow can never emit a zero-or-negative bucket. The OB38S003
+          // Timer-1 ISR decrements before testing zero, so a 0 bucket wraps to 65,535
+          // intervals (~659 ms of stuck carrier). One bucket of 0 us, 1 data nibble.
+          const std::string zero_bucket = "AAB005010800000055";
+          assert(b0_with_bucket_offset(zero_bucket, 90) == "AAB005010800640055");  // 0 -> 100 us
+          // A bucket that would land below the floor is raised to it, not wrapped.
+          const std::string small_bucket = "AAB005010800640055";  // 100 us
+          assert(b0_with_bucket_offset(small_bucket, 90) == small_bucket);  // 10 -> 100 us
+          // 200 -> 110 us: a bucket clear of the floor is reduced exactly.
+          assert(b0_with_bucket_offset("AAB005010800C80055", 90) == "AAB0050108006E0055");
+          // The maximum accepted offset still cannot drive any bucket to zero.
+          for (uint16_t offset = 1; offset <= 255; offset++) {
+            const std::string floored = b0_with_bucket_offset(zero_bucket, offset);
+            assert(floored.compare(10, 4, "0000") != 0);
+          }
 
-  // Anything that is not a B0 bucket frame is passed through whole rather
-  // than partially rewritten: send_raw is a public ESPHome action.
-  assert(b0_with_bucket_offset("", 90).empty());
-  assert(b0_with_bucket_offset("AAA55", 90) == "AAA55");
-  assert(b0_with_bucket_offset("AAB0050108", 90) == "AAB0050108");  // declared table truncated
-  assert(b0_with_bucket_offset("AAB005ZZ0800000055", 90) == "AAB005ZZ0800000055");
-  assert(b0_with_bucket_offset("AAB0050108ZZZZ0055", 90) == "AAB0050108ZZZZ0055");
-  return 0;
-}
-"""
+          // Anything that is not a B0 bucket frame is passed through whole rather
+          // than partially rewritten: send_raw is a public ESPHome action.
+          assert(b0_with_bucket_offset("", 90).empty());
+          assert(b0_with_bucket_offset("AAA55", 90) == "AAA55");
+          // Declared bucket table runs past the end of the frame.
+          assert(b0_with_bucket_offset("AAB0050108", 90) == "AAB0050108");
+          assert(b0_with_bucket_offset("AAB005ZZ0800000055", 90) == "AAB005ZZ0800000055");
+          assert(b0_with_bucket_offset("AAB0050108ZZZZ0055", 90) == "AAB0050108ZZZZ0055");
+          return 0;
+        }
+        """,
     )
-    subprocess.run(
-        [
-            compiler,
-            "-std=c++17",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-I",
-            str(PROJECT_ROOT),
-            str(source),
-            "-o",
-            str(binary),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "TMPDIR": str(tmp_path)},
-    )
-    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
 def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path) -> None:
@@ -1967,77 +1946,54 @@ def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path)
     corruption fixed in field testing. The scheduler must keep dispatching, and
     accounting for, UNcompensated durations.
     """
-    compiler = shutil.which("c++")
-    if compiler is None:
-        pytest.skip("a C++ compiler is required for the native firmware scheduler test")
-    source = tmp_path / "tx_bucket_offset_airtime.cpp"
-    binary = tmp_path / "tx_bucket_offset_airtime"
-    source.write_text(
+    _compile_and_run(
+        tmp_path,
         r"""
-#include <cassert>
-#include <cstdint>
-#include <string>
-#include <vector>
-#include "components/rf_bridge/rf_bridge_protocol.h"
-#include "rf433_scheduler.h"
+        #include <cassert>
+        #include <cstdint>
+        #include <string>
+        #include <vector>
+        #include "components/rf_bridge/rf_bridge_protocol.h"
+        #include "rf433_scheduler.h"
 
-using esphome::rf_bridge::b0_with_bucket_offset;
-using rf433::TargetScheduler;
+        using esphome::rf_bridge::b0_with_bucket_offset;
+        using rf433::TargetScheduler;
 
-int main() {
-  const std::string frame =
-      "AAB04D04081414026C01181414381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
-      "192929292A192A1A1A1A1A1A19292A1A1A1A1A1A1A1A1A1A1A1A192A1929292A1A19292A1A1A1A1955";
-  std::string normalized;
-  std::string reason;
-  uint64_t airtime_us = 0;
-  assert(rf433::normalize_b0_with_airtime(frame, normalized, reason, airtime_us));
-  // Pinned to the frame's LITERAL bucket durations: 134 pulses drawn from
-  // 5140/620/280/5140 us buckets, times the embedded repeat of 8. Subtracting
-  // any offset inside the admission path moves this number, and moving it is
-  // exactly the change that must never happen.
-  assert(airtime_us == 560160);
+        int main() {
+          const std::string frame =
+              "AAB04D04081414026C01181414381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+              "192929292A192A1A1A1A1A1A19292A1A1A1A1A1A1A1A1A1A1A1A192A1929292A1A19292A1A1A1A1955";
+          std::string normalized;
+          std::string reason;
+          uint64_t airtime_us = 0;
+          assert(rf433::normalize_b0_with_airtime(frame, normalized, reason, airtime_us));
+          // Pinned to the frame's LITERAL bucket durations: 134 pulses drawn from
+          // 5140/620/280/5140 us buckets, times the embedded repeat of 8. Subtracting
+          // any offset inside the admission path moves this number, and moving it is
+          // exactly the change that must never happen.
+          assert(airtime_us == 560160);
 
-  // The scheduler dispatches the frame it admitted, byte for byte. The
-  // compensated bytes exist only past send_raw, so pacing keeps its
-  // conservative (longer) airtime estimate.
-  std::vector<std::string> displaced;
-  std::string started;
-  TargetScheduler sched(35);
-  assert(sched.schedule("c1", "a1b2c3:20:1", frame, "", 1, 0, "", 0, displaced, reason));
-  const auto raw = sched.next(0, started);
-  assert(raw && *raw == frame && started == "c1");
+          // The scheduler dispatches the frame it admitted, byte for byte. The
+          // compensated bytes exist only past send_raw, so pacing keeps its
+          // conservative (longer) airtime estimate.
+          std::vector<std::string> displaced;
+          std::string started;
+          TargetScheduler sched(35);
+          assert(sched.schedule("c1", "a1b2c3:20:1", frame, "", 1, 0, "", 0, displaced, reason));
+          const auto raw = sched.next(0, started);
+          assert(raw && *raw == frame && started == "c1");
 
-  // Had the offset been applied at admission instead, the airtime driving the
-  // RF pacing gate would have collapsed by offset * pulses * embedded repeat
-  // = 90 * 134 * 8 = 96,480 us, far past the 5 ms margin.
-  uint64_t compensated_airtime_us = 0;
-  assert(rf433::normalize_b0_with_airtime(b0_with_bucket_offset(frame, 90), normalized, reason,
-                                          compensated_airtime_us));
-  assert(compensated_airtime_us == 463680 && compensated_airtime_us + 96480 == airtime_us);
-  return 0;
-}
-"""
+          // Had the offset been applied at admission instead, the airtime driving the
+          // RF pacing gate would have collapsed by offset * pulses * embedded repeat
+          // = 90 * 134 * 8 = 96,480 us, far past the 5 ms margin.
+          uint64_t compensated_airtime_us = 0;
+          assert(rf433::normalize_b0_with_airtime(b0_with_bucket_offset(frame, 90), normalized,
+                                                  reason, compensated_airtime_us));
+          assert(compensated_airtime_us == 463680 && compensated_airtime_us + 96480 == airtime_us);
+          return 0;
+        }
+        """,
     )
-    subprocess.run(
-        [
-            compiler,
-            "-std=c++17",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-I",
-            str(PROJECT_ROOT),
-            str(source),
-            "-o",
-            str(binary),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "TMPDIR": str(tmp_path)},
-    )
-    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
 def test_native_send_raw_is_the_single_compensation_choke_point(tmp_path: Path) -> None:

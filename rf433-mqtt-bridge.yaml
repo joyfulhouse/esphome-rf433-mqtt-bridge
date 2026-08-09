@@ -95,9 +95,6 @@ uart:
 rf_bridge:
   id: portisch_rf_bridge
   uart_id: rf_uart
-  # Applied inside send_raw, the single UART choke point every transmit path
-  # reaches. Airtime accounting keeps using the UNcompensated durations on
-  # purpose, so RF pacing stays conservative.
   tx_bucket_offset_us: ${tx_bucket_offset_us}
   on_bucket_received:
     then:
