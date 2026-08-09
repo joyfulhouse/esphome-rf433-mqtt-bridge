@@ -23,6 +23,28 @@ SCHEDULER_HEADER = PROJECT_ROOT / "rf433_scheduler.h"
 BRIDGE_YAML = PROJECT_ROOT / "rf433-mqtt-bridge.yaml"
 
 
+def _without_comments(source: str) -> str:
+    """Strip C++ line and block comments, so a source pin tests code and not prose.
+
+    One leftmost alternation, never two sequential passes. `re.sub` scans
+    leftmost-first BY POSITION; alternation order only breaks ties at the same
+    offset. So at a `//` the line branch matches and consumes to end of line,
+    and an embedded `/*` never opens a block; at a `/*` the line branch cannot
+    match, so the block branch runs. That is exactly how a C++ lexer treats the
+    two token classes.
+
+    Stripping in two passes instead gets this wrong in both directions, because
+    a URL inside a block comment carries a `//`: the line pass eats from
+    `https://` through the closing `*/`, leaving an orphaned `/*`. With no later
+    `*/` the block pass then removes nothing and the prose before the URL
+    survives (a false GREEN -- the escape this pin exists to stop); with a later
+    `*/` the orphan pairs with it and swallows the real code in between (a false
+    RED on a comment-only edit). URLs in comments are established convention
+    here -- components/mqtt/ already carries them.
+    """
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
+
+
 def _firmware_lambda(section_start: str, section_end: str) -> str:
     """Extract a shipped ESPHome lambda for host execution."""
     package = BRIDGE_YAML.read_text()
@@ -2307,16 +2329,12 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     # what stops the next reader from "simplifying" a one-line lambda back into
     # place -- a change that would look obviously correct.
     component_sources = sorted(RF_BRIDGE_DIR.glob("*.h")) + sorted(RF_BRIDGE_DIR.glob("*.cpp"))
-    # (1) The serializer routes through the shared rule. Comments -- BOTH line
-    # and block -- are stripped first: a developer inlining the rule would
-    # naturally leave one naming it ("Inlined equivalent of serialized_nibble()
-    # ..."), which contains this very substring and satisfied the raw-body form
-    # of this assertion in either spelling. Line comments go first, so that an
-    # unterminated `/*` inside one cannot make the block pattern span forward
-    # and swallow the real call.
-    serializer_code = re.sub(r"//[^\n]*", "", members["write_byte_str_"])
-    serializer_code = re.sub(r"/\*.*?\*/", "", serializer_code, flags=re.DOTALL)
-    assert "serialized_nibble(" in serializer_code
+    # (1) The serializer routes through the shared rule. Comments are stripped
+    # first: a developer inlining the rule would naturally leave one naming it
+    # ("Inlined equivalent of serialized_nibble() ..."), which contains this
+    # very substring and satisfies the raw-body form of this assertion in
+    # either comment spelling.
+    assert "serialized_nibble(" in _without_comments(members["write_byte_str_"])
     # (2) No second copy of invalid-nibble-becomes-0 in its TERNARY shape.
     # Matched by shape, not by name: the reverted form is an anonymous lambda
     # that can be called anything, so pinning the identifier alone would miss it.
@@ -2327,10 +2345,20 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     ] == ["rf_bridge_protocol.h"]
     # (3) The classifier's magic comparison calls the same function, so a frame
     # whose SERIALIZED bytes open AA B0 is judged whatever characters spelled it.
+    # Comment-stripped for the same reason as (1), and it is the same escape: a
+    # character-judging rewrite (`frame.compare(0, 4, "AAB0")`) carrying a
+    # comment like "same rule as serialized_nibble()" satisfies the presence
+    # check from prose AND the absence check genuinely, passing under the very
+    # mutation this names. Unlike (1) the classifier is also backstopped
+    # behaviorally -- b0_frame_status("AABZ...") == MALFORMED and its siblings
+    # fail under any such rewrite -- so here the pin is defense in depth, where
+    # for the serializer it is the only line.
     protocol = (RF_BRIDGE_DIR / "rf_bridge_protocol.h").read_text()
-    magic_check = protocol.split("inline B0FrameStatus b0_frame_status(", maxsplit=1)[1].split(
-        "return B0FrameStatus::PASSTHROUGH;", maxsplit=1
-    )[0]
+    magic_check = _without_comments(
+        protocol.split("inline B0FrameStatus b0_frame_status(", maxsplit=1)[1].split(
+            "return B0FrameStatus::PASSTHROUGH;", maxsplit=1
+        )[0]
+    )
     assert "serialized_nibble(" in magic_check
     assert "hex_nibble(" not in magic_check
     # (4) Exactly one definition carrying that signature, so a same-signature
