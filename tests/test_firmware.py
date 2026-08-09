@@ -2307,11 +2307,15 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     # what stops the next reader from "simplifying" a one-line lambda back into
     # place -- a change that would look obviously correct.
     component_sources = sorted(RF_BRIDGE_DIR.glob("*.h")) + sorted(RF_BRIDGE_DIR.glob("*.cpp"))
-    # (1) The serializer routes through the shared rule.
-    assert "serialized_nibble(" in members["write_byte_str_"]
-    # (2) Neither path re-implements invalid-nibble-becomes-0 locally. Matched by
-    # SHAPE, not by name: the reverted form is an anonymous lambda that can be
-    # called anything, so pinning the identifier alone would miss it.
+    # (1) The serializer routes through the shared rule. Comments are stripped
+    # first: a developer inlining the rule would naturally leave one naming it
+    # ("// Inlined equivalent of serialized_nibble() ..."), which contains this
+    # very substring and satisfied the raw-body form of this assertion.
+    serializer_code = re.sub(r"//[^\n]*", "", members["write_byte_str_"])
+    assert "serialized_nibble(" in serializer_code
+    # (2) No second copy of invalid-nibble-becomes-0 in its TERNARY shape.
+    # Matched by shape, not by name: the reverted form is an anonymous lambda
+    # that can be called anything, so pinning the identifier alone would miss it.
     assert [
         path.name
         for path in component_sources
@@ -2325,7 +2329,16 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     )[0]
     assert "serialized_nibble(" in magic_check
     assert "hex_nibble(" not in magic_check
-    # (4) The shared rule is defined exactly once, so no second copy can appear.
+    # (4) Exactly one definition carrying that signature, so a same-signature
+    # duplicate cannot appear.
+    #
+    # What these four do NOT enforce, so nobody over-trusts them: a
+    # differently-named private copy written as an `if` rather than a ternary
+    # evades both (2) and (4). Inside write_byte_str_ it is still caught, by
+    # (1) -- the real call disappears when it is inlined. Elsewhere in the
+    # component it is not caught. The scan is components/rf_bridge/*.{h,cpp};
+    # rf433_scheduler.h is out of scope (no UART write path, and normalize_b0
+    # rejects bad input rather than coercing it, so it cannot host this bug).
     assert [
         path.name for path in component_sources if "serialized_nibble(char" in path.read_text()
     ] == ["rf_bridge_protocol.h"]
