@@ -56,10 +56,15 @@ CONF_TX_BUCKET_OFFSET_US = "tx_bucket_offset_us"
 
 # Microseconds subtracted from every bucket of an outbound B0 frame to
 # compensate the OB38S003 port's long transmit timing (upstream
-# mightymos/RF-Bridge-OB38S003#27). Off by default; field-observed error spans
-# 30-90 us, so the range is bounded well above any plausible value rather than
-# left open to a substitution typo that would gut every bucket.
-MAX_TX_BUCKET_OFFSET_US = 255
+# mightymos/RF-Bridge-OB38S003#27). Off by default.
+#
+# The cap is ~1.3x the highest figure anyone has reported (90 us on pulses),
+# not the uint16 the wire could carry. The shortest real AOK bucket is 280 us
+# and compensated buckets are floored at 100 us, so from 181 us upward that
+# bucket stops encoding its captured duration and the frame silently ceases to
+# carry the code. A value that far out is a substitution typo, not a tuning
+# choice, and config validation is the cheapest place to catch it.
+MAX_TX_BUCKET_OFFSET_US = 120
 
 CONFIG_SCHEMA = cv.All(
     cv.Schema(

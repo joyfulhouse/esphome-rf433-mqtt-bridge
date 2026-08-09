@@ -191,7 +191,7 @@ payloads. All topics live under the fixed `rf433/` root.
 | Topic | Direction | Payload |
 |---|---|---|
 | `rf433/<bridge_id>/availability` | bridge → broker (QoS 0, retained) | `online` / `offline` |
-| `rf433/<bridge_id>/info` | bridge → broker (QoS 0, retained) | `{"bridge":"rf433-bridge","area":"living_room","default":false,"boot":2718281828,"listen":false,"v":3}` |
+| `rf433/<bridge_id>/info` | bridge → broker (QoS 0, retained) | `{"bridge":"rf433-bridge","area":"living_room","default":false,"boot":2718281828,"listen":false,"hw":"efm8bb1-portisch","tx_offset_us":0,"v":3}` |
 | `rf433/<bridge_id>/tx` | controller → bridge (QoS 1, non-retained) | JSON transmit command (below) |
 | `rf433/<bridge_id>/status` | bridge → controller (QoS 1, non-retained) | `{"status","command_id"[,"reason"][,"age_ms"][,"t"][,"boot"]}` |
 | `rf433/<bridge_id>/rx` | bridge → broker (QoS 1, non-retained) | `{"frame":"AAB1...55","t":123456,"boot":2718281828}` |
@@ -328,7 +328,10 @@ The additional MQTT surface is:
   instant (`displacement = t - age_ms`) — except when the terminal state was reached by `disarm`,
   which has no such instant and so omits them.
 - Retained `/info` advertises `boot`, `listen`, and `v` (`2` for this contract), allowing a controller
-  to discover which bridges participate without waiting for traffic.
+  to discover which bridges participate without waiting for traffic. It also carries two additive
+  inventory fields: `hw`, the RF coprocessor variant tag, and `tx_offset_us`, the microseconds this
+  bridge subtracts from every outbound bucket (`0` on a stock build — see
+  [HARDWARE.md → caveat 2a](HARDWARE.md#alternate-path--r2-v22-with-the-ob38s003-radio)).
 - Publish `{"action":"disarm","command_id":"move:42"}` to `/cmd` to cancel every future scheduled
   frame for that command. It emits no RF. The bridge acknowledges every valid request, including an
   already-unknown id, with `{"status":"disarmed","command_id":"move:42","t":123456,"boot":2718281828}`

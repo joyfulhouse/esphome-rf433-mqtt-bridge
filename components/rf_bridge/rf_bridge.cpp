@@ -279,6 +279,11 @@ void RFBridgeComponent::learn() {
 
 void RFBridgeComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "RF_Bridge:");
+  // Printed unconditionally, including the 0 default. Double-compensation --
+  // hand-tuned codes plus a non-zero offset -- is silent on air and silent in
+  // MQTT, so the boot log has to be somewhere the effective value can be read
+  // off a running bridge without recovering the YAML that built it.
+  ESP_LOGCONFIG(TAG, "  TX bucket offset: %u us", static_cast<unsigned>(this->tx_bucket_offset_us_));
   this->check_uart_settings(19200);
 }
 
@@ -310,16 +315,33 @@ void RFBridgeComponent::start_bucket_sniffing() {
 void RFBridgeComponent::send_raw(const std::string &raw_code) {
   ESP_LOGD(TAG, "Sending Raw Code: %s", raw_code.c_str());
 
-  // The single transmit choke point: scheduler dispatch, the OTA
-  // wait-for-idle pump, and the fail-safe STOP drain all reach the UART
+  // The only path carrying host-supplied bucket timings: scheduler dispatch,
+  // the OTA wait-for-idle pump, and the fail-safe STOP drain all reach the UART
   // through here, so OB38S003 bucket compensation is applied once, at the last
-  // moment before serialization, and no transmit path can bypass it. The
-  // default offset of 0 skips it entirely -- a default build runs exactly the
-  // code it always did and writes exactly the bytes it always wrote.
+  // moment before serialization. (send_code/0xA5 and send_advanced_code/0xA8
+  // are separate registered actions that write their own frames; their timings
+  // come from the coprocessor's protocol table, not from a bucket table, so
+  // there is nothing here to compensate.) The default offset of 0 skips it
+  // entirely -- a default build runs exactly the code it always did and writes
+  // exactly the bytes it always wrote.
   if (this->tx_bucket_offset_us_ == 0) {
     this->write_byte_str_(raw_code);
   } else {
-    this->write_byte_str_(b0_with_bucket_offset(raw_code, this->tx_bucket_offset_us_));
+    size_t clamped_buckets = 0;
+    const std::string compensated =
+        b0_with_bucket_offset(raw_code, this->tx_bucket_offset_us_, &clamped_buckets);
+    if (clamped_buckets != 0) {
+      // The floor keeps the coprocessor off a 659 ms stuck carrier, but a
+      // floored bucket no longer carries the captured duration: the frame goes
+      // out and encodes something the receiver was never taught. Silent is the
+      // one thing that must not happen, so say it once per send.
+      ESP_LOGW(TAG,
+               "tx_bucket_offset_us=%u floored %u bucket(s) at %u us; this frame no longer encodes "
+               "its captured timing -- lower the offset",
+               static_cast<unsigned>(this->tx_bucket_offset_us_),
+               static_cast<unsigned>(clamped_buckets), static_cast<unsigned>(B0_MIN_BUCKET_US));
+    }
+    this->write_byte_str_(compensated);
   }
   this->flush();
 }
