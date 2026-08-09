@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
 import textwrap
 from pathlib import Path
 
-import pytest
+from tests._native import compile_and_run, write_rf_bridge_stubs
 
 PROJECT_ROOT = Path(__file__).parents[1]
 BRIDGE_YAML = PROJECT_ROOT / "rf433-mqtt-bridge.yaml"
@@ -16,208 +13,6 @@ RX_HEADER = PROJECT_ROOT / "rf433_rx.h"
 RF_BRIDGE_DIR = PROJECT_ROOT / "components" / "rf_bridge"
 RF_BRIDGE_PROTOCOL = RF_BRIDGE_DIR / "rf_bridge_protocol.h"
 TX_SEND_PATHS = 3
-
-
-def _compile_and_run(tmp_path: Path, source_text: str) -> None:
-    """Compile and execute one dependency-free C++17 firmware unit."""
-    compiler = shutil.which("c++")
-    if compiler is None:
-        pytest.skip("a host C++ compiler is required")
-    source = tmp_path / "test.cpp"
-    binary = tmp_path / "test"
-    source.write_text(textwrap.dedent(source_text))
-    subprocess.run(
-        [
-            compiler,
-            "-std=c++17",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-I",
-            str(tmp_path),
-            "-I",
-            str(PROJECT_ROOT),
-            str(source),
-            "-o",
-            str(binary),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "TMPDIR": str(tmp_path)},
-    )
-    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
-
-
-def _write_rf_bridge_stubs(tmp_path: Path) -> None:
-    """Provide the small ESPHome surface needed to host-test the vendored parser."""
-    stubs = {
-        "esphome/core/component.h": r"""
-            #pragma once
-
-            #include <functional>
-            #include <string>
-            #include <utility>
-            #include <vector>
-
-            namespace esphome {
-
-            class Component {
-             public:
-              virtual ~Component() = default;
-              virtual void setup() {}
-              virtual void loop() {}
-              virtual void dump_config() {}
-            };
-
-            template<typename Signature> class CallbackManager;
-
-            template<typename... Args> class CallbackManager<void(Args...)> {
-             public:
-              template<typename F> void add(F &&callback) {
-                this->callbacks_.emplace_back(std::forward<F>(callback));
-              }
-
-              void call(Args... args) {
-                for (auto &callback : this->callbacks_)
-                  callback(args...);
-              }
-
-             private:
-              std::vector<std::function<void(Args...)>> callbacks_;
-            };
-
-            }  // namespace esphome
-        """,
-        "esphome/components/uart/uart.h": r"""
-            #pragma once
-
-            #include <algorithm>
-            #include <cstddef>
-            #include <cstdint>
-            #include <deque>
-            #include <vector>
-
-            namespace esphome::uart {
-
-            class UARTDevice {
-             public:
-              size_t available() const { return this->input_.size(); }
-
-              bool read_array(uint8_t *buffer, size_t length) {
-                if (length > this->input_.size())
-                  return false;
-                for (size_t index = 0; index < length; index++) {
-                  buffer[index] = this->input_.front();
-                  this->input_.pop_front();
-                }
-                return true;
-              }
-
-              void write(uint8_t byte) { this->output_.push_back(byte); }
-              void flush() {}
-              void check_uart_settings(uint32_t) {}
-
-              void feed_uart(const std::vector<uint8_t> &bytes) {
-                this->input_.insert(this->input_.end(), bytes.begin(), bytes.end());
-              }
-
-              const std::vector<uint8_t> &written_bytes() const { return this->output_; }
-
-             private:
-              std::deque<uint8_t> input_;
-              std::vector<uint8_t> output_;
-            };
-
-            }  // namespace esphome::uart
-        """,
-        "esphome/core/automation.h": r"""
-            #pragma once
-
-            namespace esphome {
-
-            template<typename... Ts> class Action {
-             public:
-              virtual ~Action() = default;
-            };
-
-            template<typename T> class TemplatableValue {
-             public:
-              template<typename... Ts> T value(const Ts &...) const { return T{}; }
-            };
-
-            }  // namespace esphome
-
-            #define TEMPLATABLE_VALUE(type, name) \
-              ::esphome::TemplatableValue<type> name##_;
-        """,
-        "esphome/core/application.h": r"""
-            #pragma once
-
-            #include <cstdint>
-
-            namespace esphome {
-
-            class Application {
-             public:
-              uint32_t get_loop_component_start_time() const { return this->now_ms_; }
-              void set_loop_component_start_time(uint32_t now_ms) { this->now_ms_ = now_ms; }
-
-             private:
-              uint32_t now_ms_{0};
-            };
-
-            inline Application App;
-
-            }  // namespace esphome
-        """,
-        "esphome/core/helpers.h": r"""
-            #pragma once
-
-            #include <cstddef>
-            #include <cstdio>
-
-            namespace esphome {
-
-            template<typename... Args>
-            void buf_append_printf(char *buffer, size_t buffer_size, size_t offset,
-                                   const char *format, Args... args) {
-              if (offset < buffer_size)
-                std::snprintf(buffer + offset, buffer_size - offset, format, args...);
-            }
-
-            }  // namespace esphome
-        """,
-        "esphome/core/log.h": r"""
-            #pragma once
-
-            #include <utility>
-
-            namespace esphome {
-
-            template<typename... Args>
-            void host_test_log(const char *, const char *, Args &&...) {}
-
-            }  // namespace esphome
-
-            #define ESP_LOGD(tag, format, ...) \
-              ::esphome::host_test_log(tag, format, ##__VA_ARGS__)
-            #define ESP_LOGI(tag, format, ...) \
-              ::esphome::host_test_log(tag, format, ##__VA_ARGS__)
-            #define ESP_LOGV(tag, format, ...) \
-              ::esphome::host_test_log(tag, format, ##__VA_ARGS__)
-            #define ESP_LOGVV(tag, format, ...) \
-              ::esphome::host_test_log(tag, format, ##__VA_ARGS__)
-            #define ESP_LOGW(tag, format, ...) \
-              ::esphome::host_test_log(tag, format, ##__VA_ARGS__)
-            #define ESP_LOGCONFIG(tag, format, ...) \
-              ::esphome::host_test_log(tag, format, ##__VA_ARGS__)
-        """,
-    }
-    for relative_path, contents in stubs.items():
-        stub = tmp_path / relative_path
-        stub.parent.mkdir(parents=True, exist_ok=True)
-        stub.write_text(textwrap.dedent(contents))
 
 
 def _firmware_lambda(section_start: str, section_end: str) -> str:
@@ -240,7 +35,7 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
     tmp_path: Path,
 ) -> None:
     """The shipped callback follows physical RX state and cannot enter TX."""
-    _write_rf_bridge_stubs(tmp_path)
+    write_rf_bridge_stubs(tmp_path)
     rx_lambda = _firmware_lambda("on_bucket_received:", "\n\n# The per-bridge scheduler")
     source = (
         r"""
@@ -402,7 +197,7 @@ def test_generated_rx_callback_publishes_only_during_sniff_without_tx(
         }
         """
     )
-    _compile_and_run(tmp_path, source)
+    compile_and_run(tmp_path, source)
 
 
 def test_generated_cmd_handler_delegates_sniff_and_disarms_without_tx(
@@ -636,14 +431,14 @@ def test_generated_cmd_handler_delegates_sniff_and_disarms_without_tx(
         }
         """
     )
-    _compile_and_run(tmp_path, source)
+    compile_and_run(tmp_path, source)
 
 
 def test_b1_parser_uses_aok_envelope_offsets_and_preserves_interior_stop_bytes(
     tmp_path: Path,
 ) -> None:
     """Only an envelope-valid stop at a declared AOK offset ends a B1 capture."""
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -765,8 +560,8 @@ def test_b1_parser_accepts_oem_truncated_trailer_capture(tmp_path: Path) -> None
     64-pair frames and a lone trailer 1-bit remain rejected: neither occurs on
     air.
     """
-    _write_rf_bridge_stubs(tmp_path)
-    _compile_and_run(
+    write_rf_bridge_stubs(tmp_path)
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -852,8 +647,8 @@ def test_vendored_parser_never_acks_received_frames_and_bounds_advanced(tmp_path
     on rf433-bridge-office (2026-07-17): the first delivered ambient capture
     plus its ACK ended bucket mode until the next TX cycle re-armed it.
     """
-    _write_rf_bridge_stubs(tmp_path)
-    _compile_and_run(
+    write_rf_bridge_stubs(tmp_path)
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -991,7 +786,7 @@ def test_vendored_parser_never_acks_received_frames_and_bounds_advanced(tmp_path
 
 def test_sniff_state_caps_rate_limits_expires_and_wraps(tmp_path: Path) -> None:
     """The bounded state accepts only sniff and emits one expiry transition."""
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -1067,7 +862,7 @@ def test_rx_state_keeps_bounded_deadline_across_radio_preemption(
     tmp_path: Path,
 ) -> None:
     """Bounded intent expires independently of physical bucket mode."""
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -1141,7 +936,7 @@ def test_rx_state_wants_sniff_truth_table_and_cancel_preserves_radio(
     tmp_path: Path,
 ) -> None:
     """Idle listen and bounded intent combine without implicit radio edges."""
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -1195,7 +990,7 @@ def test_rx_state_keepalive_rearms_only_while_radio_armed(tmp_path: Path) -> Non
     sniffing). A periodic idempotent B1 bounds that deafness to one keepalive
     period.
     """
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>

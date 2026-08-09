@@ -601,7 +601,14 @@ interval:
                        // non-zero offset) is invisible on air and invisible in
                        // `started`: this is the only place a fleet-wide audit
                        // can see which bridges are correcting and by how much.
-                       root["tx_offset_us"] = ${tx_bucket_offset_us};
+                       //
+                       // Read back from the component, never spliced from
+                       // ${tx_bucket_offset_us}: a substitution is textual, so
+                       // "073" validates as decimal 73 and then compiles as
+                       // OCTAL 59 here while the wire still uses 73, and "08"
+                       // would not compile at all.
+                       root["tx_offset_us"] =
+                           id(portisch_rf_bridge).get_tx_bucket_offset_us();
                        root["v"] = 3;
                      }, 0, true)) {
             id(next_info_ms) = now_ms + 60000;

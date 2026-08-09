@@ -10,6 +10,12 @@ namespace esphome::rf_bridge {
 
 static const char *const TAG = "rf_bridge";
 
+// Quiet window for the floored-bucket warning after its first occurrence. The
+// condition never changes within a build, so repeating it per repeat, per
+// trailer, and per fail-safe STOP adds no information -- only UART time inside
+// the dispatch loop and MQTT-republished log traffic.
+static constexpr uint32_t CLAMP_LOG_INTERVAL_MS = 60000;
+
 void RFBridgeComponent::finish_bucket_capture_(bool publish) {
   // Never ACK a delivery. Portisch's capture path is fire-and-forget (it
   // clears RF_DATA_STATUS and re-enables the receive interrupt immediately
@@ -312,37 +318,70 @@ void RFBridgeComponent::start_bucket_sniffing() {
   this->flush();
 }
 
-void RFBridgeComponent::send_raw(const std::string &raw_code) {
-  ESP_LOGD(TAG, "Sending Raw Code: %s", raw_code.c_str());
+bool RFBridgeComponent::clamp_log_due_(uint32_t now_ms) {
+  // Plain unsigned subtraction, matching rf433_inbound_guard.h: elapsed wraps
+  // modulo 2^32 exactly like the clock it came from, so a rollover between
+  // calls still yields the true (small) elapsed duration.
+  if (this->clamp_logged_ && (now_ms - this->last_clamp_log_ms_) < CLAMP_LOG_INTERVAL_MS)
+    return false;
+  this->clamp_logged_ = true;
+  this->last_clamp_log_ms_ = now_ms;
+  return true;
+}
 
-  // The only path carrying host-supplied bucket timings: scheduler dispatch,
+void RFBridgeComponent::send_raw(const std::string &raw_code) {
+  // The only path carrying host-supplied BUCKET timings: scheduler dispatch,
   // the OTA wait-for-idle pump, and the fail-safe STOP drain all reach the UART
   // through here, so OB38S003 bucket compensation is applied once, at the last
-  // moment before serialization. (send_code/0xA5 and send_advanced_code/0xA8
-  // are separate registered actions that write their own frames; their timings
-  // come from the coprocessor's protocol table, not from a bucket table, so
-  // there is nothing here to compensate.) The default offset of 0 skips it
-  // entirely -- a default build runs exactly the code it always did and writes
-  // exactly the bytes it always wrote.
-  if (this->tx_bucket_offset_us_ == 0) {
-    this->write_byte_str_(raw_code);
-  } else {
-    size_t clamped_buckets = 0;
-    const std::string compensated =
-        b0_with_bucket_offset(raw_code, this->tx_bucket_offset_us_, &clamped_buckets);
-    if (clamped_buckets != 0) {
-      // The floor keeps the coprocessor off a 659 ms stuck carrier, but a
-      // floored bucket no longer carries the captured duration: the frame goes
-      // out and encodes something the receiver was never taught. Silent is the
-      // one thing that must not happen, so say it once per send.
-      ESP_LOGW(TAG,
-               "tx_bucket_offset_us=%u floored %u bucket(s) at %u us; this frame no longer encodes "
-               "its captured timing -- lower the offset",
-               static_cast<unsigned>(this->tx_bucket_offset_us_),
-               static_cast<unsigned>(clamped_buckets), static_cast<unsigned>(B0_MIN_BUCKET_US));
-    }
-    this->write_byte_str_(compensated);
+  // moment before serialization.
+  //
+  // The two other registered transmit actions write their own frames and do not
+  // pass through here. send_advanced_code (0xA8) carries a protocol ID, so the
+  // coprocessor generates its edges from its own protocol table and there is
+  // nothing host-supplied to compensate. send_code (0xA5) is NOT in that
+  // position: its sync/low/high fields are host-supplied timings straight from
+  // YAML, and whether they suffer issue #27 the way bucket timings do has not
+  // been measured. This knob does not touch them either way.
+  const B0FrameStatus status = b0_frame_status(raw_code);
+  if (status == B0FrameStatus::MALFORMED) {
+    // Not merely uncompensatable -- unserializable. write_byte_str_ turns an
+    // unparseable nibble into 0 and drops a trailing odd one, so transmitting
+    // this frame would put timings on air that the caller never wrote, and a
+    // zeroed bucket is the 659 ms stuck carrier the floor exists to prevent.
+    // Dropping it is the only outcome that cannot occupy the band.
+    ESP_LOGW(TAG, "Refusing malformed B0 frame (non-hex or odd length), nothing sent: %s",
+             raw_code.c_str());
+    return;
   }
+  // A default build, and any frame this pass cannot compensate, writes exactly
+  // the bytes it always wrote.
+  if (this->tx_bucket_offset_us_ == 0 || status != B0FrameStatus::COMPENSABLE) {
+    ESP_LOGD(TAG, "Sending Raw Code: %s", raw_code.c_str());
+    this->write_byte_str_(raw_code);
+    this->flush();
+    return;
+  }
+
+  size_t clamped_buckets = 0;
+  const std::string compensated =
+      b0_with_bucket_offset(raw_code, this->tx_bucket_offset_us_, &clamped_buckets);
+  // Log what reaches the coprocessor, not what the caller handed us: the bucket
+  // table differs, and a lowercase input comes back mixed-case.
+  ESP_LOGD(TAG, "Sending Raw Code: %s", compensated.c_str());
+  // The floor keeps the coprocessor off a 659 ms stuck carrier, but a floored
+  // bucket no longer carries the captured duration: the frame goes out encoding
+  // something the receiver was never taught. Silent is the one thing that must
+  // not happen. Throttled because the condition is deterministic -- it fires on
+  // every repeat of every dispatch or on none of them -- and this loop paces
+  // against a 5 ms RF margin with warnings republished over MQTT.
+  if (clamped_buckets != 0 && this->clamp_log_due_(App.get_loop_component_start_time())) {
+    ESP_LOGW(TAG,
+             "tx_bucket_offset_us=%u floored %u bucket(s) at %u us; this frame no longer encodes "
+             "its captured timing -- lower the offset",
+             static_cast<unsigned>(this->tx_bucket_offset_us_),
+             static_cast<unsigned>(clamped_buckets), static_cast<unsigned>(B0_MIN_BUCKET_US));
+  }
+  this->write_byte_str_(compensated);
   this->flush();
 }
 

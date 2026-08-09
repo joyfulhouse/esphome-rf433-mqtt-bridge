@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import textwrap
@@ -11,26 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_rx_firmware import _compile_and_run, _write_rf_bridge_stubs
+from tests._native import (
+    RF_BRIDGE_DIR,
+    compile_and_run,
+    rf_bridge_member_bodies,
+    write_rf_bridge_stubs,
+)
 
 PROJECT_ROOT = Path(__file__).parents[1]
 SCHEDULER_HEADER = PROJECT_ROOT / "rf433_scheduler.h"
 BRIDGE_YAML = PROJECT_ROOT / "rf433-mqtt-bridge.yaml"
-RF_BRIDGE_DIR = PROJECT_ROOT / "components" / "rf_bridge"
-RF_BRIDGE_CPP = RF_BRIDGE_DIR / "rf_bridge.cpp"
-
-
-def _rf_bridge_member_bodies() -> dict[str, str]:
-    """Split rf_bridge.cpp into one source slice per RFBridgeComponent member."""
-    source = RF_BRIDGE_CPP.read_text()
-    definitions = list(
-        re.finditer(r"^\w[\w:<>*& ]*\bRFBridgeComponent::(\w+)\(", source, re.MULTILINE)
-    )
-    starts = [match.start() for match in definitions] + [len(source)]
-    return {
-        match.group(1): source[starts[index] : starts[index + 1]]
-        for index, match in enumerate(definitions)
-    }
 
 
 def _firmware_lambda(section_start: str, section_end: str) -> str:
@@ -46,10 +35,11 @@ def _firmware_lambda(section_start: str, section_end: str) -> str:
         "${hardware_variant}": "test-hw",
         "${listen_enabled}": "false",
         "${repeat_gap_ms}": "35",
-        # Deliberately neither the shipped default nor a plausible tuning value,
-        # so an assertion on it can only pass if the substitution really reached
-        # the payload.
-        "${tx_bucket_offset_us}": "77",
+        # A tripwire, not a value the shipped lambdas read. Substitutions are
+        # textual: "073" passes cv.int_range as decimal 73 and then compiles as
+        # OCTAL 59. Any payload that goes back to splicing this into C++ reports
+        # 59 while the component -- and the wire -- use 73.
+        "${tx_bucket_offset_us}": "073",
     }
     for key, value in substitutions.items():
         body = body.replace(key, value)
@@ -1456,11 +1446,17 @@ struct FakeMqtt {
 struct FakeBridge {
   std::vector<std::string> sent;
   bool sniffing{false};
+  // The component owns the effective offset. /info must read it back through
+  // this getter: the substitution feeding the same value into the component
+  // config is spelled "073" in this harness, so any payload built by splicing
+  // that text into C++ reports octal 59 instead.
+  uint16_t tx_bucket_offset_us{73};
 
   void send_raw(const std::string &raw) { this->sent.push_back(raw); }
   void start_bucket_sniffing() { this->sniffing = true; }
   void stop_advanced_sniffing() { this->sniffing = false; }
   bool receive_idle() const { return true; }
+  uint16_t get_tx_bucket_offset_us() const { return this->tx_bucket_offset_us; }
 } portisch_rf_bridge;
 
 uint32_t fake_now_ms{0};
@@ -1580,7 +1576,11 @@ int main() {
       // So is tx_offset_us, the effective bucket compensation. Double
       // compensation is silent on air and silent in `started`; the retained
       // payload is where a fleet can see which bridges are correcting.
-      assert(message.payload.at("tx_offset_us") == "77");
+      //
+      // 73, read back from the component. The substitution that configured it
+      // is spelled "073", so a payload built by splicing that text would say
+      // 59 -- advertising a correction the bridge is not applying.
+      assert(message.payload.at("tx_offset_us") == "73");
       saw_info = true;
     }
   }
@@ -1635,8 +1635,12 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     # The accepted range stops at ~1.3x the highest reported error, not at the
     # uint16 the wire could carry: from 181 us upward the shortest real AOK
     # bucket (280 us) hits the 100 us floor and the emitted frame silently stops
-    # encoding the code, with `started` still firing on every send.
-    assert "MAX_TX_BUCKET_OFFSET_US = 120" in (RF_BRIDGE_DIR / "__init__.py").read_text()
+    # encoding the code, with `started` still firing on every send. Pin the
+    # constant AND its use -- a schema that hardcodes its own max would leave the
+    # constant defined, documented, and enforcing nothing.
+    component_python = (RF_BRIDGE_DIR / "__init__.py").read_text()
+    assert "MAX_TX_BUCKET_OFFSET_US = 120" in component_python
+    assert "max=MAX_TX_BUCKET_OFFSET_US" in component_python
     assert "TargetScheduler" in scheduler
     assert "rf433::tx_scheduler" in package
     assert 'x["command_id"]' in package
@@ -1909,6 +1913,14 @@ def test_native_shared_hex_digits_is_one_object_across_translation_units(
     entities in different TUs -- ill-formed, no diagnostic required
     ([basic.def.odr]/12). No compiler reports it, so the only way to hold the
     fix is to link two TUs and compare the address each one sees.
+
+    That comparison is only meaningful on a toolchain that keeps two identical
+    read-only arrays apart, which is not guaranteed -- constant merging or
+    identical-data folding would make the `static` spelling pass too. Each unit
+    therefore also carries SHADOW_HEX_DIGITS, a deliberately per-TU copy holding
+    the same bytes, and the binary asserts those two addresses DIFFER. On a
+    merging toolchain that control fails, so this test goes red rather than
+    quietly proving nothing.
     """
     compiler = shutil.which("c++")
     if compiler is None:
@@ -1918,12 +1930,20 @@ def test_native_shared_hex_digits_is_one_object_across_translation_units(
 #include <vector>
 #include "components/rf_bridge/rf_bridge_protocol.h"
 
+// The control: exactly what `static constexpr` in the header would produce --
+// one internal-linkage copy per translation unit, same bytes in each.
+namespace {
+constexpr char SHADOW_HEX_DIGITS[] = "0123456789ABCDEF";
+}  // namespace
+
 // Odr-use the table exactly as the header's own inline functions do.
 const void *hex_digits_seen_by_%(name)s() {
   return esphome::rf_bridge::compact_hex(std::vector<uint8_t>{0xAB}) == "AB"
              ? static_cast<const void *>(esphome::rf_bridge::HEX_DIGITS)
              : nullptr;
 }
+
+const void *shadow_seen_by_%(name)s() { return SHADOW_HEX_DIGITS; }
 """
     (tmp_path / "unit_one.cpp").write_text(unit % {"name": "one"})
     (tmp_path / "unit_two.cpp").write_text(
@@ -1932,8 +1952,14 @@ const void *hex_digits_seen_by_%(name)s() {
 #include <cassert>
 
 const void *hex_digits_seen_by_one();
+const void *shadow_seen_by_one();
 
 int main() {
+  // Control first: if the toolchain merges identical read-only arrays, the
+  // assertion below cannot distinguish `inline` from `static` and the whole
+  // test is vacuous. Fail here instead.
+  assert(shadow_seen_by_one() != shadow_seen_by_two());
+
   assert(hex_digits_seen_by_one() != nullptr);
   assert(hex_digits_seen_by_one() == hex_digits_seen_by_two());
   return 0;
@@ -1965,7 +1991,7 @@ int main() {
 
 def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) -> None:
     """OB38S003 compensation: no-op at 0, exact subtraction above it, safe floor."""
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -2021,29 +2047,31 @@ def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) 
           //   duration == offset + 99 -> 99 us  -> floored, reported (last one caught)
           //   duration == offset + 100-> 100 us -> emitted exactly, NOT reported
           //   duration  = 280 us      -> 207 us -> emitted exactly, NOT reported
+          // The last two run at MAX_TX_BUCKET_OFFSET_US, where the floor reaches
+          // highest: 220 us is the shortest bucket the largest accepted offset
+          // leaves intact, and even there a 0 us bucket comes out at 100, never 0.
           struct FloorCase {
             const char *frame;
+            uint16_t offset_us;
             const char *expected;
             size_t clamped;
           };
           const FloorCase cases[] = {
-              {"AAB005010800000055", "AAB005010800640055", 1},  // 0 us   -> 100 us
-              {"AAB005010800490055", "AAB005010800640055", 1},  // 73 us  -> 100 us
-              {"AAB0050108004A0055", "AAB005010800640055", 1},  // 74 us  -> 100 us
-              {"AAB005010800AC0055", "AAB005010800640055", 1},  // 172 us -> 100 us
-              {"AAB005010800AD0055", "AAB005010800640055", 0},  // 173 us -> 100 us exactly
-              {"AAB005010801180055", "AAB005010800CF0055", 0},  // 280 us -> 207 us
+              {"AAB005010800000055", offset, "AAB005010800640055", 1},  // 0 us   -> 100 us
+              {"AAB005010800490055", offset, "AAB005010800640055", 1},  // 73 us  -> 100 us
+              {"AAB0050108004A0055", offset, "AAB005010800640055", 1},  // 74 us  -> 100 us
+              {"AAB005010800AC0055", offset, "AAB005010800640055", 1},  // 172 us -> 100 us
+              {"AAB005010800AD0055", offset, "AAB005010800640055", 0},  // 173 us -> 100 exactly
+              {"AAB005010801180055", offset, "AAB005010800CF0055", 0},  // 280 us -> 207 us
+              {"AAB005010800DC0055", 120, "AAB005010800640055", 0},     // 220 us -> 100 exactly
+              {"AAB005010800000055", 120, "AAB005010800640055", 1},     // 0 us   -> 100 us
           };
           for (const FloorCase &floor_case : cases) {
             size_t floored_buckets = 99;
-            assert(b0_with_bucket_offset(floor_case.frame, offset, &floored_buckets) ==
-                   floor_case.expected);
+            assert(b0_with_bucket_offset(floor_case.frame, floor_case.offset_us,
+                                         &floored_buckets) == floor_case.expected);
             assert(floored_buckets == floor_case.clamped);
           }
-          // No offset config accepts can drive a bucket to zero, not even one that
-          // arrives at zero: MAX_TX_BUCKET_OFFSET_US is 120.
-          for (uint16_t sweep = 1; sweep <= 120; sweep++)
-            assert(b0_with_bucket_offset("AAB005010800000055", sweep).compare(10, 4, "0000") != 0);
 
           // (d) Lowercase is the same frame on the wire. hex_nibble accepts lowercase
           // everywhere else, so an uppercase-only magic test would ship a
@@ -2051,9 +2079,9 @@ def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) 
           // table takes the normalizer's uppercase; the rest is copied as authored.
           assert(b0_with_bucket_offset("aab005010801180055", offset) == "aab005010800CF0055");
 
-          // (e) Anything that is not a self-consistent, fully-hex B0 bucket frame is
-          // passed through whole rather than partially rewritten: send_raw is a
-          // public ESPHome action reachable from any user lambda.
+          // (e) Anything that is not a self-consistent, fully-hex B0 bucket frame
+          // comes back unchanged rather than partially rewritten. An unchanged
+          // return is NOT a verdict that the frame is safe to send -- see (g).
           assert(b0_with_bucket_offset("", offset).empty());
           assert(b0_with_bucket_offset("AAA55", offset) == "AAA55");
           // An A8 advanced-code frame of exactly the same length, and otherwise
@@ -2091,6 +2119,34 @@ def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) 
           // check rejects the inconsistency and not the shape.
           assert(b0_with_bucket_offset(honest, offset) ==
                  "AAB011010800CF0808080808080808080808080855");
+
+          // (g) The classification send_raw acts on. "Unchanged" above covers two
+          // very different verdicts, and only this distinguishes them: a
+          // PASSTHROUGH frame is serialized as written, a MALFORMED one must not
+          // reach the UART at all -- write_byte_str_ turns `ZZ` into 00, which is
+          // the zero bucket and its 659 ms stuck carrier.
+          using esphome::rf_bridge::b0_frame_status;
+          using esphome::rf_bridge::B0FrameStatus;
+          assert(b0_frame_status(frame) == B0FrameStatus::COMPENSABLE);
+          assert(b0_frame_status("aab005010801180055") == B0FrameStatus::COMPENSABLE);
+          assert(b0_frame_status(honest) == B0FrameStatus::COMPENSABLE);
+          // Not a B0 frame: not ours to judge, and A5/A8/sniff strings must keep
+          // transmitting exactly as they always have.
+          assert(b0_frame_status("") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAA55") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAA805010801180055") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAA8ZZ01080118ZZ55") == B0FrameStatus::PASSTHROUGH);
+          // A B0 frame whose declared shape does not add up: uncompensatable, but
+          // every character still serializes to the byte the caller wrote.
+          assert(b0_frame_status(wrong_length) == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status(over_declared) == B0FrameStatus::PASSTHROUGH);
+          // A B0 frame the serializer would silently alter.
+          assert(b0_frame_status("AAB005ZZ0800000055") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AAB0050108ZZZZ0055") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AAB00501080118ZZ55") == B0FrameStatus::MALFORMED);
+          // Odd length: write_byte_str_ walks in pairs and drops the last nibble,
+          // so the coprocessor would receive a truncated frame.
+          assert(b0_frame_status("AAB0050108011800555") == B0FrameStatus::MALFORMED);
           return 0;
         }
         """,
@@ -2105,7 +2161,7 @@ def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path)
     corruption fixed in field testing. The scheduler must keep dispatching, and
     accounting for, UNcompensated durations.
     """
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -2168,37 +2224,43 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     host-supplied hex are exactly the two expected names.
     """
     package = BRIDGE_YAML.read_text()
-    members = _rf_bridge_member_bodies()
+    members = rf_bridge_member_bodies()
 
-    # Scheduler dispatch, the fail-safe STOP drain, and the OTA wait-for-idle
-    # pump -- every transmit the package performs, all on the one component.
-    shipped_transmits = 3
-    assert package.count(".send_raw(") == shipped_transmits
-    assert package.count("id(portisch_rf_bridge).send_raw(") == shipped_transmits
-    # The two registered actions that write to the UART without passing through
-    # send_raw are unused here. They carry no host-supplied bucket table -- their
-    # timings come from the coprocessor's protocol table -- so they are outside
-    # compensation by construction, not by oversight.
-    assert "rf_bridge.send_code" not in package
-    assert "rf_bridge.send_advanced_code" not in package
+    # The invariant is the equality, not the count: a fourth transmit is fine as
+    # long as it is also a send_raw on the one compensated component. Scheduler
+    # dispatch, the fail-safe STOP drain, and the OTA wait-for-idle pump are
+    # today's three.
+    assert package.count(".send_raw(") == package.count("id(portisch_rf_bridge).send_raw(") > 0
+    # The two other registered transmit actions are unused here. Matched as
+    # lambda calls -- `id(...)` ends in `)`, so the dotted YAML action spelling
+    # would never appear. send_advanced_code (0xA8) carries a protocol ID and has
+    # no host timings to compensate; send_code (0xA5) carries host-supplied
+    # sync/low/high timings that this knob does NOT correct and that nobody has
+    # measured against issue #27. Keeping both out of the package keeps that
+    # question academic.
+    assert ".send_advanced_code(" not in package
+    assert ".send_code(" not in package
 
-    # Inside the component, the members that serialize host-supplied hex are
-    # exactly those two. A new transmit helper that writes hex without going
-    # through send_raw fails here rather than shipping uncompensated.
+    # Inside the component, the members that serialize a host-supplied hex STRING
+    # are exactly these two. This does not cover raw byte writers: send_code
+    # assembles its frame with bare this->write(...) calls and would pass this
+    # guard, which is why the package-level assertions above matter.
     assert sorted(name for name, body in members.items() if "this->write_byte_str_(" in body) == [
         "send_advanced_code",
         "send_raw",
     ]
     assert "b0_with_bucket_offset(" in members["send_raw"]
     assert "b0_with_bucket_offset(" not in members["send_advanced_code"]
-    # A floored bucket changes what the frame encodes; send_raw says so.
-    assert "ESP_LOGW(" in members["send_raw"]
     # The effective offset is readable off a running bridge, so the silent
     # double-compensation trap has one place it stops being silent.
     assert "TX bucket offset" in members["dump_config"]
+    # /info reads the same value from the component instead of splicing the
+    # substitution text into the payload lambda, where "073" would compile as 59.
+    assert "id(portisch_rf_bridge).get_tx_bucket_offset_us()" in package
+    assert 'root["tx_offset_us"] = ${tx_bucket_offset_us}' not in package
 
-    _write_rf_bridge_stubs(tmp_path)
-    _compile_and_run(
+    write_rf_bridge_stubs(tmp_path)
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -2217,6 +2279,12 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
             return esphome::rf_bridge::compact_hex(this->written_bytes());
           }
         };
+
+        static size_t warnings_since_reset() {
+          return esphome::host_test_warnings().size();
+        }
+
+        static void reset_warnings() { esphome::host_test_warnings().clear(); }
 
         int main() {
           const std::string frame = "AAB005010801180055";
@@ -2239,6 +2307,67 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
           zeroed.set_tx_bucket_offset_us(0);
           zeroed.send_raw(frame);
           assert(zeroed.serialized() == frame);
+
+          // A malformed B0 frame reaches the UART as NOTHING. Returning it
+          // unchanged is not enough: write_byte_str_ turns `ZZ` into 00, which is
+          // the zero bucket and its ~659 ms of stuck carrier -- manufactured by
+          // the serializer out of a frame the caller never wrote. Assert at the
+          // wire, because every check above this point cannot see it.
+          for (const uint16_t configured : {static_cast<uint16_t>(0), static_cast<uint16_t>(73)}) {
+            for (const char *bad : {"AAB00501080118ZZ55", "AAB0050108ZZZZ0055",
+                                    "AAB005ZZ0800000055", "AAB0050108011800555"}) {
+              reset_warnings();
+              ProbeBridge refused;
+              refused.set_tx_bucket_offset_us(configured);
+              refused.send_raw(bad);
+              assert(refused.serialized().empty());
+              // Dropped frames are never silent.
+              assert(warnings_since_reset() == 1);
+            }
+          }
+
+          // Frames without the AAB0 magic are not ours to judge and still
+          // transmit exactly as written, bad hex and all.
+          reset_warnings();
+          ProbeBridge advanced;
+          advanced.set_tx_bucket_offset_us(73);
+          advanced.send_raw("AAA805010801180055");
+          assert(advanced.serialized() == "AAA805010801180055");
+          assert(warnings_since_reset() == 0);
+
+          // The floored-bucket warning fires on behavior, not on the presence of
+          // an ESP_LOGW in the source: a frame that clamps warns, an identical
+          // send that does not clamp stays quiet.
+          reset_warnings();
+          ProbeBridge quiet;
+          quiet.set_tx_bucket_offset_us(73);
+          quiet.send_raw(frame);  // 280 -> 207 us, clear of the floor
+          assert(quiet.serialized() == "AAB005010800CF0055");
+          assert(warnings_since_reset() == 0);
+
+          reset_warnings();
+          esphome::App.set_loop_component_start_time(1000);
+          ProbeBridge clamping;
+          clamping.set_tx_bucket_offset_us(73);
+          clamping.send_raw("AAB005010800000055");  // 0 -> floored to 100 us
+          assert(clamping.serialized() == "AAB005010800640055");
+          assert(warnings_since_reset() == 1);
+
+          // Throttled: send_raw runs once per repeat, per trailer, and per
+          // fail-safe STOP, inside a loop pacing against a 5 ms RF margin, and the
+          // condition is a property of the configured offset -- it cannot change
+          // between repeats. First occurrence, then at most once a minute.
+          for (uint32_t elapsed_ms = 1; elapsed_ms < 60000; elapsed_ms += 12345) {
+            esphome::App.set_loop_component_start_time(1000 + elapsed_ms);
+            clamping.send_raw("AAB005010800000055");
+          }
+          assert(warnings_since_reset() == 1);
+          esphome::App.set_loop_component_start_time(1000 + 60000);
+          clamping.send_raw("AAB005010800000055");
+          assert(warnings_since_reset() == 2);
+          // Every one of those sends still reached the wire: the warning is
+          // throttled, the transmit is not.
+          assert(clamping.serialized().size() == 18U * (2U + 5U));
           return 0;
         }
         """,
