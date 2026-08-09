@@ -317,8 +317,12 @@ reason not to do it — they are reasons to do it with your eyes open.
 >   tx_bucket_offset_us: "73"   # OB38S003 / R2 V2.2 boards ONLY; see "Finding the value"
 > ```
 >
-> **Default is `"0"`, which is a byte-for-byte no-op** — an existing bridge that does not set it
-> transmits exactly the bytes it always did. **EFM8BB1 boards (R2 V1.0/V2.0) must leave it at
+> **Default is `"0"`, which leaves every well-formed frame byte-identical** — an existing bridge
+> that does not set it transmits exactly the bytes it always did. The one exception is deliberate
+> and applies at every offset including `"0"`: a frame carrying the `AAB0` magic that is *not*
+> valid, even-length hex is now **dropped rather than transmitted**, because the serializer would
+> otherwise invent nibbles the author never wrote (see the malformed-frame note below).
+> **EFM8BB1 boards (R2 V1.0/V2.0) must leave it at
 > `"0"`**: they run stock Portisch, which already compensates, so a non-zero value there breaks
 > transmits that currently work.
 >
@@ -336,10 +340,13 @@ reason not to do it — they are reasons to do it with your eyes open.
 > > `/info` as `tx_offset_us` and printed at boot as `TX bucket offset`; those are the only places
 > > it is visible, and they tell you what the bridge is doing, not what your codes already assume.
 >
-> **Finding the value.** The residual is V-shaped in the offset: too small and every edge is still
-> long, too large and every edge is short. Its minimum is the **mean of the pulse and gap errors**,
-> `(pulse_error + gap_error) / 2` — with the measured +90/+56 split that is **73 µs**, and the
-> ±17 µs residual above is what remains there. Start from your board's mean if you have measured
+> **Finding the value.** What is V-shaped is the **worst edge**, not every edge. Below 56 µs both
+> roles are still long and above 90 µs both are short, but *between* them the two move in opposite
+> directions at once — one role long while the other is already short — so no offset makes every
+> edge better than the last. The quantity worth minimizing is therefore the larger of the two
+> errors, `max(|90 − offset|, |56 − offset|)`, and that minimax lands on the **mean of the pulse
+> and gap errors**, `(pulse_error + gap_error) / 2` — with the measured +90/+56 split, **73 µs**,
+> where the ±17 µs residual above is what remains. Start from your board's mean if you have measured
 > one, otherwise from 73, and search a **small range around it** rather than climbing toward the
 > pulse-only figure of 90; silicon, supply, and temperature all move it, so treat it as per-board.
 > The package accepts `0`–`120`, roughly 1.3× the highest number anyone has reported.
@@ -377,13 +384,26 @@ reason not to do it — they are reasons to do it with your eyes open.
 >   working or broken.
 >
 > **A malformed `B0` frame is dropped, not transmitted.** If a frame carries the `AAB0` magic but
-> contains a non-hex character or an odd number of characters, the bridge refuses it and logs a
-> warning; nothing reaches the coprocessor. The serializer would otherwise turn an unparseable
-> nibble into `0` — manufacturing exactly the zero-length bucket, and the 659 ms stuck carrier,
-> that the floor above exists to prevent. This check runs whatever `tx_bucket_offset_us` is set to,
-> including `"0"`. It is a serialization check, not a frame validator: frames without the `AAB0`
-> magic are not judged at all, and a `B0` frame whose bucket is a legitimate `0000` in valid hex is
-> not malformed — only the floor would raise that one, and only when compensation is on.
+> is not valid, even-length hex — or is too short to carry the header that magic implies — the
+> bridge refuses it and logs a warning; nothing reaches the coprocessor. The serializer would
+> otherwise turn an unparseable nibble into `0` and truncate an odd one, putting timings on air
+> that the author never wrote. This check runs whatever `tx_bucket_offset_us` is set to, including
+> `"0"`. Leading and trailing whitespace is trimmed first, so a frame read out of a text sensor
+> keeps working with its newline attached; whitespace *inside* a frame is refused, because
+> `AAB0 05…` gives no honest reading of where the nibbles begin.
+>
+> **What that check is, and is not.** The line it draws is **authorship**: the serializer must not
+> invent nibbles. It is not a ban on zero-length buckets, and it does not close the stuck-carrier
+> hazard in general. A frame whose bucket is a literal `0000` is valid hex, self-consistent, and
+> exactly what its author wrote, so it is accepted — and at the default `"0"`, where the 100 µs
+> floor does not run, it reaches the coprocessor as a `0` and can hold the carrier for ~659 ms.
+> **Nothing in this package prevents that**, and it is unchanged from every prior release.
+>
+> It is left open on purpose. A declared bucket need never be *referenced* by a data nibble (the
+> scheduler rejects references *above* `bucket_count`, not unused entries below it), so an
+> over-sized, zero-filled bucket table is legal, is admitted today, and never reaches the air.
+> Refusing every frame containing a zero bucket would drop those too. If you hand-write `B0`
+> frames, the responsibility for not encoding a zero-length bucket is yours.
 >
 > This is **compile-time**, not runtime-settable: changing it needs `esphome run` (recompile plus
 > OTA), so budget a flash per trial value. It applies only to the bucket table — data nibbles,

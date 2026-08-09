@@ -34,7 +34,8 @@ substitutions:
   # emitted verbatim into the generated JSON/C++ string carrying "hw", so a `\`
   # or `"` would malform that literal.
   hardware_variant: efm8bb1-portisch
-  # OFF by default ("0" is a byte-for-byte no-op) and for OB38S003 / R2 V2.2
+  # OFF by default ("0" leaves every well-formed frame byte-identical; a
+  # malformed AAB0 frame is dropped at any offset) and for OB38S003 / R2 V2.2
   # boards ONLY: microseconds subtracted from every bucket of an outbound B0
   # frame to compensate that firmware's long transmit timing (upstream
   # mightymos/RF-Bridge-OB38S003#27). EFM8BB1 boards run stock Portisch, which

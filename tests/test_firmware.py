@@ -2016,9 +2016,10 @@ def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) 
               "192929292A192A1A1A1A1A1A19292A1A1A1A1A1A1A1A1A1A1A1A192A1929292A1A19292A1A1A1A1955";
           assert(frame.size() == 162);
 
-          // (a) The shipped default is a provable byte-for-byte no-op. Existing
-          // deployments must serialize exactly the bytes they always have -- including
-          // the safety floor, which must not "fix" a bucket while compensation is off.
+          // (a) At the shipped default this rewrite is a provable byte-for-byte
+          // no-op -- including the safety floor, which must not "fix" a bucket while
+          // compensation is off. (Whether the frame is then SENT is send_raw's call:
+          // it drops a MALFORMED frame at every offset. See the choke-point test.)
           assert(b0_with_bucket_offset(frame, 0) == frame);
           assert(b0_with_bucket_offset("AAB005010800000055", 0) == "AAB005010800000055");
 
@@ -2147,6 +2148,22 @@ def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) 
           // Odd length: write_byte_str_ walks in pairs and drops the last nibble,
           // so the coprocessor would receive a truncated frame.
           assert(b0_frame_status("AAB0050108011800555") == B0FrameStatus::MALFORMED);
+          // Claims the magic but is too short to carry the header that magic
+          // implies. Only the magic may decide whether a frame is ours to judge:
+          // screening on length first let these reach the UART as fragments.
+          assert(b0_frame_status("AAB0Z") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AAB0") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AAB005") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("aab0") == B0FrameStatus::MALFORMED);
+          // Shorter than the magic itself cannot claim to be a B0 at all.
+          assert(b0_frame_status("AAB") == B0FrameStatus::PASSTHROUGH);
+          // A literal zero bucket is valid hex, self-consistent, and exactly
+          // what its author wrote, so it is COMPENSABLE rather than MALFORMED.
+          // The MALFORMED line is authorship -- the serializer must not INVENT
+          // nibbles -- not a ban on zero buckets. At the default offset this
+          // frame still reaches the wire as a 0; see the residual documented in
+          // HARDWARE.md caveat 2a.
+          assert(b0_frame_status("AAB005010800000055") == B0FrameStatus::COMPENSABLE);
           return 0;
         }
         """,
@@ -2293,6 +2310,10 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
           ProbeBridge plain;
           plain.send_raw(frame);
           assert(plain.serialized() == frame);
+          // A frame that IS sent hands the UART off exactly once. This is the
+          // live counterexample that keeps the flush_count() == 0 assertions on
+          // the refusal paths below from being vacuously true.
+          assert(plain.flush_count() == 1);
 
           // Configured build: 280 - 73 = 207 = 0x00CF reaches the wire, and
           // nothing outside the bucket table moves.
@@ -2313,18 +2334,63 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
           // the zero bucket and its ~659 ms of stuck carrier -- manufactured by
           // the serializer out of a frame the caller never wrote. Assert at the
           // wire, because every check above this point cannot see it.
+          //
+          // The last three claim the AAB0 magic but are too short to carry the
+          // header it implies. Length must NOT decide whether a frame is judged:
+          // screening on size before the magic let these skip every check and
+          // reach the coprocessor as a truncated fragment.
           for (const uint16_t configured : {static_cast<uint16_t>(0), static_cast<uint16_t>(73)}) {
             for (const char *bad : {"AAB00501080118ZZ55", "AAB0050108ZZZZ0055",
-                                    "AAB005ZZ0800000055", "AAB0050108011800555"}) {
+                                    "AAB005ZZ0800000055", "AAB0050108011800555",
+                                    "AAB0Z", "AAB0", "AAB005"}) {
               reset_warnings();
               ProbeBridge refused;
               refused.set_tx_bucket_offset_us(configured);
               refused.send_raw(bad);
               assert(refused.serialized().empty());
+              // Not merely "wrote no bytes": a refusal must not touch the UART
+              // at all, so it never reaches the flush either.
+              assert(refused.flush_count() == 0);
               // Dropped frames are never silent.
               assert(warnings_since_reset() == 1);
             }
           }
+
+          // Surrounding whitespace must not cost a transmit. An ESPHome lambda
+          // that reads a frame out of a text sensor or a template gets the
+          // trailing newline for free; write_byte_str_'s pair-at-a-time loop
+          // used to ignore an odd trailing character, so these transmitted
+          // correctly before this component enforced parity. Byte-identical to
+          // the untrimmed frame on both the default and the compensated path.
+          for (const uint16_t configured : {static_cast<uint16_t>(0), static_cast<uint16_t>(73)}) {
+            const std::string expected =
+                configured == 0 ? frame : std::string("AAB005010800CF0055");
+            for (const std::string &padded : {frame + "\n", frame + " ", frame + "\r\n",
+                                              "\n" + frame, "  " + frame + "\t\r\n"}) {
+              reset_warnings();
+              ProbeBridge padded_bridge;
+              padded_bridge.set_tx_bucket_offset_us(configured);
+              padded_bridge.send_raw(padded);
+              // The TRIMMED frame is what is serialized: the stray bytes reach
+              // neither the classifier nor the UART. A \r\n pair is even-length
+              // and fully "hex" to nobody -- untrimmed it would append a
+              // serializer-invented 0x00 byte.
+              assert(padded_bridge.serialized() == expected);
+              assert(padded_bridge.flush_count() == 1);
+              assert(warnings_since_reset() == 0);
+            }
+          }
+
+          // Interior whitespace is NOT stripped, and that is deliberate: the
+          // frame claims the B0 magic, so it is judged, and " " is not hex.
+          // There is no honest reading of where the caller's nibbles begin, so
+          // it is refused rather than silently re-packed.
+          reset_warnings();
+          ProbeBridge interior;
+          interior.send_raw("AAB0 5010801180055");
+          assert(interior.serialized().empty());
+          assert(interior.flush_count() == 0);
+          assert(warnings_since_reset() == 1);
 
           // Frames without the AAB0 magic are not ours to judge and still
           // transmit exactly as written, bad hex and all.

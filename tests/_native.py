@@ -132,7 +132,11 @@ def write_rf_bridge_stubs(tmp_path: Path) -> None:
               }
 
               void write(uint8_t byte) { this->output_.push_back(byte); }
-              void flush() {}
+              // Counted, not ignored: "wrote nothing" and "wrote nothing AND
+              // did not block the UART draining it" are different claims, and a
+              // refusal path that returned after flushing would satisfy only
+              // the first. Tests assert on both.
+              void flush() { this->flushes_++; }
               void check_uart_settings(uint32_t) {}
 
               void feed_uart(const std::vector<uint8_t> &bytes) {
@@ -141,9 +145,12 @@ def write_rf_bridge_stubs(tmp_path: Path) -> None:
 
               const std::vector<uint8_t> &written_bytes() const { return this->output_; }
 
+              size_t flush_count() const { return this->flushes_; }
+
              private:
               std::deque<uint8_t> input_;
               std::vector<uint8_t> output_;
+              size_t flushes_{0};
             };
 
             }  // namespace esphome::uart

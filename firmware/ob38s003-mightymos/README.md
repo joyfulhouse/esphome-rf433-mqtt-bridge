@@ -86,7 +86,7 @@ HARDWARE.md; summarised here so this directory is self-contained.
 
 | Issue | Effect | Handling |
 |---|---|---|
-| [#27](https://github.com/mightymos/RF-Bridge-OB38S003/issues/27) (open) | Transmitted `B0` bucket timings run long on air — roughly **+30 µs** per bucket measured with a Flipper Zero, and **+76 µs** measured against a calibrated RTL-SDR (that same RTL-SDR measurement resolves per edge into **+90 µs on pulses, +56 µs on gaps**). The port dropped Portisch's per-bucket startup-delay compensation, does a 16-bit division *after* asserting the RF edge (~38–40 µs charged to the pulse already on air), and reloads Timer-1 one interval long — an error that is **additive** rather than proportional to bucket length, but not identical on every edge | **Re-capture every code on the V2.2 board itself**; codes captured on an EFM8BB1 Portisch bridge may not replay. Then pick **one** correction, never both: hand-tune the bucket values yourself, **or** leave them untouched and set the package's `tx_bucket_offset_us` substitution (**default `"0"`, a byte-for-byte no-op**) — see the notes below the table. |
+| [#27](https://github.com/mightymos/RF-Bridge-OB38S003/issues/27) (open) | Transmitted `B0` bucket timings run long on air — roughly **+30 µs** per bucket measured with a Flipper Zero, and **+76 µs** measured against a calibrated RTL-SDR (that same RTL-SDR measurement resolves per edge into **+90 µs on pulses, +56 µs on gaps**). The port dropped Portisch's per-bucket startup-delay compensation, does a 16-bit division *after* asserting the RF edge (~38–40 µs charged to the pulse already on air), and reloads Timer-1 one interval long — an error that is **additive** rather than proportional to bucket length, but not identical on every edge | **Re-capture every code on the V2.2 board itself**; codes captured on an EFM8BB1 Portisch bridge may not replay. Then pick **one** correction, never both: hand-tune the bucket values yourself, **or** leave them untouched and set the package's `tx_bucket_offset_us` substitution (**default `"0"`, byte-identical for every well-formed frame**) — see the notes below the table. |
 | [#19](https://github.com/mightymos/RF-Bridge-OB38S003/issues/19) (open) | After ~24–48 h the radio MCU's **receive** path stops decoding codes. Transmit and the ESP8285/Wi-Fi keep working normally, and restarting the ESP does not clear it | Reset the radio MCU on a schedule (`AA FE 55`) or power-cycle the board; there is no firmware fix. Alarm on missing **inbound** traffic — availability stays `online` throughout. |
 | No stock image published | Stock OB38S003 firmware is read-protected and is destroyed by the `erase` that unprotects the chip | There is nothing to roll back to. Unlike the EFM8BB1 path, no vendor original `.hex` exists. |
 
@@ -106,9 +106,11 @@ host-side value removes that residual.
 That is `tx_bucket_offset_us`, a package substitution documented in
 [HARDWARE.md → caveat 2a](../../HARDWARE.md#alternate-path--r2-v22-with-the-ob38s003-radio):
 
-- **Default `"0"`, opt-in, and a byte-for-byte no-op** — a bridge that does not set it emits
-  exactly the bytes it always did. EFM8BB1 boards must leave it at `"0"`; stock Portisch already
-  compensates.
+- **Default `"0"`, opt-in, and byte-identical for every well-formed frame** — a bridge that does
+  not set it emits exactly the bytes it always did. EFM8BB1 boards must leave it at `"0"`; stock
+  Portisch already compensates. One deliberate exception applies at every offset including `"0"`:
+  a frame carrying the `AAB0` magic that is not valid, even-length hex is dropped rather than
+  transmitted, because the serializer would otherwise invent nibbles the author never wrote.
 - **It replaces hand-tuning; it does not follow it.** These are two ways to apply the same
   correction, so pick one. If you already subtracted the overshoot from your bucket values, this
   knob subtracts it a second time, the buckets fall as far short of the receiver's window as they

@@ -342,29 +342,52 @@ void RFBridgeComponent::send_raw(const std::string &raw_code) {
   // position: its sync/low/high fields are host-supplied timings straight from
   // YAML, and whether they suffer issue #27 the way bucket timings do has not
   // been measured. This knob does not touch them either way.
-  const B0FrameStatus status = b0_frame_status(raw_code);
+  //
+  // Trim surrounding whitespace before anything looks at the frame. Reading a
+  // frame out of a text sensor or a template hands the lambda a trailing
+  // newline for free, and write_byte_str_'s pair-at-a-time loop used to ignore
+  // an odd trailing character, so such a frame transmitted correctly until this
+  // component started enforcing parity. Everything below -- classification AND
+  // both serialization paths -- uses `frame`, so the trailing bytes cannot
+  // reach the UART either. Interior whitespace is deliberately NOT stripped: it
+  // fails the hex check and is refused, because `AAB0 05` gives no honest
+  // reading of where the caller's nibbles begin.
+  size_t begin = raw_code.find_first_not_of(B0_TRIM_CHARS);
+  size_t end = 0;
+  if (begin == std::string::npos)
+    begin = 0;
+  else
+    end = raw_code.find_last_not_of(B0_TRIM_CHARS) + 1U;
+  // Bind rather than copy when there is nothing to trim: send_raw runs once per
+  // repeat of every dispatch, and the default path must not start allocating.
+  const bool trimmed = begin != 0U || end != raw_code.size();
+  const std::string trimmed_frame = trimmed ? raw_code.substr(begin, end - begin) : std::string();
+  const std::string &frame = trimmed ? trimmed_frame : raw_code;
+
+  const B0FrameStatus status = b0_frame_status(frame);
   if (status == B0FrameStatus::MALFORMED) {
     // Not merely uncompensatable -- unserializable. write_byte_str_ turns an
     // unparseable nibble into 0 and drops a trailing odd one, so transmitting
     // this frame would put timings on air that the caller never wrote, and a
     // zeroed bucket is the 659 ms stuck carrier the floor exists to prevent.
     // Dropping it is the only outcome that cannot occupy the band.
-    ESP_LOGW(TAG, "Refusing malformed B0 frame (non-hex or odd length), nothing sent: %s",
-             raw_code.c_str());
+    ESP_LOGW(TAG, "Refusing malformed B0 frame (non-hex, odd length, or truncated), nothing sent: %s",
+             frame.c_str());
     return;
   }
   // A default build, and any frame this pass cannot compensate, writes exactly
-  // the bytes it always wrote.
+  // the bytes it always wrote -- for every frame that reaches here, which is
+  // every well-formed one. MALFORMED already returned above.
   if (this->tx_bucket_offset_us_ == 0 || status != B0FrameStatus::COMPENSABLE) {
-    ESP_LOGD(TAG, "Sending Raw Code: %s", raw_code.c_str());
-    this->write_byte_str_(raw_code);
+    ESP_LOGD(TAG, "Sending Raw Code: %s", frame.c_str());
+    this->write_byte_str_(frame);
     this->flush();
     return;
   }
 
   size_t clamped_buckets = 0;
   const std::string compensated =
-      b0_with_bucket_offset(raw_code, this->tx_bucket_offset_us_, &clamped_buckets);
+      b0_with_bucket_offset(frame, this->tx_bucket_offset_us_, &clamped_buckets);
   // Log what reaches the coprocessor, not what the caller handed us: the bucket
   // table differs, and a lowercase input comes back mixed-case.
   ESP_LOGD(TAG, "Sending Raw Code: %s", compensated.c_str());
