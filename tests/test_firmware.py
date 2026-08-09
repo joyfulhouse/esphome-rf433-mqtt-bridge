@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import textwrap
@@ -2289,6 +2290,46 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     ]
     assert "b0_with_bucket_offset(" in members["send_raw"]
     assert "b0_with_bucket_offset(" not in members["send_advanced_code"]
+
+    # ONE shared rule for "what nibble does this character become on the wire",
+    # pinned at the source level. That is deliberate, and it is not the usual
+    # text-pin-standing-in-for-a-behavioral-test smell: the property being
+    # protected is ITSELF textual -- the rule is written down once, and both the
+    # serializer and the classifier call that one copy. There is provably no
+    # behavioral signal to assert instead. A local lambda with identical
+    # semantics is observationally indistinguishable at runtime (-O2 emits
+    # byte-identical code and no out-of-line symbol), so every behavioral test
+    # in this suite stays green if the serializer grows its own copy back.
+    #
+    # That copy is exactly the pre-round-6 shape, and it is what produced five
+    # separate drift bugs in this PR: the lowercase gate, the truncated frame,
+    # the trailing newline, the odd-length parity check, and AABZ. This block is
+    # what stops the next reader from "simplifying" a one-line lambda back into
+    # place -- a change that would look obviously correct.
+    component_sources = sorted(RF_BRIDGE_DIR.glob("*.h")) + sorted(RF_BRIDGE_DIR.glob("*.cpp"))
+    # (1) The serializer routes through the shared rule.
+    assert "serialized_nibble(" in members["write_byte_str_"]
+    # (2) Neither path re-implements invalid-nibble-becomes-0 locally. Matched by
+    # SHAPE, not by name: the reverted form is an anonymous lambda that can be
+    # called anything, so pinning the identifier alone would miss it.
+    assert [
+        path.name
+        for path in component_sources
+        for _ in re.finditer(r"<\s*0\s*\?\s*0", path.read_text())
+    ] == ["rf_bridge_protocol.h"]
+    # (3) The classifier's magic comparison calls the same function, so a frame
+    # whose SERIALIZED bytes open AA B0 is judged whatever characters spelled it.
+    protocol = (RF_BRIDGE_DIR / "rf_bridge_protocol.h").read_text()
+    magic_check = protocol.split("inline B0FrameStatus b0_frame_status(", maxsplit=1)[1].split(
+        "return B0FrameStatus::PASSTHROUGH;", maxsplit=1
+    )[0]
+    assert "serialized_nibble(" in magic_check
+    assert "hex_nibble(" not in magic_check
+    # (4) The shared rule is defined exactly once, so no second copy can appear.
+    assert [
+        path.name for path in component_sources if "serialized_nibble(char" in path.read_text()
+    ] == ["rf_bridge_protocol.h"]
+
     # The effective offset is readable off a running bridge, so the silent
     # double-compensation trap has one place it stops being silent.
     assert "TX bucket offset" in members["dump_config"]
