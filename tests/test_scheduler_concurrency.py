@@ -405,7 +405,7 @@ def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
 
 
 def test_completion_telemetry_reports_delivered_action_repeats(tmp_path: Path) -> None:
-    """Report complete solo delivery and concurrency truncation per command."""
+    """Report ACTION-only counts across complete and truncated command shapes."""
     _compile_and_run(
         tmp_path,
         "completion_telemetry",
@@ -451,8 +451,51 @@ def test_completion_telemetry_reports_delivered_action_repeats(tmp_path: Path) -
     saw_timed = true;
   }
   assert(saw_timed);
+
+  TargetScheduler with_trailer(35);
+  assert(with_trailer.schedule("trailer", "a1b2c3:42:1", "ACTION", "TRAILER", 3, 0, "", 0,
+                               displaced, reason));
+  int action_frames = 0;
+  int trailer_frames = 0;
+  bool saw_trailer = false;
+  for (uint32_t t = 0; t <= 500; t++) {
+    auto raw = with_trailer.next(t, started, &completed);
+    if (raw && *raw == "ACTION")
+      action_frames++;
+    if (raw && *raw == "TRAILER")
+      trailer_frames++;
+    if (completed.command_id == "trailer") {
+      assert(completed.action_repeats_delivered == 3);
+      assert(completed.action_repeats_configured == 3);
+      saw_trailer = true;
+    }
+  }
+  assert(action_frames == 3 && trailer_frames == 3 && saw_trailer);
+
+  TargetScheduler single(35);
+  assert(single.schedule("single", "a1b2c3:42:1", "ONE", "", 1, 0, "", 123,
+                         displaced, reason));
+  auto single_raw = single.next(123, started, &completed);
+  assert(single_raw && *single_raw == "ONE");
+  assert(started == "single" && completed.command_id == "single");
+  assert(completed.action_repeats_delivered == 1);
+  assert(completed.action_repeats_configured == 1);
 """,
     )
+
+
+def test_completion_telemetry_yaml_source_presence_smoke() -> None:
+    """Smoke-check MQTT wiring presence; native simulations prove behavior."""
+    package = (PROJECT_ROOT / "rf433-mqtt-bridge.yaml").read_text()
+    required_once = (
+        "outbox.publish_or_enqueue(completed_event, send_status)",
+        'root["action_repeats_delivered"]',
+        'root["action_repeats_configured"]',
+        "event.has_action_repeats",
+        "&completed_event",
+    )
+    for token in required_once:
+        assert package.count(token) == 1, token
 
 
 def test_completed_outbox_is_best_effort_under_saturation(tmp_path: Path) -> None:
