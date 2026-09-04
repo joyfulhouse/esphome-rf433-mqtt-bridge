@@ -65,6 +65,7 @@ enum class LifecycleKind : uint8_t {
   STARTED,
   DISPLACED,
   DISARMED,
+  COMPLETED,
 };
 
 struct LifecycleEvent {
@@ -74,8 +75,11 @@ struct LifecycleEvent {
   uint32_t age_ms{0};
   uint32_t timestamp_ms{0};
   uint32_t boot_id{0};
+  int action_repeats_delivered{0};
+  int action_repeats_configured{0};
   bool has_age{false};
   bool has_clock{false};
+  bool has_action_repeats{false};
 
   static LifecycleEvent accepted(const std::string &command_id) {
     return make_(LifecycleKind::ACCEPTED, command_id);
@@ -95,6 +99,15 @@ struct LifecycleEvent {
     event.boot_id = boot_id;
     event.has_age = true;
     event.has_clock = true;
+    return event;
+  }
+
+  static LifecycleEvent completed(const std::string &command_id, int action_repeats_delivered,
+                                  int action_repeats_configured) {
+    LifecycleEvent event = make_(LifecycleKind::COMPLETED, command_id);
+    event.action_repeats_delivered = action_repeats_delivered;
+    event.action_repeats_configured = action_repeats_configured;
+    event.has_action_repeats = true;
     return event;
   }
 
@@ -142,6 +155,8 @@ struct LifecycleEvent {
         return "rejected";
       case LifecycleKind::STARTED:
         return "started";
+      case LifecycleKind::COMPLETED:
+        return "completed";
       case LifecycleKind::DISPLACED:
         return "displaced";
       case LifecycleKind::DISARMED:
@@ -230,6 +245,7 @@ class LifecycleOutbox {
         return 0;
       case LifecycleKind::STARTED:
         return 1;
+      case LifecycleKind::COMPLETED:
       case LifecycleKind::DISPLACED:
       case LifecycleKind::DISARMED:
         return 2;
@@ -677,8 +693,11 @@ class TargetScheduler {
     return 0;
   }
 
-  std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id) {
+  std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id,
+                                  LifecycleEvent *completed_event = nullptr) {
     started_command_id.clear();
+    if (completed_event != nullptr)
+      *completed_event = LifecycleEvent{};
     // Age-based reset applies only to the discretionary user floor. Physical
     // occupancy has its own short, bounded rf_busy_until_ horizon and is never
     // bypassed. Resetting only when the floor is >60s stale preserves spacing
@@ -761,6 +780,8 @@ class TargetScheduler {
             command.deadline_at = now_ms + command.stop_after_ms;
           }
         }
+        if (command.phase == Phase::ACTION)
+          command.action_repeats_delivered++;
         command.remaining--;
         const bool complete = command.remaining == 0 && this->advance_(command);
         if (command.remaining > 0) {
@@ -770,6 +791,10 @@ class TargetScheduler {
 
         this->flush_last_ = false;
         this->cursor_ = (index + 1) % count;
+        if (complete && completed_event != nullptr) {
+          *completed_event = LifecycleEvent::completed(
+              command.command_id, command.action_repeats_delivered, command.repeats);
+        }
         if (complete)
           this->erase_(target);
         this->record_dispatch_(now_ms, airtime_ms, uart_ms_(raw.size()));
@@ -809,6 +834,7 @@ class TargetScheduler {
     uint32_t stop_airtime_ms{0};
     int repeats{1};
     int remaining{1};
+    int action_repeats_delivered{0};
     uint32_t stop_after_ms{0};
     uint32_t deadline_at{0};
     uint32_t next_at{0};

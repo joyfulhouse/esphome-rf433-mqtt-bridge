@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).parents[1]
+STATUS_PUBLISHER_COUNT = 2
 
 # A shared C++ prologue: a 1 ms polling driver that records the exact dispatch
 # timeline. Polling every 1 ms is a finer version of the real ESPHome 5 ms
@@ -402,3 +403,60 @@ def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
   assert(second_b > first_stop);
 """,
     )
+
+
+def test_completion_telemetry_reports_delivered_action_repeats(tmp_path: Path) -> None:
+    """Report complete solo delivery and concurrency truncation per command."""
+    _compile_and_run(
+        tmp_path,
+        "completion_telemetry",
+        r"""
+  std::string reason;
+  std::string started;
+  std::vector<std::string> displaced;
+  rf433::LifecycleEvent completed;
+
+  TargetScheduler solo(35);
+  assert(solo.schedule("solo", "a1b2c3:42:1", FX, "", 3, 2620, FW, 0,
+                       displaced, reason));
+  bool saw_solo = false;
+  for (uint32_t t = 0; t <= 8000; t++) {
+    auto raw = solo.next(t, started, &completed);
+    if (!raw || completed.command_id.empty())
+      continue;
+    assert(completed.status() == std::string("completed"));
+    assert(completed.has_action_repeats);
+    assert(completed.action_repeats_delivered == 3);
+    assert(completed.action_repeats_configured == 3);
+    saw_solo = true;
+  }
+  assert(saw_solo);
+
+  TargetScheduler concurrent(35);
+  assert(concurrent.schedule("timed", "a1b2c3:42:1", FX, "", 3, 2620, FW, 0,
+                             displaced, reason));
+  bool peer_admitted = false;
+  bool saw_timed = false;
+  for (uint32_t t = 0; t <= 12000; t++) {
+    if (!peer_admitted && t >= 500) {
+      assert(concurrent.schedule("peer", "a1b2c3:43:1", FY, "", 3, 0, "", t,
+                                 displaced, reason));
+      peer_admitted = true;
+    }
+    auto raw = concurrent.next(t, started, &completed);
+    if (!raw || completed.command_id != "timed")
+      continue;
+    assert(completed.has_action_repeats);
+    assert(completed.action_repeats_delivered == 2);
+    assert(completed.action_repeats_configured == 3);
+    saw_timed = true;
+  }
+  assert(saw_timed);
+""",
+    )
+
+    package = (PROJECT_ROOT / "rf433-mqtt-bridge.yaml").read_text()
+    assert package.count('root["action_repeats_delivered"]') == STATUS_PUBLISHER_COUNT
+    assert package.count('root["action_repeats_configured"]') == STATUS_PUBLISHER_COUNT
+    assert "sched.next(dispatch_ms, started_command_id, &completed_event)" in package
+    assert "outbox.publish_or_enqueue(completed_event, send_status)" in package
