@@ -612,6 +612,8 @@ interval:
                     started_command_id, status_ms - dispatch_ms, status_ms, id(boot_id)),
                 send_status);
           }
+          // The deployed consumer safely ignores unknown lifecycle kinds;
+          // completion telemetry is additive and never load-bearing.
           if (!completed_event.command_id.empty())
             outbox.publish_or_enqueue(completed_event, send_status);
   - interval: 10s

@@ -104,6 +104,9 @@ struct LifecycleEvent {
 
   static LifecycleEvent completed(const std::string &command_id, int action_repeats_delivered,
                                   int action_repeats_configured) {
+    // Counts-only telemetry is emitted only on normal scheduler completion.
+    // Displacement/disarm removals report their existing lifecycle event, and
+    // completion intentionally carries no clock or age correlation.
     LifecycleEvent event = make_(LifecycleKind::COMPLETED, command_id);
     event.action_repeats_delivered = action_repeats_delivered;
     event.action_repeats_configured = action_repeats_configured;
@@ -175,12 +178,13 @@ struct LifecycleEvent {
 };
 
 // ESPHome's MQTT client retries a failed QoS enqueue only once immediately.
-// Keep lifecycle truth across longer disconnects in a fixed FIFO. Repeated
-// callbacks for the same command transition coalesce in place; transitions
+// Keep lifecycle truth across longer disconnects in a fixed FIFO. COMPLETED
+// telemetry is best-effort and never displaces an existing lifecycle kind.
+// Repeated callbacks for the same command transition coalesce in place; transitions
 // retain lifecycle order per command (accepted before started) even if a
 // broker replay arrives after a later phase was queued. Sustained overload
-// drops the oldest event and increments dropped_count_ instead of growing heap
-// without bound.
+// of existing lifecycle kinds drops the oldest event and increments
+// dropped_count_ instead of growing heap without bound.
 class LifecycleOutbox {
  public:
   static constexpr size_t CAPACITY = 32;
@@ -227,10 +231,22 @@ class LifecycleOutbox {
       }
     }
     if (this->size_ == CAPACITY) {
-      this->pop_front_();
-      this->dropped_count_++;
-      if (insertion > 0)
-        insertion--;
+      if (event.kind == LifecycleKind::COMPLETED)
+        return;
+      const auto completed = std::find_if(
+          this->events_.begin(), this->events_.begin() + this->size_,
+          [](const LifecycleEvent &queued) { return queued.kind == LifecycleKind::COMPLETED; });
+      if (completed != this->events_.begin() + this->size_) {
+        const size_t removed = static_cast<size_t>(std::distance(this->events_.begin(), completed));
+        this->erase_at_(removed);
+        if (insertion > removed)
+          insertion--;
+      } else {
+        this->pop_front_();
+        this->dropped_count_++;
+        if (insertion > 0)
+          insertion--;
+      }
     }
     for (size_t index = this->size_; index > insertion; index--)
       this->events_[index] = std::move(this->events_[index - 1]);
@@ -245,10 +261,11 @@ class LifecycleOutbox {
         return 0;
       case LifecycleKind::STARTED:
         return 1;
-      case LifecycleKind::COMPLETED:
       case LifecycleKind::DISPLACED:
       case LifecycleKind::DISARMED:
         return 2;
+      case LifecycleKind::COMPLETED:
+        return 3;
     }
     return 0;
   }
@@ -256,7 +273,11 @@ class LifecycleOutbox {
   void pop_front_() {
     if (this->empty())
       return;
-    for (size_t index = 1; index < this->size_; index++)
+    this->erase_at_(0);
+  }
+
+  void erase_at_(size_t removed) {
+    for (size_t index = removed + 1; index < this->size_; index++)
       this->events_[index - 1] = std::move(this->events_[index]);
     this->events_[--this->size_] = LifecycleEvent{};
   }
