@@ -256,10 +256,6 @@ mqtt:
                     root["t"] = event.timestamp_ms;
                     root["boot"] = event.boot_id;
                   }
-                  if (event.has_action_repeats) {
-                    root["action_repeats_delivered"] = event.action_repeats_delivered;
-                    root["action_repeats_configured"] = event.action_repeats_configured;
-                  }
                 }, 1, false);
           };
           auto publish_status = [&](const rf433::LifecycleEvent &event) {

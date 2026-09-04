@@ -27,7 +27,6 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).parents[1]
-STATUS_PUBLISHER_COUNT = 2
 
 # A shared C++ prologue: a 1 ms polling driver that records the exact dispatch
 # timeline. Polling every 1 ms is a finer version of the real ESPHome 5 ms
@@ -456,7 +455,7 @@ def test_completion_telemetry_reports_delivered_action_repeats(tmp_path: Path) -
     )
 
     package = (PROJECT_ROOT / "rf433-mqtt-bridge.yaml").read_text()
-    assert package.count('root["action_repeats_delivered"]') == STATUS_PUBLISHER_COUNT
-    assert package.count('root["action_repeats_configured"]') == STATUS_PUBLISHER_COUNT
+    assert package.count('root["action_repeats_delivered"]') == 1
+    assert package.count('root["action_repeats_configured"]') == 1
     assert "sched.next(dispatch_ms, started_command_id, &completed_event)" in package
     assert "outbox.publish_or_enqueue(completed_event, send_status)" in package
