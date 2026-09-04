@@ -2451,8 +2451,15 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     )
     assert "serialized_nibble(" in magic_check
     assert "hex_nibble(" not in magic_check
-    # (4) Exactly one definition carrying that signature, so a same-signature
-    # duplicate cannot appear.
+    # (4) Exactly one DEFINITION of the shared rule, whatever its parameter is
+    # spelled as. Matched by definition shape -- `name ( [const] type ident )
+    # [const] {` -- over comment-stripped source, not by the literal
+    # `serialized_nibble(char`: that literal was parameter-type-sensitive, so a
+    # same-named `serialized_nibble(int v)` / `(uint8_t v)` / `(const char v)`
+    # definition, at file scope or as a class static, was invisible to it and the
+    # structural guarantee lapsed silently. A call never carries `type ident)`
+    # -- `serialized_nibble(codes[i])` cannot match -- so the real call sites do
+    # not trip this, and the header's one legitimate definition is the only hit.
     #
     # What these do NOT enforce, so nobody over-trusts them: a differently-named
     # private copy written as an `if` rather than a ternary evades both (2) and
@@ -2461,8 +2468,13 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     # component it is not caught. The scan is components/rf_bridge/*.{h,cpp};
     # rf433_scheduler.h is out of scope (no UART write path, and normalize_b0
     # rejects bad input rather than coercing it, so it cannot host this bug).
+    definition = re.compile(
+        r"\bserialized_nibble\s*\(\s*(?:const\s+)?[\w:]+\s+\w+\s*\)\s*(?:const\s*)?\{"
+    )
     assert [
-        path.name for path in component_sources if "serialized_nibble(char" in path.read_text()
+        path.name
+        for path in component_sources
+        for _ in definition.finditer(_without_comments(path.read_text()))
     ] == ["rf_bridge_protocol.h"]
 
     # The effective offset is readable off a running bridge, so the silent
