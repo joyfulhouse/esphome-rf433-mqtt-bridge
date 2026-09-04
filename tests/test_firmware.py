@@ -2298,9 +2298,15 @@ def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path)
             id="plain-block-comment",
         ),
         pytest.param(
-            "  // TODO: /* revisit\n  keep_me();\n",
+            # The trailing block comment is what makes this case bite: without a
+            # later `*/`, a block-first strip matches nothing here and the case
+            # stays green under the very regression it names. With one, the
+            # orphaned `/*` in the line comment pairs with it and swallows
+            # keep_me() -- which is the forward-swallow this fixture exists to
+            # catch.
+            "  // TODO: /* revisit\n  keep_me();\n  /* trailing block */\n",
             ("keep_me();",),
-            ("TODO", "revisit"),
+            ("TODO", "revisit", "trailing block"),
             id="unterminated-open-inside-line-comment",
         ),
     ],
@@ -2407,7 +2413,18 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     # ("Inlined equivalent of serialized_nibble() ..."), which contains this
     # very substring and satisfies the raw-body form of this assertion in
     # either comment spelling.
-    assert "serialized_nibble(" in _without_comments(members["write_byte_str_"])
+    serializer_code = _without_comments(members["write_byte_str_"])
+    assert "serialized_nibble(" in serializer_code
+    # (5) ...and that call resolves to the shared rule, not to a local of the
+    # SAME name. Keeping the name is the minimal-diff inlining -- zero call-site
+    # edits -- and it slips every other assertion here: the calls still read
+    # `serialized_nibble(`, an `if`-shaped body dodges (2), and a lambda spells
+    # its definition `serialized_nibble = [](char`, not `serialized_nibble(char`,
+    # so (4) never sees it. Only the same name evades; a renamed copy already
+    # fails (1).
+    assert not re.search(
+        r"\bauto\s+serialized_nibble\b|\bserialized_nibble\s*[={]", serializer_code
+    )
     # (2) No second copy of invalid-nibble-becomes-0 in its TERNARY shape.
     # Matched by shape, not by name: the reverted form is an anonymous lambda
     # that can be called anything, so pinning the identifier alone would miss it.
@@ -2437,10 +2454,10 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     # (4) Exactly one definition carrying that signature, so a same-signature
     # duplicate cannot appear.
     #
-    # What these four do NOT enforce, so nobody over-trusts them: a
-    # differently-named private copy written as an `if` rather than a ternary
-    # evades both (2) and (4). Inside write_byte_str_ it is still caught, by
-    # (1) -- the real call disappears when it is inlined. Elsewhere in the
+    # What these do NOT enforce, so nobody over-trusts them: a differently-named
+    # private copy written as an `if` rather than a ternary evades both (2) and
+    # (4). Inside write_byte_str_ it is still caught -- by (1) when renamed (the
+    # real call disappears), by (5) when it keeps the name. Elsewhere in the
     # component it is not caught. The scan is components/rf_bridge/*.{h,cpp};
     # rf433_scheduler.h is out of scope (no UART write path, and normalize_b0
     # rejects bad input rather than coercing it, so it cannot host this bug).
