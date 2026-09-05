@@ -361,6 +361,8 @@ void RFBridgeComponent::send_raw(const std::string &raw_code) {
     end = raw_code.find_last_not_of(B0_TRIM_CHARS) + 1U;
   // Bind rather than copy when there is nothing to trim: send_raw runs once per
   // repeat of every dispatch, and the default path must not start allocating.
+  // The offset-0 bucket floor below holds the same line -- its copy of the
+  // frame exists only when a referenced bucket was actually floored.
   const bool trimmed = begin != 0U || end != raw_code.size();
   const std::string trimmed_frame = trimmed ? raw_code.substr(begin, end - begin) : std::string();
   const std::string &frame = trimmed ? trimmed_frame : raw_code;
@@ -372,22 +374,42 @@ void RFBridgeComponent::send_raw(const std::string &raw_code) {
     // this frame would put on air a code its author never wrote.
     //
     // The line drawn here is AUTHORSHIP, not safety: the serializer must not
-    // invent nibbles. It is deliberately not a ban on zero-length buckets -- a
+    // invent nibbles. It is deliberately not a ban on short buckets -- a
     // literal `0000` is valid hex and exactly what its author wrote, so it is
-    // accepted and, at the default offset where the floor does not run, still
-    // reaches the coprocessor as a 0. That residual is documented in
-    // HARDWARE.md caveat 2a; see B0FrameStatus for why closing it here would be
-    // over-strict.
+    // accepted here and then floored to B0_MIN_BUCKET_US below (at every
+    // offset, including the default 0) when a data nibble REFERENCES it. See
+    // B0FrameStatus and HARDWARE.md caveat 2a for why an unreferenced zero
+    // bucket is nobody's business.
     ESP_LOGW(TAG, "Refusing malformed B0 frame (non-hex, odd length, or truncated), nothing sent: %s",
              frame.c_str());
     return;
   }
-  // A default build, and any frame this pass cannot compensate, writes exactly
-  // the bytes it always wrote -- for every frame that reaches here, which is
-  // every well-formed one. MALFORMED already returned above.
-  if (this->tx_bucket_offset_us_ == 0 || status != B0FrameStatus::COMPENSABLE) {
-    ESP_LOGD(TAG, "Sending Raw Code: %s", frame.c_str());
-    this->write_byte_str_(frame);
+  // Frames this pass cannot judge, and every frame at the default offset of 0,
+  // reach the UART through this one emit. The floored copy is materialized ONLY
+  // when a referenced bucket is actually below the floor
+  // (b0_floor_referenced_buckets returning false leaves `floored` untouched):
+  // send_raw runs once per repeat of every dispatch, and the default path must
+  // not start allocating for the overwhelmingly common frame whose buckets are
+  // all legal. Every such frame stays byte-identical to what the caller wrote,
+  // lowercase and zero-padded tables included.
+  if (status != B0FrameStatus::COMPENSABLE || this->tx_bucket_offset_us_ == 0) {
+    std::string floored;
+    size_t floored_buckets = 0;
+    const std::string *wire = &frame;
+    if (status == B0FrameStatus::COMPENSABLE &&
+        b0_floor_referenced_buckets(frame, floored, &floored_buckets)) {
+      // Same "never silent" rule as the offset>0 floor below, with a distinct
+      // message: "lower the offset" would be wrong advice at offset 0.
+      if (this->clamp_log_due_(App.get_loop_component_start_time())) {
+        ESP_LOGW(TAG,
+                 "send_raw floored %u referenced bucket(s) shorter than %u us; this frame no longer "
+                 "encodes its written timing",
+                 static_cast<unsigned>(floored_buckets), static_cast<unsigned>(B0_MIN_BUCKET_US));
+      }
+      wire = &floored;
+    }
+    ESP_LOGD(TAG, "Sending Raw Code: %s", wire->c_str());
+    this->write_byte_str_(*wire);
     this->flush();
     return;
   }

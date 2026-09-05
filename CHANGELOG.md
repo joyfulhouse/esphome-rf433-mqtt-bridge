@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is documented in
 [README.md](README.md#mqtt-topic-contract).
 
+## [Unreleased]
+
+### Fixed
+
+- **Frames referencing a bucket shorter than 100 µs are rejected at admission and floored in
+  `send_raw`** ([#18](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/18)):
+  `normalize_b0` validated structure, bucket references, and the 2 s airtime ceiling, but had no
+  minimum-duration check, and the only 100 µs floor lived inside the bucket-compensation pass,
+  which does not run at the default `tx_bucket_offset_us` of 0 — so a frame like
+  `AAB005010800010055` (a referenced 1 µs bucket) was admitted and transmitted. On the
+  OB38S003 (mightymos) a referenced 0–9 µs bucket wraps to ~659.5 ms of stuck carrier per
+  occurrence; on the EFM8BB1 (Portisch) 0–64 µs underflows to ~65.5 ms. `/tx` admission now
+  rejects such frames with `"reason":"frame references a bucket shorter than 100 us"`, and
+  `send_raw` (a public action that bypasses admission) floors every *referenced* sub-100 µs
+  bucket to 100 µs at every offset, logging a throttled warning. At the default offset of 0 only
+  referenced buckets are floored: unreferenced bucket-table entries are never rewritten and never
+  reach the air, and frames whose referenced buckets are all ≥ 100 µs transmit byte-identical. At
+  a non-zero offset the compensation pass rewrites the whole bucket table, referenced or not (see
+  [#24](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/24)). No contract-version
+  change.
+
 ## [1.4.0] - 2026-08-02
 
 ### Added

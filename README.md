@@ -280,7 +280,10 @@ the same `"reason":"boot_mismatch"` so a controller has exactly one recovery pat
 `/info`, then re-issue with the current boot. The bridge validates JSON shape, bounds, and B0
 structure, but deliberately trusts the authenticated controller for frame semantics: it cannot
 prove that `raw`, `trailer_raw`, and `stop_raw` address the same physical blind or match the
-declared `target`.
+declared `target`. One B0 validity rule is worth knowing by name: a frame whose data nibbles
+reference a bucket shorter than 100 µs is rejected with
+`"reason":"frame references a bucket shorter than 100 us"` (see
+[HARDWARE.md](HARDWARE.md) caveat 2a for the stuck-carrier hazard it prevents).
 
 </details>
 

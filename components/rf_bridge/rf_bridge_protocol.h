@@ -44,11 +44,14 @@ constexpr size_t B0_MAGIC_CHARS = 4;
 // pair-at-a-time loop simply ignored an odd trailing character. This is the
 // ASCII set the scheduler's normalize_b0 strips at admission.
 inline constexpr char B0_TRIM_CHARS[] = " \t\n\v\f\r";
-// Floor for a compensated bucket duration. The OB38S003's Timer-1 ISR
-// decrements its remaining-interval counter BEFORE testing it for zero, so a
-// bucket that reaches zero wraps to 65,535 intervals -- roughly 659 ms of
-// stuck carrier on a shared 433.92 MHz band. This floor sits far above any
-// plausible timer quantum and far below the shortest real AOK bucket (280 us).
+// Floor for a compensated bucket duration -- and for every bucket a data
+// nibble references: normalize_b0 rejects such frames at /tx admission, and
+// send_raw floors referenced sub-floor buckets even at the default offset of
+// 0. The OB38S003's Timer-1 ISR decrements its remaining-interval counter
+// BEFORE testing it for zero, so a bucket that reaches zero wraps to 65,535
+// intervals -- roughly 659 ms of stuck carrier on a shared 433.92 MHz band.
+// This floor sits far above any plausible timer quantum and far below the
+// shortest real AOK bucket (280 us).
 //
 // It has two distinct outcomes, and only one of them is a rescue. A bucket
 // LONGER than the offset but landing under 100 us is raised back to 100 us --
@@ -287,14 +290,15 @@ enum class B0FrameStatus : uint8_t {
   // The line this draws is authorship, not safety: it stops the serializer
   // INVENTING nibbles, which is why `ZZZZ` (which would be invented as the 0
   // bucket, and its 659 ms stuck carrier) is refused. It is deliberately NOT a
-  // ban on zero buckets. A literal `0000` is valid hex, self-consistent, and
-  // exactly what its author wrote, so it classifies COMPENSABLE and -- at the
-  // default offset, where the B0_MIN_BUCKET_US floor does not run -- still
-  // reaches the coprocessor as a 0. That residual predates this pass and is
-  // documented in HARDWARE.md caveat 2a; it is not closed here because a
-  // declared bucket need never be REFERENCED by a data nibble (normalize_b0
-  // only rejects references ABOVE bucket_count), so zero-filled padding in an
-  // over-sized table is legal, admitted today, and never reaches the air.
+  // ban on sub-100 us buckets. A literal `0000` is valid hex, self-consistent,
+  // and exactly what its author wrote, so it classifies COMPENSABLE and is
+  // handled downstream instead: the scheduler's normalize_b0 rejects a frame
+  // whose DATA nibbles reference a bucket shorter than B0_MIN_BUCKET_US, and
+  // send_raw floors any REFERENCED sub-floor bucket to B0_MIN_BUCKET_US at
+  // every offset, including the default 0. Unreferenced table entries are
+  // never rewritten and never reach the air, because a declared bucket need
+  // not be referenced by any data nibble (zero-filled padding in an over-sized
+  // table is legal). See HARDWARE.md caveat 2a.
   MALFORMED,
   // A self-consistent, fully-hex B0 bucket frame: lossless to serialize, and
   // eligible for bucket compensation.
@@ -340,6 +344,24 @@ inline B0FrameStatus b0_frame_status(const std::string &frame) {
   if (frame.size() != 8U + body_length * 2U || B0_BUCKET_TABLE_START + bucket_count * 4U > body_end)
     return B0FrameStatus::PASSTHROUGH;
   return B0FrameStatus::COMPENSABLE;
+}
+
+// One bucket's 4-hex-char big-endian microsecond duration within a
+// COMPENSABLE frame (b0_frame_status has already proven those chars are hex).
+// b0_bucket mirrors b1_bucket; b0_set_bucket is the rewrite half, emitting the
+// same zero-padded uppercase hex the normalizer produces.
+inline uint32_t b0_bucket(const std::string &frame, size_t index) {
+  const size_t start = B0_BUCKET_TABLE_START + index * 4U;
+  uint32_t duration_us = 0;
+  for (size_t nibble = 0; nibble < 4U; nibble++)
+    duration_us = (duration_us << 4) | static_cast<uint32_t>(hex_nibble(frame[start + nibble]));
+  return duration_us;
+}
+
+inline void b0_set_bucket(std::string &frame, size_t index, uint16_t duration_us) {
+  const size_t start = B0_BUCKET_TABLE_START + index * 4U;
+  for (size_t nibble = 0; nibble < 4U; nibble++)
+    frame[start + nibble] = HEX_DIGITS[(duration_us >> (12U - nibble * 4U)) & 0x0F];
 }
 
 // Subtract a fixed per-bucket microsecond offset from an outbound B0 frame.
@@ -395,20 +417,81 @@ inline std::string b0_with_bucket_offset(const std::string &frame, uint16_t offs
   std::string output = frame;
   size_t clamped = 0;
   for (size_t bucket = 0; bucket < bucket_count; bucket++) {
-    const size_t start = B0_BUCKET_TABLE_START + bucket * 4U;
-    uint32_t duration_us = 0;
-    for (size_t index = 0; index < 4U; index++)
-      duration_us = (duration_us << 4) | static_cast<uint32_t>(hex_nibble(frame[start + index]));
+    const uint32_t duration_us = b0_bucket(frame, bucket);
     const bool clear_of_floor = duration_us >= static_cast<uint32_t>(offset_us) + B0_MIN_BUCKET_US;
     const uint16_t emitted =
         clear_of_floor ? static_cast<uint16_t>(duration_us - offset_us) : B0_MIN_BUCKET_US;
     clamped += clear_of_floor ? 0U : 1U;
-    for (size_t index = 0; index < 4U; index++)
-      output[start + index] = HEX_DIGITS[(emitted >> (12U - index * 4U)) & 0x0F];
+    b0_set_bucket(output, bucket, emitted);
   }
   if (clamped_buckets != nullptr)
     *clamped_buckets = clamped;
   return output;
+}
+
+// Floor the REFERENCED sub-floor buckets of an outbound B0 frame. This is the
+// default (offset 0) transmit path's counterpart to b0_with_bucket_offset:
+// send_raw is a public action that bypasses the scheduler's normalize_b0 (the
+// admission check that rejects such frames), so a frame whose data nibbles
+// reference a bucket shorter than B0_MIN_BUCKET_US can arrive here
+// unvalidated, and on both coprocessor variants such a bucket is a
+// stuck-carrier hazard (see that constant).
+//
+// This is deliberately NOT "run b0_with_bucket_offset at offset 0": that pass
+// rewrites the WHOLE bucket table through uppercase HEX_DIGITS and floors
+// unreferenced entries too, which would break byte-identity for lowercase
+// input and for legal zero-padded bucket tables. Here only the 4 hex chars of
+// each referenced sub-floor bucket are rewritten (uppercase, to
+// B0_MIN_BUCKET_US); the header, data nibbles, trailer, and every
+// unreferenced bucket stay byte-verbatim.
+//
+// `frame` MUST classify COMPENSABLE (b0_frame_status): the only caller,
+// send_raw, has already run that check, and re-checking here would rescan the
+// whole frame on every repeat of every dispatch.
+//
+// Returns false -- leaving `output` untouched, so the caller can emit the
+// original string with zero allocation -- when no referenced bucket is below
+// the floor. On true, `output` is the floored copy and `clamped_buckets`, when
+// non-null, receives how many buckets were floored. A data nibble can in
+// theory reference an undefined bucket here precisely because send_raw never
+// ran normalize_b0; indices >= bucket_count are left alone (normalize_b0
+// rejects them separately).
+inline bool b0_floor_referenced_buckets(const std::string &frame, std::string &output,
+                                        size_t *clamped_buckets = nullptr) {
+  if (clamped_buckets != nullptr)
+    *clamped_buckets = 0;
+  const size_t body_length = static_cast<size_t>((hex_nibble(frame[4]) << 4) | hex_nibble(frame[5]));
+  const size_t bucket_count = static_cast<size_t>((hex_nibble(frame[6]) << 4) | hex_nibble(frame[7]));
+  const size_t body_end = 6U + body_length * 2U;
+  // A bucket index is 3 bits, so the referenced sub-floor set is a bitmask.
+  // The & 0x07 cap keeps every probed index in 0..7, and the bucket >=
+  // bucket_count skip keeps the probe inside the DECLARED table, so this scan
+  // is safe even when a crafted frame declares more than 8 buckets (possible
+  // here: send_raw bypasses normalize_b0's count check).
+  uint8_t below_floor = 0;
+  for (size_t index = B0_BUCKET_TABLE_START + bucket_count * 4U; index < body_end; index++) {
+    const size_t bucket = static_cast<size_t>(hex_nibble(frame[index]) & 0x07);
+    if (bucket >= bucket_count)
+      continue;
+    if (b0_bucket(frame, bucket) < B0_MIN_BUCKET_US)
+      below_floor = static_cast<uint8_t>(below_floor | (1U << bucket));
+  }
+  if (below_floor == 0)
+    return false;
+  output = frame;
+  size_t clamped = 0;
+  // Walk the mask's eight possible bits, not 0..bucket_count: the declared
+  // count is caller-controlled here, and a count-wide loop would evaluate
+  // 1U << bucket into undefined behavior once bucket reaches 32.
+  for (size_t bucket = 0; bucket < 8U; bucket++) {
+    if ((below_floor & (1U << bucket)) == 0)
+      continue;
+    b0_set_bucket(output, bucket, B0_MIN_BUCKET_US);
+    clamped++;
+  }
+  if (clamped_buckets != nullptr)
+    *clamped_buckets = clamped;
+  return true;
 }
 
 }  // namespace esphome::rf_bridge

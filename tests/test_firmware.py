@@ -1034,8 +1034,8 @@ void generated_ota_begin() {
 }
 
 int main() {
-  const std::string action = "AAB005010100010055";
-  const std::string stop = "AAB005010100000055";
+  const std::string action = "AAB005010100640055";
+  const std::string stop = "AAB005010100650055";
   auto &scheduler = rf433::tx_scheduler(35);
   std::string started;
   std::string reason;
@@ -1121,8 +1121,8 @@ void generated_ota_begin() {
 }
 
 int main() {
-  const std::string action = "AAB005010100010055";
-  const std::string stop = "AAB005010100000055";
+  const std::string action = "AAB005010100640055";
+  const std::string stop = "AAB005010100650055";
   auto &scheduler = rf433::tx_scheduler(35);
   std::string started;
   std::string reason;
@@ -1520,7 +1520,7 @@ void generated_tick() {
 }
 
 int main() {
-  const std::string frame = "AAB005010100010055";
+  const std::string frame = "AAB005010100640055";
 
   // Contract v3: missing, mistyped, and mismatched boot all reject with the
   // single reason "boot_mismatch" and never reach the scheduler.
@@ -2690,4 +2690,218 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
           return 0;
         }
         """,
+    )
+
+
+def test_native_min_bucket_admission(tmp_path: Path) -> None:
+    """Admission rejects a frame whose data nibbles reference a sub-100 us bucket."""
+    compile_and_run(
+        tmp_path,
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include "rf433_scheduler.h"
+#include "components/rf_bridge/rf_bridge_protocol.h"
+
+int main() {
+  // The scheduler header is compiled standalone by the native tests with only
+  // the repo root on the include path, so it cannot include the component
+  // header and carries the floor by value. The two copies must never drift.
+  assert(rf433::B0_MIN_BUCKET_US == esphome::rf_bridge::B0_MIN_BUCKET_US);
+  // The rejection reason names the floor as a decimal. Derive the expectation
+  // from the constant itself so the literal in rf433_scheduler.h cannot drift
+  // from the value it quotes without going red here.
+  const std::string min_bucket_reason =
+      "frame references a bucket shorter than " + std::to_string(rf433::B0_MIN_BUCKET_US) + " us";
+
+  std::string normalized;
+  std::string reason;
+  // One-bucket frames: length 05, bucket count 01, embedded repeat 08, one
+  // data nibble pair "00" referencing bucket 0. Every referenced duration
+  // below 100 us -- 0, 9, 10, 64, 65, 99 -- spans both coprocessors' hazard
+  // ranges (OB38S003 0-9 us, EFM8BB1 0-64 us) and is rejected; the floor
+  // itself passes.
+  for (const char *bucket : {"0000", "0009", "000A", "0040", "0041", "0063"}) {
+    const std::string frame = std::string("AAB0050108") + bucket + "0055";
+    assert(!rf433::normalize_b0(frame, normalized, reason));
+    assert(reason == min_bucket_reason);
+  }
+  assert(rf433::normalize_b0("AAB005010800640055", normalized, reason));
+
+  // The issue's exact reported frame (a referenced 1 us bucket) is rejected
+  // with the same reason.
+  assert(!rf433::normalize_b0("AAB005010800010055", normalized, reason));
+  assert(reason == min_bucket_reason);
+
+  // An UNREFERENCED sub-floor bucket stays legal: length 07, bucket count 02,
+  // buckets 100 us and 1 us, and data "00" references only bucket 0. An
+  // unreferenced table entry never keys the transmitter on either coprocessor
+  // variant, so zero-padded over-sized tables remain admissible.
+  assert(rf433::normalize_b0("AAB0070208006400010055", normalized, reason));
+  return 0;
+}
+""",
+    )
+
+
+def test_native_send_raw_floors_referenced_buckets_at_offset_zero(tmp_path: Path) -> None:
+    """send_raw floors referenced sub-100 us buckets at every offset, including 0."""
+    write_rf_bridge_stubs(tmp_path)
+    compile_and_run(
+        tmp_path,
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "components/rf_bridge/rf_bridge_protocol.h"
+
+// compact_hex renders the packed UART bytes UPPERCASE whatever characters the
+// caller wrote, so comparing serialized() against a literal can never see the
+// emit path uppercasing a lowercase frame first (a round-trip through
+// HEX_DIGITS, which is what b0_with_bucket_offset does at a non-zero offset).
+// Intercept the serializer's per-character reads instead: the protocol header
+// is already included above, so its pragma-once guard skips it inside
+// rf_bridge.cpp and this rename rewires only the .cpp's own call in
+// write_byte_str_ -- the header's classifier keeps the shared original.
+static std::string g_serialized_chars;
+static uint8_t (*g_shared_nibble)(char) = &esphome::rf_bridge::serialized_nibble;
+namespace esphome::rf_bridge {
+inline uint8_t observed_nibble(char value) {
+  g_serialized_chars.push_back(value);
+  return g_shared_nibble(value);
+}
+}  // namespace esphome::rf_bridge
+#define serialized_nibble observed_nibble
+#include "components/rf_bridge/rf_bridge.cpp"
+#undef serialized_nibble
+
+using esphome::rf_bridge::RFBridgeComponent;
+
+// The component's UART writes are protected; a test-only subclass reads them
+// back exactly as the coprocessor would receive them.
+struct ProbeBridge : RFBridgeComponent {
+  std::string serialized() const {
+    return esphome::rf_bridge::compact_hex(this->written_bytes());
+  }
+  const std::vector<uint8_t> &wire_bytes() const { return this->written_bytes(); }
+};
+
+static size_t warnings_since_reset() { return esphome::host_test_warnings().size(); }
+
+static void reset_warnings() { esphome::host_test_warnings().clear(); }
+
+int main() {
+  // The shipped default and an explicit per-board override of "0" must behave
+  // identically: both now floor REFERENCED sub-100 us buckets, and neither
+  // allocates a copy for a frame that needs none.
+  for (const bool explicit_zero : {false, true}) {
+    // A referenced 50 us bucket is floored to 100 us on the wire -- the frame
+    // is never dropped -- and the floor is never silent.
+    reset_warnings();
+    ProbeBridge floored;
+    if (explicit_zero)
+      floored.set_tx_bucket_offset_us(0);
+    floored.send_raw("AAB005010100320055");
+    assert(floored.serialized() == "AAB005010100640055");
+    assert(floored.flush_count() == 1);
+    assert(warnings_since_reset() == 1);
+
+    // A referenced 0 us bucket -- the issue-#18 shape -- floors the same way.
+    reset_warnings();
+    ProbeBridge zero_bucket;
+    if (explicit_zero)
+      zero_bucket.set_tx_bucket_offset_us(0);
+    zero_bucket.send_raw("AAB005010800000055");
+    assert(zero_bucket.serialized() == "AAB005010800640055");
+    assert(zero_bucket.flush_count() == 1);
+    assert(warnings_since_reset() == 1);
+
+    // A frame whose referenced bucket already clears the floor (280 us, the
+    // shortest real AOK bucket) emits byte-identical with no warning.
+    reset_warnings();
+    ProbeBridge legal;
+    if (explicit_zero)
+      legal.set_tx_bucket_offset_us(0);
+    legal.send_raw("AAB005010801180055");
+    assert(legal.serialized() == "AAB005010801180055");
+    assert(legal.flush_count() == 1);
+    assert(warnings_since_reset() == 0);
+
+    // Byte-identity extends to lowercase input: the floor rewrites nothing it
+    // does not have to (a round-trip through uppercase HEX_DIGITS, which is
+    // what b0_with_bucket_offset would do at a non-zero offset, is exactly
+    // the behavior this path exists to avoid).
+    reset_warnings();
+    g_serialized_chars.clear();
+    ProbeBridge lowercase;
+    if (explicit_zero)
+      lowercase.set_tx_bucket_offset_us(0);
+    lowercase.send_raw("aab005010801180055");
+    // Raw byte comparison, no case normalization: the wire carries exactly the
+    // bytes the lowercase input encodes...
+    assert(lowercase.wire_bytes() ==
+           std::vector<uint8_t>({0xAA, 0xB0, 0x05, 0x01, 0x08, 0x01, 0x18, 0x00, 0x55}));
+    // ...and the serializer consumed the caller's characters as written,
+    // lowercase included. compact_hex(written_bytes()) -- serialized() --
+    // uppercases by construction and could not see an uppercase round-trip.
+    assert(g_serialized_chars == "aab005010801180055");
+    assert(lowercase.flush_count() == 1);
+    assert(warnings_since_reset() == 0);
+
+    // An UNREFERENCED sub-floor bucket (bucket 1 = 1 us, data "00" references
+    // only bucket 0) passes through verbatim and unwarned: it never keys the
+    // transmitter, and legal zero-padded tables must survive untouched.
+    reset_warnings();
+    ProbeBridge unreferenced;
+    if (explicit_zero)
+      unreferenced.set_tx_bucket_offset_us(0);
+    unreferenced.send_raw("AAB0070208006400010055");
+    assert(unreferenced.serialized() == "AAB0070208006400010055");
+    assert(unreferenced.flush_count() == 1);
+    assert(warnings_since_reset() == 0);
+  }
+
+  // The non-zero-offset path is untouched: 280 - 73 = 207 = 0x00CF, and the
+  // whole table still goes through b0_with_bucket_offset.
+  reset_warnings();
+  ProbeBridge compensated;
+  compensated.set_tx_bucket_offset_us(73);
+  compensated.send_raw("AAB005010801180055");
+  assert(compensated.serialized() == "AAB005010800CF0055");
+  assert(compensated.flush_count() == 1);
+  assert(warnings_since_reset() == 0);
+
+  // A crafted COMPENSABLE frame declaring far more than 8 buckets (send_raw
+  // bypasses normalize_b0's 1..8 count check): count 0x28 = 40, length 0x54 =
+  // count + repeat + 80 bucket bytes + 2 data bytes. Bucket 0 is 1 us and
+  // referenced; bucket 1 is a legal 100 us and also referenced. The floor must
+  // rewrite only bucket 0's 4 chars and leave the other 39 byte-verbatim, and
+  // its rewrite loop must never evaluate 1U << bucket past bit 7 -- this
+  // binary is built with -fsanitize=undefined, so a count-wide loop would
+  // abort here instead of silently mis-shifting.
+  std::string crafted = "AAB0542808";
+  for (int index = 0; index < 40; index++)
+    crafted += (index == 0 ? "0001" : "0064");
+  crafted += "0001";
+  crafted += "55";
+  reset_warnings();
+  ProbeBridge wide;
+  wide.send_raw(crafted);
+  std::string floored_wide = "AAB0542808";
+  for (int index = 0; index < 40; index++)
+    floored_wide += "0064";
+  floored_wide += "0001";
+  floored_wide += "55";
+  assert(wide.serialized() == floored_wide);
+  assert(wide.flush_count() == 1);
+  assert(warnings_since_reset() == 1);
+  return 0;
+}
+""",
+        # -fno-sanitize-recover so a triggered check fails the test instead of
+        # printing and exiting 0.
+        extra_flags=["-fsanitize=undefined", "-fno-sanitize-recover=undefined"],
     )

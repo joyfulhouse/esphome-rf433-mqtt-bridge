@@ -37,6 +37,18 @@ constexpr uint64_t MAX_FRAME_AIRTIME_US = 2000000;
 // comparisons. Invalid substitutions are clamped at construction, before a
 // negative value can survive as a huge unsigned delay.
 constexpr uint32_t MAX_REPEAT_GAP_MS = 60000;
+// Lower bound on the duration of any bucket a data nibble references. Both
+// supported RF coprocessors turn a short REFERENCED bucket into a long stuck
+// carrier: the OB38S003 (vendored mightymos port) decrements its remaining-
+// interval counter before testing it for zero, wrapping 0-9 us to ~659.5 ms,
+// and the EFM8BB1 (Portisch) computes `timeout - 65`, underflowing 0-64 us to
+// ~65.5 ms. 100 us clears both hazard ranges while sitting far below the
+// shortest real AOK bucket (280 us). Duplicated by VALUE from
+// esphome::rf_bridge::B0_MIN_BUCKET_US in components/rf_bridge/
+// rf_bridge_protocol.h: this header is compiled standalone by the native
+// tests with only the repo root on the include path, so it must not include
+// that component header. test_native_min_bucket_admission pins the two equal.
+constexpr uint32_t B0_MIN_BUCKET_US = 100;
 // Reserve no more than four seconds of aggregate physical occupancy for one
 // fail-safe STOP copy per concurrent timed obligation. Together with at most
 // one already in-flight legal frame (~2.14 s including UART and margin), this
@@ -381,6 +393,15 @@ inline bool normalize_b0_with_airtime(const std::string &input, std::string &out
     const size_t bucket = static_cast<size_t>(hex_value(output[index]) & 0x07);
     if (bucket >= bucket_count) {
       reason = "frame references an undefined bucket";
+      return false;
+    }
+    // A referenced bucket below B0_MIN_BUCKET_US is a stuck-carrier hazard on
+    // both coprocessor variants (see the constant above). Only REFERENCED
+    // buckets are judged: an unreferenced table entry of any duration is legal
+    // (zero-filled padding in an over-sized table) and never keys the
+    // transmitter.
+    if (bucket_us[bucket] < B0_MIN_BUCKET_US) {
+      reason = "frame references a bucket shorter than 100 us";
       return false;
     }
     airtime_us += bucket_us[bucket];

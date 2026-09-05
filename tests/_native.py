@@ -35,7 +35,7 @@ def rf_bridge_member_bodies() -> dict[str, str]:
     }
 
 
-def compile_and_run(tmp_path: Path, source_text: str) -> None:
+def compile_and_run(tmp_path: Path, source_text: str, extra_flags: list[str] | None = None) -> None:
     """Compile and execute one dependency-free C++17 firmware unit."""
     compiler = shutil.which("c++")
     if compiler is None:
@@ -50,6 +50,7 @@ def compile_and_run(tmp_path: Path, source_text: str) -> None:
             "-Wall",
             "-Wextra",
             "-Werror",
+            *(extra_flags or []),
             "-I",
             str(tmp_path),
             "-I",

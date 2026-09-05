@@ -318,11 +318,13 @@ reason not to do it — they are reasons to do it with your eyes open.
 > ```
 >
 > **Default is `"0"`, which leaves every well-formed frame byte-identical** — an existing bridge
-> that does not set it transmits exactly the bytes it always did. The one exception is deliberate
-> and applies at every offset including `"0"`: a frame carrying the `AAB0` magic that is *not*
-> valid, even-length hex — or is too short to carry the header that magic implies — is now
-> **dropped rather than transmitted**, because the serializer would otherwise invent nibbles the
-> author never wrote (see the malformed-frame note below).
+> that does not set it transmits exactly the bytes it always did, as long as every bucket its
+> frames' data nibbles reference is already ≥ 100 µs. The exceptions are deliberate and apply at
+> every offset including `"0"`: a frame carrying the `AAB0` magic that is *not* valid, even-length
+> hex — or is too short to carry the header that magic implies — is **dropped rather than
+> transmitted**, because the serializer would otherwise invent nibbles the author never wrote (see
+> the malformed-frame note below); and a *referenced* bucket shorter than 100 µs is **floored to
+> 100 µs** (see the floor note below), because both RF coprocessors turn it into a stuck carrier.
 > **EFM8BB1 boards (R2 V1.0/V2.0) must leave it at
 > `"0"`**: they run stock Portisch, which already compensates, so a non-zero value there breaks
 > transmits that currently work.
@@ -359,17 +361,30 @@ reason not to do it — they are reasons to do it with your eyes open.
 > range of equally likely values to sweep — it is the spread across two boards and two measurement
 > methods.
 >
-> Compensated buckets are floored at 100 µs, so compensation itself can never drive a bucket to
-> zero: a zero-length bucket makes the coprocessor's Timer-1 ISR wrap to 65,535 intervals — about
-> **659 ms of stuck carrier** on a shared band. Two limits on that guarantee. It exists **only
-> while `tx_bucket_offset_us` is non-zero** — it is part of the compensation pass, not a frame
-> validator — so on a default install a hand-crafted zero-bucket frame still reaches the
-> coprocessor verbatim. And when the floor does engage it means the offset has eaten the bucket:
-> the frame goes out no longer encoding your code. The bridge logs a warning naming the number of
-> floored buckets — immediately, then at most once a minute, because the condition is a property
-> of the configured offset and would otherwise repeat on every repeat of every dispatch. On a real
-> AOK capture (shortest bucket 280 µs) the floor cannot engage below an offset of 181 µs — which
-> is why the accepted range stops at 120.
+> Buckets are floored at 100 µs, so neither compensation nor a hand-written frame can put a
+> short *referenced* bucket on air. The hazard differs per coprocessor. On the OB38S003 (the
+> vendored mightymos port) the Timer-1 ISR decrements its remaining-interval counter *before*
+> testing it for zero, so a referenced bucket of 0–9 µs wraps to 65,535 intervals — about
+> **659.5 ms of stuck carrier** per referenced occurrence, multiplied by the frame's embedded
+> repeat. On the EFM8BB1 (stock Portisch) the pulse timeout is computed as `timeout - 65`, so a
+> referenced bucket of 0–64 µs underflows to about **65.5 ms** of stuck line. The floor sits
+> above both hazard ranges and far below the shortest real AOK bucket (280 µs).
+>
+> The floor is enforced twice, and both times only on buckets a data nibble actually
+> **references**. `/tx` admission *rejects* a frame that references a sub-100 µs bucket
+> (`"reason":"frame references a bucket shorter than 100 us"`). `rf_bridge.send_raw` — a public
+> action that bypasses admission — instead *floors* each referenced sub-100 µs bucket to 100 µs
+> at **every** offset, including the default `"0"`, and logs a warning naming the number of
+> floored buckets: immediately, then at most once a minute, because the condition is
+> deterministic per frame and would otherwise repeat on every repeat of every dispatch. When the
+> floor engages, the frame goes out no longer encoding the timing it was written with — silent
+> is the one thing that must not happen. At the default offset of `"0"`, unreferenced
+> bucket-table entries are never rewritten, whatever their duration: they never key the
+> transmitter and pass through byte-verbatim. At a non-zero offset the compensation pass rewrites
+> the *whole* bucket table, referenced entries or not — see
+> [#24](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/24). And on a real AOK
+> capture (shortest bucket 280 µs) the compensation floor cannot engage below an offset of 181 µs
+> — which is why the accepted range stops at 120.
 >
 > **Not every transmit is compensated.** This applies to the bucket table of `B0` frames sent
 > through `rf_bridge.send_raw`, which is every transmit this package performs. The two stock
@@ -394,17 +409,17 @@ reason not to do it — they are reasons to do it with your eyes open.
 > `AAB0 05…` gives no honest reading of where the nibbles begin.
 >
 > **What that check is, and is not.** The line it draws is **authorship**: the serializer must not
-> invent nibbles. It is not a ban on zero-length buckets, and it does not close the stuck-carrier
-> hazard in general. A frame whose bucket is a literal `0000` is valid hex, self-consistent, and
-> exactly what its author wrote, so it is accepted — and at the default `"0"`, where the 100 µs
-> floor does not run, it reaches the coprocessor as a `0` and can hold the carrier for ~659 ms.
-> **Nothing in this package prevents that**, and it is unchanged from every prior release.
+> invent nibbles. It is not a ban on short buckets. A frame whose bucket is a literal `0000` is
+> valid hex, self-consistent, and exactly what its author wrote, so it is accepted by this check —
+> but it no longer reaches the coprocessor as a `0`: if a data nibble *references* that bucket,
+> `/tx` admission rejects it, and `send_raw` floors it to 100 µs at every offset including `"0"`.
+> The stuck-carrier residual that earlier revisions of this note documented is closed.
 >
-> It is left open on purpose. A declared bucket need never be *referenced* by a data nibble (the
-> scheduler rejects references *above* `bucket_count`, not unused entries below it), so an
-> over-sized, zero-filled bucket table is legal, is admitted today, and never reaches the air.
-> Refusing every frame containing a zero bucket would drop those too. If you hand-write `B0`
-> frames, the responsibility for not encoding a zero-length bucket is yours.
+> The check stays narrow on purpose. A declared bucket need never be *referenced* by a data nibble
+> (the scheduler rejects references *above* `bucket_count`, not unused entries below it), so an
+> over-sized, zero-filled bucket table is legal, is admitted, and passes through verbatim — an
+> unreferenced entry never reaches the air on either coprocessor variant. Refusing or rewriting
+> every frame containing a zero bucket would break those legitimate tables.
 >
 > This is **compile-time**, not runtime-settable: changing it needs `esphome run` (recompile plus
 > OTA), so budget a flash per trial value. It applies only to the bucket table — data nibbles,
