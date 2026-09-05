@@ -327,9 +327,10 @@ int main() {
                           displaced, reason));
   assert(displaced.size() == 1 && displaced[0] == "cx");
 
-  // Displaced-STOP fairness: two displaced timed commands' owed STOPs rotate,
-  // so the second motor's FIRST stop lands within two pacing gaps instead of
-  // waiting out the first motor's whole repeat train.
+  // A started timed command owns the bridge until its ACTION train finishes;
+  // the second timed command waits to start. Once both have started, their
+  // displaced owed STOPs still rotate, so the second motor's FIRST stop lands
+  // within two pacing gaps instead of waiting out the first motor's STOP train.
   TargetScheduler fair(35);
   assert(fair.schedule("fa", "aabbcc:22:1", "FA", "", 3, 60000, "S1", 0,
                        displaced, reason));
@@ -338,13 +339,21 @@ int main() {
   raw = fair.next(0, started);
   assert(raw && *raw == "FA");
   raw = fair.next(35, started);
+  assert(raw && *raw == "FA");
+  raw = fair.next(70, started);
+  assert(raw && *raw == "FA");
+  raw = fair.next(105, started);
   assert(raw && *raw == "FB");
-  assert(fair.schedule("fc", "aabbcc:22:1,2", "FC", "", 1, 0, "", 70,
+  raw = fair.next(140, started);
+  assert(raw && *raw == "FB");
+  raw = fair.next(175, started);
+  assert(raw && *raw == "FB");
+  assert(fair.schedule("fc", "aabbcc:22:1,2", "FC", "", 1, 0, "", 210,
                        displaced, reason));
   assert(displaced.size() == 2);
   const char *fair_expected[] = {"S1", "S2", "S1", "S2", "S1", "S2", "FC"};
   for (int index = 0; index < 7; index++) {
-    raw = fair.next(static_cast<uint32_t>(70 + 35 * index), started);
+    raw = fair.next(static_cast<uint32_t>(210 + 35 * index), started);
     assert(raw && *raw == fair_expected[index]);
   }
 
@@ -409,22 +418,28 @@ int main() {
   // A due scheduled fail-safe STOP alternates with flushed displaced STOPs
   // instead of waiting behind the entire flush queue.
   TargetScheduler alt(35);
-  assert(alt.schedule("g1", "aabbcc:44:1", "G1", "", 4, 50, "SG1", 0,
+  assert(alt.schedule("g1", "aabbcc:44:1", "G1", "", 4, 150, "SG1", 0,
                       displaced, reason));
   assert(alt.schedule("g2", "aabbcc:44:2", "G2", "", 4, 10000, "SG2", 0,
                       displaced, reason));
   raw = alt.next(0, started);
-  assert(raw && *raw == "G1");  // deadline armed at 50
+  assert(raw && *raw == "G1");  // deadline armed at 150
   raw = alt.next(35, started);
+  assert(raw && *raw == "G1");
+  raw = alt.next(70, started);
+  assert(raw && *raw == "G1");
+  raw = alt.next(105, started);
+  assert(raw && *raw == "G1");
+  raw = alt.next(140, started);
   assert(raw && *raw == "G2");
-  assert(alt.schedule("g3", "aabbcc:44:2", "G3", "", 1, 0, "", 40,
+  assert(alt.schedule("g3", "aabbcc:44:2", "G3", "", 1, 0, "", 150,
                       displaced, reason));
   assert(displaced.size() == 1 && displaced[0] == "g2");
-  raw = alt.next(70, started);
+  raw = alt.next(175, started);
   assert(raw && *raw == "SG2");  // flush frame first
-  raw = alt.next(105, started);
+  raw = alt.next(210, started);
   assert(raw && *raw == "SG1");  // due scheduled STOP takes the next tick
-  raw = alt.next(140, started);
+  raw = alt.next(245, started);
   assert(raw && *raw == "SG2");  // back to the flush queue
   return 0;
 }
@@ -534,23 +549,30 @@ int main() {
   assert(!wrap_scheduler.rf_air_clear(wrap_clear_at - 1U));
   assert(wrap_scheduler.rf_air_clear(wrap_clear_at));
 
-  // Disarming a live command atomically removes its remaining ACTION,
-  // TRAILER, and fail-safe STOP frames without disturbing a concurrent target.
+  // A timed command owns the bridge through ACTION/TRAILER completion. After
+  // disarming its pending fail-safe STOP, the delayed untimed peer still
+  // receives every repeat.
   TargetScheduler concurrent(35);
-  assert(concurrent.schedule("command-a", target_a, "A", "TA", 2, 100, "SA", 0,
+  assert(concurrent.schedule("command-a", target_a, "A", "TA", 2, 200, "SA", 0,
                              displaced, reason));
   assert(concurrent.schedule("command-b", target_b, "B", "", 2, 0, "", 0,
                              displaced, reason));
   raw = concurrent.next(0, started);
   assert(raw && *raw == "A" && started == "command-a");
   raw = concurrent.next(35, started);
-  assert(raw && *raw == "B" && started == "command-b");
+  assert(raw && *raw == "A" && started.empty());
+  raw = concurrent.next(70, started);
+  assert(raw && *raw == "TA" && started.empty());
+  raw = concurrent.next(105, started);
+  assert(raw && *raw == "TA" && started.empty());
   concurrent.disarm("command-a");
   uint32_t age = 0;
-  assert(concurrent.replay_state("command-a", 40, age) == 4);
-  raw = concurrent.next(70, started);
+  assert(concurrent.replay_state("command-a", 110, age) == 4);
+  raw = concurrent.next(140, started);
+  assert(raw && *raw == "B" && started == "command-b");
+  raw = concurrent.next(175, started);
   assert(raw && *raw == "B" && started.empty());
-  assert(!concurrent.next(105, started));
+  assert(!concurrent.next(210, started));
   assert(!concurrent.next(1000, started));
   assert(concurrent.idle());
 

@@ -253,13 +253,14 @@ def test_inter_repeat_gap_stretches_3x_with_real_airtime(tmp_path: Path) -> None
     )
 
 
-def test_armed_stop_preempts_own_train_but_not_peers(tmp_path: Path) -> None:
-    """Truncate only the armed STOP's own train, delaying peers rather than dropping them.
+def test_timed_train_finishes_before_deadline_without_dropping_peers(
+    tmp_path: Path,
+) -> None:
+    """Finish the timed train first, delaying peers rather than dropping them.
 
-    An armed fail-safe STOP that comes due mid-run truncates only its OWN
-    command's remaining repeats; peer targets' trains are delayed, not
-    dropped. STOP copies dispatch consecutively (physical pacing only),
-    bypassing both the round-robin interleave and the user gap floor.
+    A started timed train keeps normal dispatch until its repeats finish.
+    Peer targets' trains are delayed, not dropped, and STOP copies dispatch
+    consecutively (physical pacing only), bypassing the user gap floor.
     """
     _compile_and_run(
         tmp_path,
@@ -268,8 +269,8 @@ def test_armed_stop_preempts_own_train_but_not_peers(tmp_path: Path) -> None:
   std::string reason;
   std::vector<std::string> displaced;
 
-  // A: repeats=5 with an armed fail-safe STOP (stop_after_ms=200); its deadline
-  // arms when A first dispatches at t=0 and comes due at t=200, mid-train.
+  // A: repeats=5 with an armed fail-safe STOP (stop_after_ms=200). Its train
+  // owns the bridge after starting at t=0 and finishes at t=140.
   // B, C: plain repeats=5 on different remotes. Tiny frames, gap=35.
   TargetScheduler s(35);
   assert(s.schedule("cmd-a", "a1b2c3:42:1", "A", "", 5, 200, "SA", 0, displaced, reason));
@@ -281,10 +282,16 @@ def test_armed_stop_preempts_own_train_but_not_peers(tmp_path: Path) -> None:
   assert(count_raw(t, "B") == 5);
   assert(count_raw(t, "C") == 5);
 
-  // A's OWN action train is truncated by its own STOP: only the repeats that
-  // fired before the t=200 deadline (at t=0 and t=105) go out; the remaining
-  // three action repeats are abandoned in favor of the STOP.
-  assert(count_raw(t, "A") == 2);
+  // A's five copies are consecutive normal-work slots and all land before
+  // the unchanged t=200 deadline.
+  std::vector<uint32_t> a_times;
+  for (const auto &tk : t)
+    if (tk.raw == "A")
+      a_times.push_back(tk.t);
+  const uint32_t expected_a_times[] = {0, 35, 70, 105, 140};
+  assert(a_times.size() == 5);
+  for (size_t i = 0; i < a_times.size(); i++)
+    assert(a_times[i] == expected_a_times[i]);
 
   // The fail-safe STOP fires all five copies CONSECUTIVELY once due -- 5 ms
   // apart (physical occupancy only), not interleaved with B/C and not held by
@@ -348,22 +355,36 @@ def test_staggered_admission_reproduces_on_air_run1(tmp_path: Path) -> None:
     )
 
 
-def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
+def test_timed_repeats_finish_before_the_unchanged_stop_dispatch(
     tmp_path: Path,
 ) -> None:
-    """Wait out the in-flight frame, then truncate only the timed command's own train.
+    """Pack timed repeats earlier without moving its STOP dispatch later.
 
     Validation against live-hardware run 3: a timed command's fail-safe STOP
-    is promoted ahead of queued peer ACTION work but still waits out the
-    in-flight frame's physical RF occupancy, and it truncates only ITS OWN
-    remaining action repeats -- never the peer's. Interleaving can push the
-    timed command's later action repeats past its own stop deadline, so it
-    delivers FEWER action repeats under concurrency than it would solo.
+    is promoted ahead of queued peer ACTION work and still waits out physical
+    RF occupancy. Consecutive scheduling preserves all timed repeats without
+    delaying the STOP compared with the pre-fix concurrent timeline.
     """
     _compile_and_run(
         tmp_path,
         "staggered_run3",
         r"""
+  // Pin the complete pre-fix solo timeline: dispatch selection must not alter
+  // a timed command when no peer is competing for the bridge.
+  std::string reason;
+  std::vector<std::string> displaced;
+  TargetScheduler solo(35);
+  assert(solo.schedule("solo", "a1b2c3:42:1", FX, "", 3, 2620, FW, 0,
+                       displaced, reason));
+  auto solo_t = run(solo, 0, 8000);
+  const std::string solo_frames[] = {FX, FX, FX, FW, FW, FW};
+  const uint32_t solo_times[] = {0, 1060, 2120, 3180, 4240, 5300};
+  assert(solo_t.size() == 6);
+  for (size_t i = 0; i < solo_t.size(); i++) {
+    assert(solo_t[i].raw == solo_frames[i]);
+    assert(solo_t[i].t == solo_times[i]);
+  }
+
   TargetScheduler s(35);
   // Timed A (repeats=3, STOP frame FW, deadline arms at first dispatch and
   // comes due at 2620 ms -- mid-train) concurrent with plain B (repeats=3).
@@ -376,16 +397,17 @@ def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
   // The PEER is not truncated: B still gets all three action repeats.
   assert(count_raw(t, FY) == 3);
 
-  // A's OWN action train IS truncated: interleaving delayed A's third action
-  // past its 2620 ms deadline, so A delivers only two of three action repeats,
-  // then the full three-copy fail-safe STOP.
-  assert(count_raw(t, FX) == 2);
+  // A keeps the bridge for its train, so all three action repeats land before
+  // the deadline and the full three-copy fail-safe STOP still follows.
+  assert(count_raw(t, FX) == 3);
   assert(count_raw(t, FW) == 3);
+  assert(t[0].raw == FX && t[0].t == 0);
+  assert(t[1].raw == FX && t[1].t == 1060);
+  assert(t[2].raw == FX && t[2].t == 2120);
 
-  // A started at slot 0 (t=0), so its deadline is 0 + 2620. The first STOP goes
-  // on air only after the in-flight frame (B, dispatched at slot 2 / t=2120)
-  // clears at t=3180: promoted ahead of queued work, but gated by physical RF
-  // occupancy. Lateness beyond the deadline is exactly that remaining occupancy.
+  // A started at t=0, so deadline_at is 2620. The first STOP waits for A's
+  // in-flight third ACTION to clear at t=3180. That is no later than the
+  // pre-fix concurrent first-STOP dispatch, which also landed at t=3180.
   uint32_t first_stop = 0, second_b = 0;
   int b_seen = 0;
   for (const auto &tk : t) {
@@ -394,7 +416,10 @@ def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
     if (tk.raw == FY && ++b_seen == 2)
       second_b = tk.t;
   }
-  assert(first_stop == 3180);
+  constexpr uint32_t armed_deadline = 2620;
+  constexpr uint32_t pre_fix_first_stop = 3180;
+  assert(first_stop >= armed_deadline);
+  assert(first_stop <= pre_fix_first_stop);
   assert(first_stop - 2620 == 560);   // waited out the in-flight frame, not longer
 
   // STOP priority: the first STOP copy goes on air BEFORE B's second action --
@@ -404,8 +429,41 @@ def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
     )
 
 
+def test_first_timed_train_owns_actions_and_trailers_before_second_starts(
+    tmp_path: Path,
+) -> None:
+    """Let the first timed train finish ACTION/TRAILER work before the second starts."""
+    _compile_and_run(
+        tmp_path,
+        "two_timed_train_ownership",
+        r"""
+  std::string reason;
+  std::vector<std::string> displaced;
+  TargetScheduler s(35);
+  assert(s.schedule("first", "a1b2c3:42:1", "A", "TA", 2, 500, "SA", 0,
+                    displaced, reason));
+  assert(s.schedule("second", "a1b2c3:43:1", "B", "", 2, 500, "SB", 0,
+                    displaced, reason));
+  auto t = run(s, 0, 1000);
+
+  // The first started timed command owns all normal ACTION and TRAILER slots.
+  const char *expected_train[] = {"A", "A", "TA", "TA", "B", "B"};
+  const uint32_t expected_times[] = {0, 35, 70, 105, 140, 175};
+  for (size_t i = 0; i < 6; i++) {
+    assert(t[i].raw == expected_train[i]);
+    assert(t[i].t == expected_times[i]);
+  }
+  assert(t[0].started == "first");
+  assert(t[4].started == "second");
+  assert(count_raw(t, "A") == 2 && count_raw(t, "TA") == 2);
+  assert(count_raw(t, "B") == 2);
+  assert(count_raw(t, "SA") == 2 && count_raw(t, "SB") == 2);
+""",
+    )
+
+
 def test_completion_telemetry_reports_delivered_action_repeats(tmp_path: Path) -> None:
-    """Report ACTION-only counts across complete and truncated command shapes."""
+    """Report ACTION-only counts across solo and concurrent command shapes."""
     _compile_and_run(
         tmp_path,
         "completion_telemetry",
@@ -446,7 +504,7 @@ def test_completion_telemetry_reports_delivered_action_repeats(tmp_path: Path) -
     if (!raw || completed.command_id != "timed")
       continue;
     assert(completed.has_action_repeats);
-    assert(completed.action_repeats_delivered == 2);
+    assert(completed.action_repeats_delivered == 3);
     assert(completed.action_repeats_configured == 3);
     saw_timed = true;
   }
@@ -613,9 +671,9 @@ def test_completion_telemetry_preserves_dispatch_timelines(tmp_path: Path) -> No
   };
 
   assert_same(scenario(false, false, false), scenario(true, false, false));
-  const auto truncated = scenario(true, true, false);
-  assert(count_raw(truncated, FX) == 2);
-  assert_same(scenario(false, true, false), truncated);
+  const auto concurrent_timeline = scenario(true, true, false);
+  assert(count_raw(concurrent_timeline, FX) == 3);
+  assert_same(scenario(false, true, false), concurrent_timeline);
   assert_same(scenario(false, true, true), scenario(true, true, true));
 """,
     )
