@@ -384,24 +384,20 @@ void RFBridgeComponent::send_raw(const std::string &raw_code) {
              frame.c_str());
     return;
   }
-  // Anything this pass cannot judge writes exactly the bytes it always wrote.
-  if (status != B0FrameStatus::COMPENSABLE) {
-    ESP_LOGD(TAG, "Sending Raw Code: %s", frame.c_str());
-    this->write_byte_str_(frame);
-    this->flush();
-    return;
-  }
-  // The default path. The floored copy is materialized ONLY when a referenced
-  // bucket is actually below the floor: send_raw runs once per repeat of every
-  // dispatch, and this path must not start allocating for the overwhelmingly
-  // common frame whose buckets are all legal (b0_floor_referenced_buckets
-  // returning false leaves `floored` untouched). Every such frame stays
-  // byte-identical to what the caller wrote, lowercase and zero-padded tables
-  // included.
-  if (this->tx_bucket_offset_us_ == 0) {
+  // Frames this pass cannot judge, and every frame at the default offset of 0,
+  // reach the UART through this one emit. The floored copy is materialized ONLY
+  // when a referenced bucket is actually below the floor
+  // (b0_floor_referenced_buckets returning false leaves `floored` untouched):
+  // send_raw runs once per repeat of every dispatch, and the default path must
+  // not start allocating for the overwhelmingly common frame whose buckets are
+  // all legal. Every such frame stays byte-identical to what the caller wrote,
+  // lowercase and zero-padded tables included.
+  if (status != B0FrameStatus::COMPENSABLE || this->tx_bucket_offset_us_ == 0) {
     std::string floored;
     size_t floored_buckets = 0;
-    if (b0_floor_referenced_buckets(frame, floored, &floored_buckets)) {
+    const std::string *wire = &frame;
+    if (status == B0FrameStatus::COMPENSABLE &&
+        b0_floor_referenced_buckets(frame, floored, &floored_buckets)) {
       // Same "never silent" rule as the offset>0 floor below, with a distinct
       // message: "lower the offset" would be wrong advice at offset 0.
       if (this->clamp_log_due_(App.get_loop_component_start_time())) {
@@ -410,13 +406,10 @@ void RFBridgeComponent::send_raw(const std::string &raw_code) {
                  "encodes its written timing",
                  static_cast<unsigned>(floored_buckets), static_cast<unsigned>(B0_MIN_BUCKET_US));
       }
-      ESP_LOGD(TAG, "Sending Raw Code: %s", floored.c_str());
-      this->write_byte_str_(floored);
-      this->flush();
-      return;
+      wire = &floored;
     }
-    ESP_LOGD(TAG, "Sending Raw Code: %s", frame.c_str());
-    this->write_byte_str_(frame);
+    ESP_LOGD(TAG, "Sending Raw Code: %s", wire->c_str());
+    this->write_byte_str_(*wire);
     this->flush();
     return;
   }

@@ -44,14 +44,14 @@ constexpr size_t B0_MAGIC_CHARS = 4;
 // pair-at-a-time loop simply ignored an odd trailing character. This is the
 // ASCII set the scheduler's normalize_b0 strips at admission.
 inline constexpr char B0_TRIM_CHARS[] = " \t\n\v\f\r";
-// Floor for a compensated bucket duration -- and, since the issue-#18 fix,
-// for every bucket a data nibble references: normalize_b0 rejects such frames
-// at /tx admission, and send_raw floors referenced sub-floor buckets even at
-// the default offset of 0. The OB38S003's Timer-1 ISR
-// decrements its remaining-interval counter BEFORE testing it for zero, so a
-// bucket that reaches zero wraps to 65,535 intervals -- roughly 659 ms of
-// stuck carrier on a shared 433.92 MHz band. This floor sits far above any
-// plausible timer quantum and far below the shortest real AOK bucket (280 us).
+// Floor for a compensated bucket duration -- and for every bucket a data
+// nibble references: normalize_b0 rejects such frames at /tx admission, and
+// send_raw floors referenced sub-floor buckets even at the default offset of
+// 0. The OB38S003's Timer-1 ISR decrements its remaining-interval counter
+// BEFORE testing it for zero, so a bucket that reaches zero wraps to 65,535
+// intervals -- roughly 659 ms of stuck carrier on a shared 433.92 MHz band.
+// This floor sits far above any plausible timer quantum and far below the
+// shortest real AOK bucket (280 us).
 //
 // It has two distinct outcomes, and only one of them is a rescue. A bucket
 // LONGER than the offset but landing under 100 us is raised back to 100 us --
@@ -346,6 +346,24 @@ inline B0FrameStatus b0_frame_status(const std::string &frame) {
   return B0FrameStatus::COMPENSABLE;
 }
 
+// One bucket's 4-hex-char big-endian microsecond duration within a
+// COMPENSABLE frame (b0_frame_status has already proven those chars are hex).
+// b0_bucket mirrors b1_bucket; b0_set_bucket is the rewrite half, emitting the
+// same zero-padded uppercase hex the normalizer produces.
+inline uint32_t b0_bucket(const std::string &frame, size_t index) {
+  const size_t start = B0_BUCKET_TABLE_START + index * 4U;
+  uint32_t duration_us = 0;
+  for (size_t nibble = 0; nibble < 4U; nibble++)
+    duration_us = (duration_us << 4) | static_cast<uint32_t>(hex_nibble(frame[start + nibble]));
+  return duration_us;
+}
+
+inline void b0_set_bucket(std::string &frame, size_t index, uint16_t duration_us) {
+  const size_t start = B0_BUCKET_TABLE_START + index * 4U;
+  for (size_t nibble = 0; nibble < 4U; nibble++)
+    frame[start + nibble] = HEX_DIGITS[(duration_us >> (12U - nibble * 4U)) & 0x0F];
+}
+
 // Subtract a fixed per-bucket microsecond offset from an outbound B0 frame.
 //
 // Sonoff R2 V2.2 boards run the vendored mightymos OB38S003 port, whose B0
@@ -399,16 +417,12 @@ inline std::string b0_with_bucket_offset(const std::string &frame, uint16_t offs
   std::string output = frame;
   size_t clamped = 0;
   for (size_t bucket = 0; bucket < bucket_count; bucket++) {
-    const size_t start = B0_BUCKET_TABLE_START + bucket * 4U;
-    uint32_t duration_us = 0;
-    for (size_t index = 0; index < 4U; index++)
-      duration_us = (duration_us << 4) | static_cast<uint32_t>(hex_nibble(frame[start + index]));
+    const uint32_t duration_us = b0_bucket(frame, bucket);
     const bool clear_of_floor = duration_us >= static_cast<uint32_t>(offset_us) + B0_MIN_BUCKET_US;
     const uint16_t emitted =
         clear_of_floor ? static_cast<uint16_t>(duration_us - offset_us) : B0_MIN_BUCKET_US;
     clamped += clear_of_floor ? 0U : 1U;
-    for (size_t index = 0; index < 4U; index++)
-      output[start + index] = HEX_DIGITS[(emitted >> (12U - index * 4U)) & 0x0F];
+    b0_set_bucket(output, bucket, emitted);
   }
   if (clamped_buckets != nullptr)
     *clamped_buckets = clamped;
@@ -453,11 +467,7 @@ inline bool b0_floor_referenced_buckets(const std::string &frame, std::string &o
     const size_t bucket = static_cast<size_t>(hex_nibble(frame[index]) & 0x07);
     if (bucket >= bucket_count)
       continue;
-    const size_t start = B0_BUCKET_TABLE_START + bucket * 4U;
-    uint32_t duration_us = 0;
-    for (size_t nibble = 0; nibble < 4U; nibble++)
-      duration_us = (duration_us << 4) | static_cast<uint32_t>(hex_nibble(frame[start + nibble]));
-    if (duration_us < B0_MIN_BUCKET_US)
+    if (b0_bucket(frame, bucket) < B0_MIN_BUCKET_US)
       below_floor = static_cast<uint8_t>(below_floor | (1U << bucket));
   }
   if (below_floor == 0)
@@ -467,9 +477,7 @@ inline bool b0_floor_referenced_buckets(const std::string &frame, std::string &o
   for (size_t bucket = 0; bucket < bucket_count; bucket++) {
     if ((below_floor & (1U << bucket)) == 0)
       continue;
-    const size_t start = B0_BUCKET_TABLE_START + bucket * 4U;
-    for (size_t index = 0; index < 4U; index++)
-      output[start + index] = HEX_DIGITS[(B0_MIN_BUCKET_US >> (12U - index * 4U)) & 0x0F];
+    b0_set_bucket(output, bucket, B0_MIN_BUCKET_US);
     clamped++;
   }
   if (clamped_buckets != nullptr)
