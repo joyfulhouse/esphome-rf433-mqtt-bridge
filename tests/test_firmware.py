@@ -2271,9 +2271,9 @@ def test_native_airtime_estimate_floors_buckets_like_the_transmitter(tmp_path: P
 
     b0_with_bucket_offset emits max(duration - offset, B0_MIN_BUCKET_US) per
     bucket, so a sub-100 us bucket keys a full 100 us at any nonzero offset the
-    scheduler never sees. Summing RAW durations under-estimated such frames by
-    up to 100x and let the pacing gate hand the next frame to the coprocessor
-    while RF was still on air. The estimate now floors each bucket the same way.
+    scheduler never sees; summing raw durations would under-estimate such a
+    frame by up to 100x and let the pacing gate hand the next frame to the
+    coprocessor while RF is still on air.
     """
     compile_and_run(
         tmp_path,
@@ -2325,15 +2325,14 @@ def test_native_airtime_estimate_floors_buckets_like_the_transmitter(tmp_path: P
           // The RAW sum is 200 * 10 * 16 = 32,000 us; any nonzero offset floors the
           // bucket to 100 us, so the coprocessor keys 320,000 us -- 10x more.
           const std::string repro = "AAB0680110000A" + std::string(200, '0') + "55";
-          assert(literal_airtime_us(repro) == 32000);
           assert(estimate_us(repro) == 320000);
-          for (uint16_t offset = 0; offset <= 255; offset++)
-            assert(estimate_us(repro) >= literal_airtime_us(b0_with_bucket_offset(repro, offset)));
-          // ...and the bound is tight: at any nonzero offset the emitted frame keys
-          // exactly what the estimate reserved.
-          assert(literal_airtime_us(b0_with_bucket_offset(repro, 1)) == 320000);
-          assert(literal_airtime_us(b0_with_bucket_offset(repro, 90)) == 320000);
-          assert(literal_airtime_us(b0_with_bucket_offset(repro, 255)) == 320000);
+          for (uint16_t offset = 0; offset <= 255; offset++) {
+            const uint64_t emitted_us = literal_airtime_us(b0_with_bucket_offset(repro, offset));
+            assert(estimate_us(repro) >= emitted_us);
+            // ...and the bound is tight: every nonzero offset lands the bucket on
+            // the floor, so the emitted frame keys exactly what was reserved.
+            assert(emitted_us == (offset == 0 ? 32000 : 320000));
+          }
 
           // All-zero-bucket edge case at the maximum declared length: 502 nibbles
           // of a 0 us bucket at repeat 16 summed to 0 us -- "occupies no air" -- yet
@@ -2343,8 +2342,8 @@ def test_native_airtime_estimate_floors_buckets_like_the_transmitter(tmp_path: P
           assert(literal_airtime_us(all_zero) == 0);
           assert(estimate_us(all_zero) == 803200);
           assert(literal_airtime_us(b0_with_bucket_offset(all_zero, 90)) == 803200);
-          // The scheduler no longer treats it as a zero-airtime frame: the second
-          // repeat waits for serialization + 804 ms + margin, not the 35 ms gap.
+          // The scheduler paces it as real airtime: the second repeat waits for
+          // serialization + 804 ms + margin, not the 35 ms gap.
           std::vector<std::string> displaced;
           std::string started;
           std::string reason;

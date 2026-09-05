@@ -367,8 +367,7 @@ inline B0FrameStatus b0_frame_status(const std::string &frame) {
 //
 // This is applied at the UART boundary and NOWHERE else. The scheduler's
 // airtime and RF-pacing math deliberately keeps using the UNcompensated
-// durations (each floored at B0_MIN_BUCKET_US, mirroring the floor below, so
-// the estimate stays >= the emitted airtime for every offset -- see #19):
+// durations, floored per bucket at B0_MIN_BUCKET_US exactly as emitted below:
 // compensating at frame admission would shrink the computed airtime
 // of a production AOK frame by ~96 ms at a 90 us offset -- against a 5 ms
 // margin -- and reopen the UART-ring corruption fixed in field testing.
