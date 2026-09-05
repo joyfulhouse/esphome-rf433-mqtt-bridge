@@ -2266,6 +2266,114 @@ def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path)
     )
 
 
+def test_native_airtime_estimate_floors_buckets_like_the_transmitter(tmp_path: Path) -> None:
+    """The airtime estimate stays >= what the compensated frame keys on air (#19).
+
+    b0_with_bucket_offset emits max(duration - offset, B0_MIN_BUCKET_US) per
+    bucket, so a sub-100 us bucket keys a full 100 us at any nonzero offset the
+    scheduler never sees. Summing RAW durations under-estimated such frames by
+    up to 100x and let the pacing gate hand the next frame to the coprocessor
+    while RF was still on air. The estimate now floors each bucket the same way.
+    """
+    compile_and_run(
+        tmp_path,
+        r"""
+        #include <cassert>
+        #include <cstdint>
+        #include <string>
+        #include <vector>
+        #include "components/rf_bridge/rf_bridge_protocol.h"
+        #include "rf433_scheduler.h"
+
+        using esphome::rf_bridge::b0_with_bucket_offset;
+        using rf433::TargetScheduler;
+
+        // The scheduler cannot include the component header, so the floor is
+        // duplicated there; pin both copies to one value.
+        static_assert(rf433::B0_MIN_BUCKET_US == esphome::rf_bridge::B0_MIN_BUCKET_US,
+                      "scheduler airtime floor must match the transmitter's bucket floor");
+
+        // Ground truth the estimate must never fall below: the airtime the
+        // coprocessor spends on `frame` exactly as written -- every data nibble
+        // holds its bucket's LITERAL duration, times the embedded repeat, no floor.
+        static uint64_t literal_airtime_us(const std::string &frame) {
+          const auto hex = [&](size_t index) {
+            return static_cast<uint32_t>(esphome::rf_bridge::hex_nibble(frame[index]));
+          };
+          const size_t bucket_count = (hex(6) << 4) | hex(7);
+          const uint64_t repeat = (hex(8) << 4) | hex(9);
+          std::vector<uint32_t> bucket_us(bucket_count, 0);
+          for (size_t bucket = 0; bucket < bucket_count; bucket++)
+            for (size_t nibble = 0; nibble < 4; nibble++)
+              bucket_us[bucket] = (bucket_us[bucket] << 4) | hex(10 + bucket * 4 + nibble);
+          uint64_t total = 0;
+          for (size_t index = 10 + bucket_count * 4; index < frame.size() - 2; index++)
+            total += bucket_us[hex(index) & 0x07];
+          return total * repeat;
+        }
+
+        static uint64_t estimate_us(const std::string &frame) {
+          std::string normalized;
+          std::string reason;
+          uint64_t airtime_us = 0;
+          assert(rf433::normalize_b0_with_airtime(frame, normalized, reason, airtime_us));
+          return airtime_us;
+        }
+
+        int main() {
+          // Issue #19 repro: one 10 us bucket, 200 data nibbles, embedded repeat 16.
+          // The RAW sum is 200 * 10 * 16 = 32,000 us; any nonzero offset floors the
+          // bucket to 100 us, so the coprocessor keys 320,000 us -- 10x more.
+          const std::string repro = "AAB0680110000A" + std::string(200, '0') + "55";
+          assert(literal_airtime_us(repro) == 32000);
+          assert(estimate_us(repro) == 320000);
+          for (uint16_t offset = 0; offset <= 255; offset++)
+            assert(estimate_us(repro) >= literal_airtime_us(b0_with_bucket_offset(repro, offset)));
+          // ...and the bound is tight: at any nonzero offset the emitted frame keys
+          // exactly what the estimate reserved.
+          assert(literal_airtime_us(b0_with_bucket_offset(repro, 1)) == 320000);
+          assert(literal_airtime_us(b0_with_bucket_offset(repro, 90)) == 320000);
+          assert(literal_airtime_us(b0_with_bucket_offset(repro, 255)) == 320000);
+
+          // All-zero-bucket edge case at the maximum declared length: 502 nibbles
+          // of a 0 us bucket at repeat 16 summed to 0 us -- "occupies no air" -- yet
+          // compensation keys 100 us per nibble: 803,200 us of carrier.
+          const std::string all_zero = "AAB0FF01100000" + std::string(502, '0') + "55";
+          assert(all_zero.size() == 8 + 0xFF * 2);
+          assert(literal_airtime_us(all_zero) == 0);
+          assert(estimate_us(all_zero) == 803200);
+          assert(literal_airtime_us(b0_with_bucket_offset(all_zero, 90)) == 803200);
+          // The scheduler no longer treats it as a zero-airtime frame: the second
+          // repeat waits for serialization + 804 ms + margin, not the 35 ms gap.
+          std::vector<std::string> displaced;
+          std::string started;
+          std::string reason;
+          TargetScheduler sched(35);
+          assert(sched.schedule("z", "a1b2c3:20:1", all_zero, "", 2, 0, "", 0, displaced, reason));
+          auto raw = sched.next(0, started);
+          assert(raw && *raw == all_zero && started == "z");
+          assert(!sched.rf_air_clear(35));
+          assert(!sched.next(35, started));
+          const uint32_t uart_ms =
+              static_cast<uint32_t>((all_zero.size() * 5000ULL + 19199ULL) / 19200ULL);
+          const uint32_t clear_at = uart_ms + 804 + 5;
+          assert(!sched.next(clear_at - 1, started));
+          raw = sched.next(clear_at, started);
+          assert(raw && *raw == all_zero);
+
+          // Buckets at or above the floor are untouched -- the production frame
+          // pinned elsewhere at 560,160 us and every real AOK bucket (>= 280 us)
+          // keep their airtime; only sub-floor buckets grow, to exactly the floor.
+          assert(estimate_us("AAB005010800640055") == 1600);  // 100 us x 2 nibbles x 8
+          assert(estimate_us("AAB005010800630055") == 1600);  // 99 us -> 100 us
+          assert(estimate_us("AAB005010800010055") == 1600);  // 1 us -> 100 us
+          assert(estimate_us("AAB005010800650055") == 1616);  // 101 us stays 101 us
+          return 0;
+        }
+        """,
+    )
+
+
 @pytest.mark.parametrize(
     ("source", "must_survive", "must_not_survive"),
     [

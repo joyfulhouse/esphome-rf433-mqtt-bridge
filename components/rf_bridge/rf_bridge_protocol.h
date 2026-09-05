@@ -57,6 +57,12 @@ inline constexpr char B0_TRIM_CHARS[] = " \t\n\v\f\r";
 // was captured, not shorter. Either way the emitted bucket no longer carries
 // the captured timing, so b0_with_bucket_offset counts BOTH in its
 // clamped_buckets report and send_raw warns on any non-zero count.
+//
+// rf433_scheduler.h mirrors this value as rf433::B0_MIN_BUCKET_US so its
+// airtime estimate floors each bucket exactly as emitted here and stays an
+// upper bound on real airtime at every offset (it cannot include this header;
+// see the note there). tests/test_firmware.py pins the two equal -- change
+// both together.
 constexpr uint16_t B0_MIN_BUCKET_US = 100;
 
 // `inline`, not `static`: two inline functions below odr-use this object, and a
@@ -361,7 +367,9 @@ inline B0FrameStatus b0_frame_status(const std::string &frame) {
 //
 // This is applied at the UART boundary and NOWHERE else. The scheduler's
 // airtime and RF-pacing math deliberately keeps using the UNcompensated
-// durations: compensating at frame admission would shrink the computed airtime
+// durations (each floored at B0_MIN_BUCKET_US, mirroring the floor below, so
+// the estimate stays >= the emitted airtime for every offset -- see #19):
+// compensating at frame admission would shrink the computed airtime
 // of a production AOK frame by ~96 ms at a 90 us offset -- against a 5 ms
 // margin -- and reopen the UART-ring corruption fixed in field testing.
 // Over-reserving air is safe; under-reserving is not.

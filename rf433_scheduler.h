@@ -31,6 +31,25 @@ constexpr size_t MAX_TOTAL_FRAME_BYTES = 16384;
 // STOP. A real AOK frame runs ~550 ms at the controller's embedded repeat of
 // 8; two seconds admits the full legal repeat range with margin.
 constexpr uint64_t MAX_FRAME_AIRTIME_US = 2000000;
+// Floor for every bucket the transmitter actually keys, mirrored from
+// B0_MIN_BUCKET_US in components/rf_bridge/rf_bridge_protocol.h. The opt-in
+// OB38S003 compensation there (b0_with_bucket_offset, applied once in
+// RFBridgeComponent::send_raw) emits max(duration - offset, 100) us per bucket
+// for a compile-time offset of 0..255 us that this header never sees. Summing
+// the RAW durations therefore under-estimated any frame with a bucket below
+// the floor -- a 10 us bucket keys 100 us on air, and a 0 us bucket keys 100 us
+// instead of nothing -- breaking the estimate >= actual bound that the pacing
+// and rf_air_clear() gates rely on to keep the next UART handoff clear of the
+// coprocessor's ~64-byte ring while RF is still on air. Summing
+// max(duration, 100) per bucket restores the bound for every offset, because
+// max(d - offset, 100) <= max(d, 100), and leaves any bucket already at or
+// above the floor (every real AOK bucket; the shortest is 280 us) untouched,
+// so production pacing does not move. Duplicated rather than included: ESPHome
+// copies this `includes:` header into the build's src/ while the local
+// component compiles under esphome/components/rf_bridge/, so no single include
+// path resolves in both the firmware build and the host tests.
+// tests/test_firmware.py pins the two constants equal.
+constexpr uint32_t B0_MIN_BUCKET_US = 100;
 // A user pacing preference is never allowed to approach the 2^31 ms signed
 // serial-arithmetic horizon used by due_(). Sixty seconds is already far above
 // any useful repeat cadence while leaving >35,000x headroom for rollover-safe
@@ -346,7 +365,9 @@ inline bool normalize_b0_with_airtime(const std::string &input, std::string &out
       reason = "frame references an undefined bucket";
       return false;
     }
-    airtime_us += bucket_us[bucket];
+    // Charge each nibble what the transmitter will actually key, never less:
+    // b0_with_bucket_offset floors every emitted bucket at B0_MIN_BUCKET_US.
+    airtime_us += std::max(bucket_us[bucket], B0_MIN_BUCKET_US);
   }
   const uint64_t total_airtime_us = airtime_us * embedded_repeat;
   if (total_airtime_us > MAX_FRAME_AIRTIME_US) {
