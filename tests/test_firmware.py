@@ -2451,15 +2451,22 @@ def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
     )
     assert "serialized_nibble(" in magic_check
     assert "hex_nibble(" not in magic_check
-    # (4) Exactly one DEFINITION of the shared rule, whatever its parameter is
-    # spelled as. Matched by definition shape -- `name ( [const] type ident )
-    # [const] {` -- over comment-stripped source, not by the literal
-    # `serialized_nibble(char`: that literal was parameter-type-sensitive, so a
-    # same-named `serialized_nibble(int v)` / `(uint8_t v)` / `(const char v)`
-    # definition, at file scope or as a class static, was invisible to it and the
-    # structural guarantee lapsed silently. A call never carries `type ident)`
-    # -- `serialized_nibble(codes[i])` cannot match -- so the real call sites do
-    # not trip this, and the header's one legitimate definition is the only hit.
+    # (4) A BOUNDED regression guard against a same-named second definition, not
+    # an exhaustive C++ definition recognizer. It matches the definition shape
+    # `name ( [const] type ident ) [const] {` over comment-stripped source, which
+    # covers the natural copy spellings: a single-token-typed parameter
+    # (`(char v)`, `(int v)`, `(uint8_t v)`), a const-qualified one
+    # (`(const char v)`), at file scope or as a class-method / class-static
+    # member. The earlier literal `serialized_nibble(char` covered only the first
+    # of those. A call never carries `type ident)` -- `serialized_nibble(codes[i])`
+    # cannot match -- so the real call sites do not trip this, and the header's
+    # one legitimate definition is the only expected hit.
+    #
+    # Deliberately OUT of scope, mirroring the natural-vs-adversarial fence used
+    # throughout this block: multiword or reference parameter types
+    # (`unsigned char`, `const char &`), `noexcept` / trailing-return suffixes,
+    # unnamed parameters (`(char)`), and `decltype`. Someone reaching for those
+    # to inline a one-liner is not the failure mode this guards against.
     #
     # What these do NOT enforce, so nobody over-trusts them: a differently-named
     # private copy written as an `if` rather than a ternary evades both (2) and
