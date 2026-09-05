@@ -39,9 +39,11 @@ constexpr uint64_t MAX_FRAME_AIRTIME_US = 2000000;
 // max(duration, floor) per nibble so it stays an upper bound on what goes on
 // air at every offset -- max(d - offset, 100) <= max(d, 100) -- while any
 // bucket already at or above the floor (every real AOK bucket; the shortest
-// is 280 us) is unchanged, so production pacing does not move. Mirrored
-// rather than included: ESPHome copies this `includes:` header into the
-// build's src/ while the local component compiles under
+// is 280 us) is unchanged, so production pacing does not move. At offset 0
+// the floor does not run and a literal 0 us bucket still keys ~659 ms
+// (HARDWARE.md caveat 2a); that residual is not covered by this estimate.
+// Mirrored rather than included: ESPHome copies this `includes:` header into
+// the build's src/ while the local component compiles under
 // esphome/components/rf_bridge/, so no single include path resolves in both
 // the firmware build and the host tests. tests/test_firmware.py pins the two
 // constants equal.
