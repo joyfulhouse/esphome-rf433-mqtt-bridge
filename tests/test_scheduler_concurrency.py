@@ -355,15 +355,15 @@ def test_staggered_admission_reproduces_on_air_run1(tmp_path: Path) -> None:
     )
 
 
-def test_timed_repeats_finish_before_the_unchanged_stop_dispatch(
+def test_timed_repeats_finish_with_solo_equal_stop_lateness(
     tmp_path: Path,
 ) -> None:
-    """Pack timed repeats earlier without moving its STOP dispatch later.
+    """Pack timed repeats earlier while retaining the solo STOP-lateness bound.
 
     Validation against live-hardware run 3: a timed command's fail-safe STOP
     is promoted ahead of queued peer ACTION work and still waits out physical
     RF occupancy. Consecutive scheduling preserves all timed repeats without
-    delaying the STOP compared with the pre-fix concurrent timeline.
+    adding concurrency delay beyond the owning frame's solo occupancy.
     """
     _compile_and_run(
         tmp_path,
@@ -383,6 +383,18 @@ def test_timed_repeats_finish_before_the_unchanged_stop_dispatch(
   for (size_t i = 0; i < solo_t.size(); i++) {
     assert(solo_t[i].raw == solo_frames[i]);
     assert(solo_t[i].t == solo_times[i]);
+  }
+
+  // An untimed solo train retains the same pre-fix frame timeline too.
+  TargetScheduler untimed_solo(35);
+  assert(untimed_solo.schedule("untimed-solo", "a1b2c3:42:1", FX, "", 3, 0, "", 0,
+                               displaced, reason));
+  auto untimed_solo_t = run(untimed_solo, 0, 5000);
+  const uint32_t untimed_solo_times[] = {0, 1060, 2120};
+  assert(untimed_solo_t.size() == 3);
+  for (size_t i = 0; i < untimed_solo_t.size(); i++) {
+    assert(untimed_solo_t[i].raw == FX);
+    assert(untimed_solo_t[i].t == untimed_solo_times[i]);
   }
 
   TargetScheduler s(35);
@@ -405,9 +417,8 @@ def test_timed_repeats_finish_before_the_unchanged_stop_dispatch(
   assert(t[1].raw == FX && t[1].t == 1060);
   assert(t[2].raw == FX && t[2].t == 2120);
 
-  // A started at t=0, so deadline_at is 2620. The first STOP waits for A's
-  // in-flight third ACTION to clear at t=3180. That is no later than the
-  // pre-fix concurrent first-STOP dispatch, which also landed at t=3180.
+  // A started at t=0, so deadline_at is 2620. The first STOP waits only for
+  // A's in-flight third ACTION to clear at t=3180, matching the solo bound.
   uint32_t first_stop = 0, second_b = 0;
   int b_seen = 0;
   for (const auto &tk : t) {
@@ -418,13 +429,45 @@ def test_timed_repeats_finish_before_the_unchanged_stop_dispatch(
   }
   constexpr uint32_t armed_deadline = 2620;
   constexpr uint32_t pre_fix_first_stop = 3180;
-  assert(first_stop >= armed_deadline);
-  assert(first_stop <= pre_fix_first_stop);
-  assert(first_stop - 2620 == 560);   // waited out the in-flight frame, not longer
+  assert(first_stop == pre_fix_first_stop);
+  assert(first_stop - armed_deadline == 560);  // waited out the in-flight frame, not longer
 
   // STOP priority: the first STOP copy goes on air BEFORE B's second action --
   // the promoted STOP jumps ahead of queued ACTION work.
   assert(second_b > first_stop);
+
+  // With asymmetric airtimes, the packed owner -- not the tiny peer -- may be
+  // in flight at deadline_at. Its STOP lateness remains exactly the same as
+  // solo: only the owning frame's remaining physical occupancy is charged.
+  TargetScheduler asymmetric_solo(35);
+  assert(asymmetric_solo.schedule("big-solo", "a1b2c3:42:1", FX, "", 2, 1061, FW, 0,
+                                  displaced, reason));
+  auto asymmetric_solo_t = run(asymmetric_solo, 0, 5000);
+
+  TargetScheduler asymmetric_shared(35);
+  assert(asymmetric_shared.schedule("big-shared", "a1b2c3:42:1", FX, "", 2, 1061, FW, 0,
+                                    displaced, reason));
+  assert(asymmetric_shared.schedule("tiny-peer", "a1b2c3:43:1", "P", "", 3, 0, "", 0,
+                                    displaced, reason));
+  auto asymmetric_shared_t = run(asymmetric_shared, 0, 6000);
+  assert(count_raw(asymmetric_shared_t, FX) == 2);
+  assert(count_raw(asymmetric_shared_t, "P") == 3);
+
+  uint32_t solo_first_stop = 0, shared_first_stop = 0;
+  for (const auto &tk : asymmetric_solo_t)
+    if (tk.raw == FW && solo_first_stop == 0)
+      solo_first_stop = tk.t;
+  for (const auto &tk : asymmetric_shared_t)
+    if (tk.raw == FW && shared_first_stop == 0)
+      shared_first_stop = tk.t;
+  constexpr uint32_t asymmetric_deadline = 1061;
+  const uint32_t owner_frame_dispatch = asymmetric_shared_t[1].t;
+  const uint32_t owner_frame_occupancy = asymmetric_solo_t[1].t - asymmetric_solo_t[0].t;
+  const uint32_t owner_frame_clear = owner_frame_dispatch + owner_frame_occupancy;
+  assert(shared_first_stop == owner_frame_clear);
+  assert(shared_first_stop - asymmetric_deadline == owner_frame_clear - asymmetric_deadline);
+  assert(shared_first_stop - asymmetric_deadline <= owner_frame_occupancy);
+  assert(shared_first_stop - asymmetric_deadline == solo_first_stop - asymmetric_deadline);
 """,
     )
 
@@ -509,6 +552,43 @@ def test_completion_telemetry_reports_delivered_action_repeats(tmp_path: Path) -
     saw_timed = true;
   }
   assert(saw_timed);
+
+  TargetScheduler truncated(35);
+  assert(truncated.schedule("truncated", "a1b2c3:42:1", "A", "", 5, 50, "SA", 0,
+                            displaced, reason));
+  assert(truncated.schedule("truncated-peer", "a1b2c3:43:1", "B", "", 3, 0, "", 0,
+                            displaced, reason));
+  int truncated_actions = 0;
+  int stop_frames = 0;
+  int peer_actions = 0;
+  uint32_t last_stop = 0;
+  uint32_t first_peer = 0;
+  bool saw_truncated = false;
+  for (uint32_t t = 0; t <= 500; t++) {
+    auto raw = truncated.next(t, started, &completed);
+    if (raw && *raw == "A")
+      truncated_actions++;
+    if (raw && *raw == "SA") {
+      stop_frames++;
+      last_stop = t;
+    }
+    if (raw && *raw == "B") {
+      peer_actions++;
+      if (first_peer == 0) {
+        first_peer = t;
+        assert(started == "truncated-peer");
+      }
+    }
+    if (completed.command_id == "truncated") {
+      assert(completed.has_action_repeats);
+      assert(completed.action_repeats_delivered == 2);
+      assert(completed.action_repeats_configured == 5);
+      saw_truncated = true;
+    }
+  }
+  assert(truncated_actions == 2 && stop_frames == 5 && saw_truncated);
+  assert(peer_actions == 3);
+  assert(first_peer > last_stop);
 
   TargetScheduler with_trailer(35);
   assert(with_trailer.schedule("trailer", "a1b2c3:42:1", "ACTION", "TRAILER", 3, 0, "", 0,

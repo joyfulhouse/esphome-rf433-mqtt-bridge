@@ -549,30 +549,25 @@ int main() {
   assert(!wrap_scheduler.rf_air_clear(wrap_clear_at - 1U));
   assert(wrap_scheduler.rf_air_clear(wrap_clear_at));
 
-  // A timed command owns the bridge through ACTION/TRAILER completion. After
-  // disarming its pending fail-safe STOP, the delayed untimed peer still
-  // receives every repeat.
+  // Disarming a live command atomically removes its remaining ACTION,
+  // TRAILER, and fail-safe STOP frames without disturbing a concurrent target.
   TargetScheduler concurrent(35);
-  assert(concurrent.schedule("command-a", target_a, "A", "TA", 2, 200, "SA", 0,
+  assert(concurrent.schedule("command-a", target_a, "A", "TA", 2, 100, "SA", 0,
                              displaced, reason));
   assert(concurrent.schedule("command-b", target_b, "B", "", 2, 0, "", 0,
                              displaced, reason));
   raw = concurrent.next(0, started);
   assert(raw && *raw == "A" && started == "command-a");
-  raw = concurrent.next(35, started);
-  assert(raw && *raw == "A" && started.empty());
-  raw = concurrent.next(70, started);
-  assert(raw && *raw == "TA" && started.empty());
-  raw = concurrent.next(105, started);
-  assert(raw && *raw == "TA" && started.empty());
   concurrent.disarm("command-a");
   uint32_t age = 0;
-  assert(concurrent.replay_state("command-a", 110, age) == 4);
-  raw = concurrent.next(140, started);
+  assert(concurrent.replay_state("command-a", 35, age) == 4);
+  raw = concurrent.next(35, started);
   assert(raw && *raw == "B" && started == "command-b");
-  raw = concurrent.next(175, started);
+  raw = concurrent.next(70, started);
   assert(raw && *raw == "B" && started.empty());
-  assert(!concurrent.next(210, started));
+  assert(!concurrent.next(105, started));
+  for (uint32_t t = 106; t < 1000; t++)
+    assert(!concurrent.next(t, started));  // no remaining A, TA, or SA frame
   assert(!concurrent.next(1000, started));
   assert(concurrent.idle());
 
