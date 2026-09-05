@@ -1,0 +1,85 @@
+{
+  "info": {
+    "topic": "rf433/fixture-bridge/info",
+    "qos": 0,
+    "retain": true,
+    "payload": {
+      "bridge": "fixture-bridge",
+      "area": "fixture-area",
+      "default": false,
+      "boot": 123,
+      "listen": true,
+      "hw": "efm8bb1-portisch",
+      "v": 3,
+      "caps": {
+        "tx_summary": 1,
+        "a0_complete": 0
+      }
+    }
+  },
+  "tx_summaries": [
+    {
+      "topic": "rf433/fixture-bridge/status",
+      "qos": 1,
+      "retain": false,
+      "payload": {
+        "status": "tx_summary",
+        "command_id": "fixture-complete",
+        "boot": 123,
+        "t": 123456,
+        "action_requested": 3,
+        "action_handoffs": 3,
+        "action_not_handed_off": 0,
+        "trailer_requested": 0,
+        "trailer_handoffs": 0,
+        "trailer_not_handed_off": 0,
+        "stop_requested": 0,
+        "stop_handoffs": 0,
+        "stop_not_handed_off": 0,
+        "terminal": "completed",
+        "truncation": null
+      }
+    },
+    {
+      "topic": "rf433/fixture-bridge/status",
+      "qos": 1,
+      "retain": false,
+      "payload": {
+        "status": "tx_summary",
+        "command_id": "fixture-deadline",
+        "boot": 123,
+        "t": 234567,
+        "action_requested": 3,
+        "action_handoffs": 2,
+        "action_not_handed_off": 1,
+        "trailer_requested": 0,
+        "trailer_handoffs": 0,
+        "trailer_not_handed_off": 0,
+        "stop_requested": 3,
+        "stop_handoffs": 3,
+        "stop_not_handed_off": 0,
+        "terminal": "completed",
+        "truncation": "deadline"
+      }
+    }
+  ],
+  "diagnostics": {
+    "topic": "rf433/fixture-bridge/diagnostics",
+    "qos": 0,
+    "retain": true,
+    "payload": {
+      "boot": 123,
+      "admitted": 2,
+      "started": 2,
+      "summarized": 2,
+      "action_handoffs": 5,
+      "trailer_handoffs": 0,
+      "stop_handoffs": 3,
+      "displacements": 0,
+      "coprocessor_completions": 0,
+      "coprocessor_unknown": 0,
+      "summary_drops": 0,
+      "summary_cache_drops": 0
+    }
+  }
+}

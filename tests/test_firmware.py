@@ -1382,8 +1382,12 @@ struct JsonSlot {
   }
 
   JsonSlot &operator=(const char *value) {
-    (*this->values)[this->key] = value;
+    (*this->values)[this->key] = value == nullptr ? "null" : value;
     return *this;
+  }
+
+  JsonSlot operator[](const char *child) {
+    return {this->values, this->key + "." + child};
   }
 
   JsonSlot &operator=(uint32_t value) {
@@ -1467,6 +1471,7 @@ void generated_tick() {
 
 int main() {
   const std::string frame = "AAB005010100010055";
+  rf433::tx_scheduler(35).start_boot_session(42);
 
   // Contract v3: missing, mistyped, and mismatched boot all reject with the
   // single reason "boot_mismatch" and never reach the scheduler.
@@ -1493,6 +1498,7 @@ int main() {
   // roughly half the time. Prove the boot check accepts a matching value up
   // there too, not just the small literal 42 the rest of this test uses.
   boot_id = 3000000000u;
+  rf433::tx_scheduler(35).start_boot_session(boot_id);
   FakeJson big_boot;
   big_boot.set_string("command_id", "big-boot-1");
   big_boot.set_string("target", "a1b2c3:01:1");
@@ -1513,6 +1519,7 @@ int main() {
   assert(mqtt_client.messages.back().payload.at("reason") == "boot_mismatch");
   assert(rf433::tx_scheduler(35).idle());
   boot_id = 42;
+  rf433::tx_scheduler(35).start_boot_session(boot_id);
 
   mqtt_client.messages.clear();
   mqtt_client.connected = false;
@@ -1557,10 +1564,23 @@ int main() {
       assert(message.payload.at("v") == "3");
       // hw is additive to contract v3: hardware_variant flows through verbatim.
       assert(message.payload.at("hw") == "test-hw");
+      assert(message.payload.at("caps.tx_summary") == "1");
+      assert(message.payload.at("caps.a0_complete") == "0");
       saw_info = true;
     }
   }
   assert(saw_info);
+  bool saw_diagnostics = false;
+  for (const Message &message : mqtt_client.messages) {
+    if (message.topic == "rf433/test-bridge/diagnostics") {
+      assert(message.retained);
+      assert(message.payload.at("boot") == "42");
+      assert(message.payload.at("admitted") == "1");
+      assert(message.payload.at("started") == "1");
+      saw_diagnostics = true;
+    }
+  }
+  assert(saw_diagnostics);
 
   fake_now_ms = 110;
   generated_tick();
@@ -1570,6 +1590,53 @@ int main() {
       delivered_statuses++;
   }
   assert(delivered_statuses == 2);  // no reconnect duplicate
+
+  // The terminal summary is created only after the final STOP's synchronous
+  // UART write, then emitted from its dedicated lane on the following tick.
+  fake_now_ms = 1100;
+  generated_tick();
+  assert(portisch_rf_bridge.sent == std::vector<std::string>({frame, frame}));
+  assert(rf433::tx_scheduler(35).pending_summary_count() == 1);
+  fake_now_ms = 1105;
+  generated_tick();
+  std::vector<Message> summaries;
+  for (const Message &message : mqtt_client.messages) {
+    if (message.topic == "rf433/test-bridge/status" &&
+        message.payload.at("status") == "tx_summary") {
+      summaries.push_back(message);
+    }
+  }
+  assert(summaries.size() == 1);
+  const auto terminal_payload = summaries[0].payload;
+  assert(terminal_payload.at("command_id") == "move-1");
+  assert(terminal_payload.at("boot") == "42");
+  assert(terminal_payload.at("action_requested") == "1");
+  assert(terminal_payload.at("action_handoffs") == "1");
+  assert(terminal_payload.at("action_not_handed_off") == "0");
+  assert(terminal_payload.at("stop_requested") == "1");
+  assert(terminal_payload.at("stop_handoffs") == "1");
+  assert(terminal_payload.at("stop_not_handed_off") == "0");
+  assert(terminal_payload.at("terminal") == "completed");
+  assert(terminal_payload.at("truncation") == "null");
+  assert(terminal_payload.find("coprocessor_completions") == terminal_payload.end());
+  assert(terminal_payload.find("coprocessor_unknown") == terminal_payload.end());
+
+  // A QoS-1 duplicate replays byte-for-byte terminal truth without another
+  // UART handoff or another increment of the boot-scoped summarized counter.
+  const uint32_t summarized_before_replay = rf433::tx_scheduler(35).diagnostics().summarized;
+  fake_now_ms = 1110;
+  generated_tx_handler(command);
+  summaries.clear();
+  for (const Message &message : mqtt_client.messages) {
+    if (message.topic == "rf433/test-bridge/status" &&
+        message.payload.at("status") == "tx_summary") {
+      summaries.push_back(message);
+    }
+  }
+  assert(summaries.size() == 2);
+  assert(summaries[1].payload == terminal_payload);
+  assert(portisch_rf_bridge.sent == std::vector<std::string>({frame, frame}));
+  assert(rf433::tx_scheduler(35).diagnostics().summarized == summarized_before_replay);
   return 0;
 }
 """
@@ -1639,7 +1706,11 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     assert ".stop_and_drain(" not in package
     assert "mode: restart" not in package
     assert "script:" not in package
-    assert "Dispatch" not in scheduler
+    assert "struct Dispatch" in scheduler
+    assert "DispatchPhase phase" in scheduler
+    assert "uint8_t copy_ordinal" in scheduler
+    assert "record_handoff" in scheduler
+    assert "sched.record_handoff(*raw, status_ms);" in package
     assert "CancelResult" not in scheduler
     assert "queue_depth" not in scheduler
     assert "stop_and_drain" not in scheduler

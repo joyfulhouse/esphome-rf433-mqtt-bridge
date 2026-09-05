@@ -69,6 +69,8 @@ esphome:
     then:
       - lambda: |-
           id(boot_id) = esphome::random_uint32();
+          rf433::tx_scheduler(${repeat_gap_ms}).start_boot_session(id(boot_id));
+          rf433::diagnostics_publish_gate().reset();
 
 external_components:
   - source:
@@ -164,7 +166,8 @@ ota:
               std::string started_command_id;
               const auto raw = sched.next(millis(), started_command_id);
               if (raw.has_value()) {
-                id(portisch_rf_bridge).send_raw(*raw);
+                id(portisch_rf_bridge).send_raw(raw->raw);
+                sched.record_handoff(*raw, millis());
               } else {
                 delay(1);
               }
@@ -172,11 +175,12 @@ ota:
             // Anything still armed past the window gets the v1.3.0 early
             // flush: one immediate STOP per armed command, never delayed by
             // the discretionary gap, always honoring physical occupancy.
-            const auto stops = sched.drain_armed_stops();
+            const auto stops = sched.drain_armed_stops(millis());
             for (const auto &stop : stops) {
               while (!sched.rf_air_clear(millis()))
                 delay(1);
               id(portisch_rf_bridge).send_raw(stop.raw);
+              sched.record_handoff(stop, millis());
               delay(stop.occupancy_ms);
             }
     on_error:
@@ -261,6 +265,40 @@ mqtt:
           auto publish_status = [&](const rf433::LifecycleEvent &event) {
             rf433::lifecycle_outbox().publish_or_enqueue(event, send_status);
           };
+          auto send_tx_summary = [&](const rf433::TxSummary &summary) {
+            if (!rf433::lifecycle_outbox().empty())
+              return false;
+            return id(mqtt_client).publish_json(
+                "rf433/${bridge_id}/status", [=](JsonObject root) {
+                  root["status"] = "tx_summary";
+                  root["command_id"] = summary.command_id;
+                  root["boot"] = summary.boot_id;
+                  root["t"] = summary.timestamp_ms;
+                  root["action_requested"] = static_cast<uint32_t>(summary.action_requested);
+                  root["action_handoffs"] = static_cast<uint32_t>(summary.action_handoffs);
+                  root["action_not_handed_off"] =
+                      static_cast<uint32_t>(summary.action_not_handed_off);
+                  root["trailer_requested"] = static_cast<uint32_t>(summary.trailer_requested);
+                  root["trailer_handoffs"] = static_cast<uint32_t>(summary.trailer_handoffs);
+                  root["trailer_not_handed_off"] =
+                      static_cast<uint32_t>(summary.trailer_not_handed_off);
+                  root["stop_requested"] = static_cast<uint32_t>(summary.stop_requested);
+                  root["stop_handoffs"] = static_cast<uint32_t>(summary.stop_handoffs);
+                  root["stop_not_handed_off"] =
+                      static_cast<uint32_t>(summary.stop_not_handed_off);
+                  if (summary.has_coprocessor_outcomes) {
+                    root["coprocessor_completions"] =
+                        static_cast<uint32_t>(summary.coprocessor_completions);
+                    root["coprocessor_unknown"] =
+                        static_cast<uint32_t>(summary.coprocessor_unknown);
+                  }
+                  root["terminal"] = summary.terminal();
+                  if (summary.truncation() == nullptr)
+                    root["truncation"] = nullptr;
+                  else
+                    root["truncation"] = summary.truncation();
+                }, 1, false);
+          };
           auto reject = [&](const std::string &reason) {
             ESP_LOGW("rf433", "Rejected command %s for %s: %s", command_id.c_str(),
                      target.c_str(), reason.c_str());
@@ -322,6 +360,7 @@ mqtt:
             } else {
               publish_status(rf433::LifecycleEvent::displaced(command_id));
             }
+            rf433::tx_scheduler(${repeat_gap_ms}).replay_summary(command_id, send_tx_summary);
             return;
           }
           if (replay > 0) {
@@ -330,6 +369,7 @@ mqtt:
               publish_status(rf433::LifecycleEvent::started(
                   command_id, replay_age_ms, replay_ms, id(boot_id)));
             }
+            rf433::tx_scheduler(${repeat_gap_ms}).replay_summary(command_id, send_tx_summary);
             return;
           }
 
@@ -461,8 +501,8 @@ mqtt:
               ESP_LOGW("rf433", "Rejected disarm command: command_id is invalid");
               return;
             }
-            rf433::tx_scheduler(${repeat_gap_ms}).disarm(command_id);
             const uint32_t status_ms = millis();
+            rf433::tx_scheduler(${repeat_gap_ms}).disarm(command_id, status_ms);
             const auto event = rf433::LifecycleEvent::disarmed(
                 command_id, status_ms, id(boot_id));
             auto send_status = [&](const rf433::LifecycleEvent &queued) {
@@ -542,14 +582,56 @@ interval:
                   }
                 }, 1, false);
           };
-          if (id(mqtt_client).is_connected())
+          auto send_tx_summary = [&](const rf433::TxSummary &summary) {
+            return id(mqtt_client).publish_json(
+                "rf433/${bridge_id}/status", [=](JsonObject root) {
+                  root["status"] = "tx_summary";
+                  root["command_id"] = summary.command_id;
+                  root["boot"] = summary.boot_id;
+                  root["t"] = summary.timestamp_ms;
+                  root["action_requested"] = static_cast<uint32_t>(summary.action_requested);
+                  root["action_handoffs"] = static_cast<uint32_t>(summary.action_handoffs);
+                  root["action_not_handed_off"] =
+                      static_cast<uint32_t>(summary.action_not_handed_off);
+                  root["trailer_requested"] = static_cast<uint32_t>(summary.trailer_requested);
+                  root["trailer_handoffs"] = static_cast<uint32_t>(summary.trailer_handoffs);
+                  root["trailer_not_handed_off"] =
+                      static_cast<uint32_t>(summary.trailer_not_handed_off);
+                  root["stop_requested"] = static_cast<uint32_t>(summary.stop_requested);
+                  root["stop_handoffs"] = static_cast<uint32_t>(summary.stop_handoffs);
+                  root["stop_not_handed_off"] =
+                      static_cast<uint32_t>(summary.stop_not_handed_off);
+                  if (summary.has_coprocessor_outcomes) {
+                    root["coprocessor_completions"] =
+                        static_cast<uint32_t>(summary.coprocessor_completions);
+                    root["coprocessor_unknown"] =
+                        static_cast<uint32_t>(summary.coprocessor_unknown);
+                  }
+                  root["terminal"] = summary.terminal();
+                  if (summary.truncation() == nullptr)
+                    root["truncation"] = nullptr;
+                  else
+                    root["truncation"] = summary.truncation();
+                }, 1, false);
+          };
+          if (id(mqtt_client).is_connected()) {
             outbox.flush(send_status);
+            if (outbox.empty())
+              sched.flush_summaries(send_tx_summary);
+          }
           static uint32_t logged_outbox_drops = 0;
           if (outbox.dropped_count() != logged_outbox_drops) {
             ESP_LOGW("rf433", "Lifecycle outbox dropped %u oldest event(s), total=%u",
                      outbox.dropped_count() - logged_outbox_drops,
                      outbox.dropped_count());
             logged_outbox_drops = outbox.dropped_count();
+          }
+          static uint32_t logged_summary_drops = 0;
+          if (sched.summary_dropped_count() != logged_summary_drops) {
+            ESP_LOGW("rf433", "TX summary retention dropped %u event(s), total=%u",
+                     sched.summary_dropped_count() - logged_summary_drops,
+                     sched.summary_dropped_count());
+            logged_summary_drops = sched.summary_dropped_count();
           }
           const bool busy = !sched.idle() || !sched.rf_air_clear(now_ms);
           const bool desired = !busy && rx.wants_sniff(now_ms, ${listen_enabled});
@@ -577,6 +659,7 @@ interval:
             // Hold the timer due so the first tick after a reconnect
             // republishes retained info immediately.
             id(next_info_ms) = now_ms;
+            rf433::diagnostics_publish_gate().note_disconnected();
           } else if (static_cast<int32_t>(now_ms - id(next_info_ms)) >= 0 &&
                      id(mqtt_client).publish_json("rf433/${bridge_id}/info", [=](JsonObject root) {
                        root["bridge"] = "${bridge_id}";
@@ -588,21 +671,45 @@ interval:
                        // unknown fields are unaffected.
                        root["hw"] = "${hardware_variant}";
                        root["v"] = 3;
+                       root["caps"]["tx_summary"] = 1;
+                       root["caps"]["a0_complete"] = 0;
                      }, 0, true)) {
             id(next_info_ms) = now_ms + 60000;
+          }
+          auto &diagnostics_gate = rf433::diagnostics_publish_gate();
+          if (id(mqtt_client).is_connected() && diagnostics_gate.due(now_ms)) {
+            const rf433::BootDiagnostics diagnostics = sched.diagnostics();
+            if (id(mqtt_client).publish_json(
+                    "rf433/${bridge_id}/diagnostics", [=](JsonObject root) {
+                      root["boot"] = diagnostics.boot_id;
+                      root["admitted"] = diagnostics.admitted;
+                      root["started"] = diagnostics.started;
+                      root["summarized"] = diagnostics.summarized;
+                      root["action_handoffs"] = diagnostics.action_handoffs;
+                      root["trailer_handoffs"] = diagnostics.trailer_handoffs;
+                      root["stop_handoffs"] = diagnostics.stop_handoffs;
+                      root["displacements"] = diagnostics.displacements;
+                      root["coprocessor_completions"] = diagnostics.a0_completions;
+                      root["coprocessor_unknown"] = diagnostics.a0_unknown;
+                      root["summary_drops"] = diagnostics.summary_drops;
+                      root["summary_cache_drops"] = diagnostics.summary_cache_drops;
+                    }, 0, true)) {
+              diagnostics_gate.note_published(now_ms);
+            }
           }
           std::string started_command_id;
           const uint32_t dispatch_ms = millis();
           const auto raw = sched.next(dispatch_ms, started_command_id);
           if (!raw.has_value())
             return;
-          id(portisch_rf_bridge).send_raw(*raw);
+          id(portisch_rf_bridge).send_raw(raw->raw);
+          const uint32_t status_ms = millis();
+          sched.record_handoff(*raw, status_ms);
           if (started_command_id.empty())
             return;
           // `started` means this frame was handed to the RF coprocessor over
           // UART. ESPHome's rf_bridge send_raw does not wait for an EFM8BB1
           // ack, so `started` is proof of dispatch, not of RF emission.
-          const uint32_t status_ms = millis();
           outbox.publish_or_enqueue(
               rf433::LifecycleEvent::started(
                   started_command_id, status_ms - dispatch_ms, status_ms, id(boot_id)),

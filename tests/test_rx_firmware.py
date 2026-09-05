@@ -1295,7 +1295,7 @@ def test_firmware_wires_state_sync_contract_without_rx_to_tx() -> None:
     assert "stop_advanced_sniffing" not in cmd_handler
     assert 'action == "disarm"' in cmd_handler
     assert "rf433::valid_key(command_id)" in cmd_handler
-    assert ".disarm(command_id)" in cmd_handler
+    assert ".disarm(command_id, status_ms)" in cmd_handler
     assert "LifecycleEvent::disarmed" in cmd_handler
     assert "lifecycle_outbox().publish_or_enqueue" in cmd_handler
     assert 'root["t"] = queued.timestamp_ms;' in cmd_handler

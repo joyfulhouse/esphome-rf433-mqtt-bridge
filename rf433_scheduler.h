@@ -58,6 +58,140 @@ constexpr size_t COMMAND_ID_RING_SIZE = 64;
 // on_begin pumps dispatch itself for at most this long waiting for natural
 // idle before falling back to the early-STOP flush.
 static constexpr uint32_t OTA_IDLE_WAIT_MS = 30000;
+static constexpr uint32_t DIAGNOSTICS_INTERVAL_MS = 60000;
+
+enum class DispatchPhase : uint8_t { ACTION, TRAILER, STOP };
+enum class TerminalDisposition : uint8_t { COMPLETED, DISPLACED, DISARMED };
+enum class TruncationReason : uint8_t { NONE, DEADLINE, DISPLACED, DISARMED };
+
+struct Dispatch {
+  std::string command_id;
+  DispatchPhase phase{DispatchPhase::ACTION};
+  uint8_t copy_ordinal{0};
+  std::string raw;
+
+  // Preserve source compatibility for callers that only inspect the raw frame.
+  operator const std::string &() const { return this->raw; }
+  bool operator==(const std::string &other) const { return this->raw == other; }
+  bool operator==(const char *other) const { return this->raw == other; }
+};
+
+struct TxSummary {
+  std::string command_id;
+  uint32_t boot_id{0};
+  uint32_t timestamp_ms{0};
+  uint8_t action_requested{0};
+  uint8_t action_handoffs{0};
+  uint8_t action_not_handed_off{0};
+  uint8_t trailer_requested{0};
+  uint8_t trailer_handoffs{0};
+  uint8_t trailer_not_handed_off{0};
+  uint8_t stop_requested{0};
+  uint8_t stop_handoffs{0};
+  uint8_t stop_not_handed_off{0};
+  uint8_t coprocessor_completions{0};
+  uint8_t coprocessor_unknown{0};
+  TerminalDisposition disposition{TerminalDisposition::COMPLETED};
+  TruncationReason truncation_reason{TruncationReason::NONE};
+  bool has_coprocessor_outcomes{false};
+
+  const char *terminal() const {
+    switch (this->disposition) {
+      case TerminalDisposition::COMPLETED:
+        return "completed";
+      case TerminalDisposition::DISPLACED:
+        return "displaced";
+      case TerminalDisposition::DISARMED:
+        return "disarmed";
+    }
+    return "completed";
+  }
+
+  const char *truncation() const {
+    switch (this->truncation_reason) {
+      case TruncationReason::NONE:
+        return nullptr;
+      case TruncationReason::DEADLINE:
+        return "deadline";
+      case TruncationReason::DISPLACED:
+        return "displaced";
+      case TruncationReason::DISARMED:
+        return "disarmed";
+    }
+    return nullptr;
+  }
+};
+
+struct BootDiagnostics {
+  uint32_t boot_id{0};
+  uint32_t admitted{0};
+  uint32_t started{0};
+  uint32_t summarized{0};
+  uint32_t action_handoffs{0};
+  uint32_t trailer_handoffs{0};
+  uint32_t stop_handoffs{0};
+  uint32_t displacements{0};
+  uint32_t a0_completions{0};
+  uint32_t a0_unknown{0};
+  uint32_t summary_drops{0};
+  uint32_t summary_cache_drops{0};
+};
+
+// Scalar telemetry lives beside the existing 64 command-id records, so the
+// normal immutable cache reuses their bounded strings. The smaller retained
+// lane owns a summary only when lifecycle churn must reuse a still-pending
+// cache slot.
+struct CommandTelemetry {
+  std::array<uint8_t, 3> requested{};
+  std::array<uint8_t, 3> handoffs{};
+  uint32_t summary_timestamp_ms{0};
+  uint32_t summary_boot_id{0};
+  uint16_t pending_dispatches{0};
+  uint8_t pending_copy_ordinal{0};
+  DispatchPhase pending_phase{DispatchPhase::ACTION};
+  TerminalDisposition disposition{TerminalDisposition::COMPLETED};
+  TruncationReason truncation{TruncationReason::NONE};
+  bool tally_active{false};
+  bool scheduler_retired{false};
+  bool has_summary{false};
+  bool summary_pending{false};
+};
+
+struct RetainedSummary {
+  TxSummary summary;
+  uint32_t lifecycle_timestamp_ms{0};
+  uint8_t lifecycle_state{0};
+  bool lifecycle_has_timestamp{false};
+  bool occupied{false};
+  bool pending{false};
+};
+
+class DiagnosticsPublishGate {
+ public:
+  bool due(uint32_t now_ms) const {
+    return this->immediate_ || static_cast<int32_t>(now_ms - this->next_at_ms_) >= 0;
+  }
+
+  void note_published(uint32_t now_ms) {
+    this->immediate_ = false;
+    this->next_at_ms_ = now_ms + DIAGNOSTICS_INTERVAL_MS;
+  }
+
+  void note_disconnected() { this->immediate_ = true; }
+  void reset() { this->immediate_ = true; }
+
+ protected:
+  uint32_t next_at_ms_{0};
+  bool immediate_{true};
+};
+
+static constexpr size_t TX_TELEMETRY_FIXED_STORAGE_BYTES =
+    COMMAND_ID_RING_SIZE * sizeof(CommandTelemetry) +
+    MAX_TARGETS * sizeof(RetainedSummary) + sizeof(BootDiagnostics) +
+    sizeof(DiagnosticsPublishGate);
+static constexpr size_t TX_TELEMETRY_FIXED_STORAGE_BUDGET_BYTES = 3 * 1024;
+static_assert(TX_TELEMETRY_FIXED_STORAGE_BYTES <= TX_TELEMETRY_FIXED_STORAGE_BUDGET_BYTES,
+              "TX telemetry exceeds its fixed RAM budget");
 
 enum class LifecycleKind : uint8_t {
   ACCEPTED,
@@ -423,14 +557,102 @@ inline bool parse_target(const std::string &value, std::string &identity, uint16
 
 class TargetScheduler {
  public:
-  struct EmergencyStop {
-    std::string raw;
+  struct EmergencyStop : Dispatch {
     uint32_t occupancy_ms{0};
   };
 
   explicit TargetScheduler(int64_t repeat_gap_ms)
       : repeat_gap_ms_(static_cast<uint32_t>(
             std::clamp<int64_t>(repeat_gap_ms, 0, MAX_REPEAT_GAP_MS))) {}
+
+  void start_boot_session(uint32_t boot_id) {
+    if (this->boot_initialized_ && this->diagnostics_.boot_id == boot_id)
+      return;
+    this->commands_.clear();
+    this->order_.clear();
+    this->flush_stops_.clear();
+    this->recent_ids_ = {};
+    this->telemetry_ = {};
+    this->retained_summaries_ = {};
+    this->cursor_ = 0;
+    this->recent_cursor_ = 0;
+    this->flush_last_ = false;
+    this->rf_dispatched_ = false;
+    this->rf_busy_until_ = 0;
+    this->next_user_at_.reset();
+    this->diagnostics_ = BootDiagnostics{};
+    this->diagnostics_.boot_id = boot_id;
+    this->boot_initialized_ = true;
+  }
+
+  const BootDiagnostics &diagnostics() const { return this->diagnostics_; }
+
+  size_t cached_summary_count() const {
+    const size_t primary = static_cast<size_t>(std::count_if(
+        this->telemetry_.begin(), this->telemetry_.end(),
+        [](const CommandTelemetry &record) { return record.has_summary; }));
+    return primary + static_cast<size_t>(std::count_if(
+                         this->retained_summaries_.begin(), this->retained_summaries_.end(),
+                         [](const RetainedSummary &record) { return record.occupied; }));
+  }
+
+  size_t pending_summary_count() const {
+    const size_t primary = static_cast<size_t>(std::count_if(
+        this->telemetry_.begin(), this->telemetry_.end(),
+        [](const CommandTelemetry &record) { return record.summary_pending; }));
+    return primary + static_cast<size_t>(std::count_if(
+                         this->retained_summaries_.begin(), this->retained_summaries_.end(),
+                         [](const RetainedSummary &record) { return record.pending; }));
+  }
+
+  uint32_t summary_dropped_count() const { return this->diagnostics_.summary_drops; }
+
+  std::optional<TxSummary> summary_for(const std::string &command_id) const {
+    const size_t slot = this->find_recent_slot_(command_id);
+    if (slot == COMMAND_ID_RING_SIZE || !this->telemetry_[slot].has_summary)
+      return this->retained_summary_for_(command_id);
+    return this->make_summary_(slot);
+  }
+
+  template<typename Publisher> size_t flush_summaries(Publisher &&publish) {
+    size_t published = 0;
+    for (RetainedSummary &record : this->retained_summaries_) {
+      if (!record.pending)
+        continue;
+      if (!publish(record.summary))
+        return published;
+      record.pending = false;
+      published++;
+    }
+    for (size_t slot = 0; slot < COMMAND_ID_RING_SIZE; slot++) {
+      CommandTelemetry &telemetry = this->telemetry_[slot];
+      if (!telemetry.summary_pending)
+        continue;
+      const TxSummary summary = this->make_summary_(slot);
+      if (!publish(summary))
+        break;
+      telemetry.summary_pending = false;
+      published++;
+    }
+    return published;
+  }
+
+  template<typename Publisher>
+  bool replay_summary(const std::string &command_id, Publisher &&publish) {
+    const size_t slot = this->find_recent_slot_(command_id);
+    if (slot != COMMAND_ID_RING_SIZE && this->telemetry_[slot].has_summary) {
+      const TxSummary summary = this->make_summary_(slot);
+      this->telemetry_[slot].summary_pending = !publish(summary);
+      return true;
+    }
+    for (RetainedSummary &record : this->retained_summaries_) {
+      if (!record.occupied || record.summary.command_id != command_id)
+        continue;
+      record.pending = !publish(record.summary);
+      return true;
+    }
+    return false;
+  }
 
   bool idle() const { return this->commands_.empty() && this->flush_stops_.empty(); }
 
@@ -451,34 +673,49 @@ class TargetScheduler {
   // blocking update. Unstarted commands have no armed STOP and are discarded
   // without emitting their ACTION. The caller waits occupancy_ms after each
   // synchronous UART write, preserving the physical RF constraint.
-  std::vector<EmergencyStop> drain_armed_stops() {
+  std::vector<EmergencyStop> drain_armed_stops(uint32_t now_ms = 0) {
     std::vector<EmergencyStop> stops;
     stops.reserve(this->flush_stops_.size() + this->commands_.size());
-    for (const FlushStop &entry : this->flush_stops_) {
-      stops.push_back(
-          EmergencyStop{entry.raw, frame_occupancy_ms_(entry.airtime_ms, entry.raw.size())});
+    std::vector<std::string> retired_ids;
+    for (FlushStop &entry : this->flush_stops_) {
+      Dispatch dispatch{entry.command_id, DispatchPhase::STOP, entry.copy_ordinal, entry.raw};
+      this->note_dispatch_(dispatch);
+      stops.push_back(EmergencyStop{dispatch,
+                                    frame_occupancy_ms_(entry.airtime_ms, entry.raw.size())});
+      retired_ids.push_back(entry.command_id);
     }
     for (const std::string &target : this->order_) {
       const Command &command = this->commands_.at(target);
       if (command.owes_stop()) {
+        const uint8_t ordinal = command.phase == Phase::STOP
+                                    ? static_cast<uint8_t>(command.repeats - command.remaining)
+                                    : 0;
+        Dispatch dispatch{command.command_id, DispatchPhase::STOP, ordinal, command.stop_raw};
+        this->note_dispatch_(dispatch);
         stops.push_back(EmergencyStop{
-            command.stop_raw,
+            dispatch,
             frame_occupancy_ms_(command.stop_airtime_ms, command.stop_raw.size()),
         });
       }
+      retired_ids.push_back(command.command_id);
     }
+    for (const std::string &command_id : retired_ids)
+      this->mark_retired_(command_id, TerminalDisposition::DISARMED,
+                          TruncationReason::DISARMED, now_ms);
     this->commands_.clear();
     this->order_.clear();
     this->flush_stops_.clear();
     this->cursor_ = 0;
     this->flush_last_ = false;
     this->next_user_at_.reset();
+    for (const std::string &command_id : retired_ids)
+      this->try_finalize_(command_id, now_ms);
     return stops;
   }
 
   // Abort every future frame for this id and retain the same terminal state
   // used by displacement so a reordered original command cannot be admitted.
-  void disarm(const std::string &command_id) {
+  void disarm(const std::string &command_id, uint32_t now_ms = 0) {
     std::string target;
     for (const auto &item : this->commands_) {
       if (item.second.command_id == command_id) {
@@ -486,6 +723,8 @@ class TargetScheduler {
         break;
       }
     }
+    this->mark_retired_(command_id, TerminalDisposition::DISARMED,
+                        TruncationReason::DISARMED, now_ms);
     if (!target.empty())
       this->erase_(target);
     this->flush_stops_.erase(
@@ -493,6 +732,7 @@ class TargetScheduler {
                        [&command_id](const FlushStop &entry) { return entry.command_id == command_id; }),
         this->flush_stops_.end());
     this->remember_(command_id, 4);
+    this->try_finalize_(command_id, now_ms);
   }
 
   // Admits one command. Latest command wins: any already-scheduled target on
@@ -608,7 +848,16 @@ class TargetScheduler {
     command.phase = Phase::ACTION;
     this->commands_[target] = std::move(command);
     this->order_.push_back(target);
-    this->remember_(command_id, 1);
+    const size_t telemetry_slot = this->remember_(command_id, 1);
+    CommandTelemetry &telemetry = this->telemetry_[telemetry_slot];
+    telemetry = CommandTelemetry{};
+    telemetry.requested = {
+        static_cast<uint8_t>(repeats),
+        static_cast<uint8_t>(trailer_raw.empty() ? 0 : repeats),
+        static_cast<uint8_t>(stop_after_ms == 0 ? 0 : repeats),
+    };
+    telemetry.tally_active = true;
+    this->diagnostics_.admitted++;
     reason.clear();
     return true;
   }
@@ -674,10 +923,21 @@ class TargetScheduler {
         return recent.state;
       }
     }
+    for (const RetainedSummary &retained : this->retained_summaries_) {
+      if (!retained.occupied || retained.summary.command_id != command_id)
+        continue;
+      if ((retained.lifecycle_state == 2 || retained.lifecycle_state == 4) &&
+          retained.lifecycle_has_timestamp) {
+        age_ms = now_ms - retained.lifecycle_timestamp_ms;
+        if (has_age != nullptr)
+          *has_age = true;
+      }
+      return retained.lifecycle_state;
+    }
     return 0;
   }
 
-  std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id) {
+  std::optional<Dispatch> next(uint32_t now_ms, std::string &started_command_id) {
     started_command_id.clear();
     // Age-based reset applies only to the discretionary user floor. Physical
     // occupancy has its own short, bounded rf_busy_until_ horizon and is never
@@ -696,6 +956,8 @@ class TargetScheduler {
       Command &command = this->commands_.at(target);
       if (command.deadline_armed && command.phase != Phase::STOP &&
           due_(now_ms, command.deadline_at)) {
+        if (command.phase != Phase::WAIT_STOP)
+          this->mark_truncated_(command.command_id, TruncationReason::DEADLINE);
         command.phase = Phase::STOP;
         command.remaining = command.repeats;
         command.next_at = now_ms;
@@ -722,13 +984,14 @@ class TargetScheduler {
       if (!(this->flush_last_ && scheduled_stop_due)) {
         FlushStop entry = std::move(this->flush_stops_.front());
         this->flush_stops_.erase(this->flush_stops_.begin());
-        const std::string raw = entry.raw;
+        Dispatch dispatch{entry.command_id, DispatchPhase::STOP, entry.copy_ordinal, entry.raw};
         const uint32_t airtime_ms = entry.airtime_ms;
+        entry.copy_ordinal++;
         if (--entry.remaining > 0)
           this->flush_stops_.push_back(std::move(entry));
         this->flush_last_ = true;
-        this->record_dispatch_(now_ms, airtime_ms, uart_ms_(raw.size()));
-        return raw;
+        this->record_dispatch_(dispatch, now_ms, airtime_ms, uart_ms_(dispatch.raw.size()));
+        return dispatch;
       }
       this->flush_last_ = false;
     }
@@ -749,7 +1012,11 @@ class TargetScheduler {
             !due_(now_ms, command.next_at))
           continue;
 
-        const std::string raw = this->phase_raw_(command);
+        const DispatchPhase dispatch_phase = this->dispatch_phase_(command.phase);
+        const uint8_t copy_ordinal =
+            static_cast<uint8_t>(command.repeats - command.remaining);
+        Dispatch dispatch{command.command_id, dispatch_phase, copy_ordinal,
+                          this->phase_raw_(command)};
         const uint32_t airtime_ms = this->phase_airtime_ms_(command);
         if (command.phase == Phase::ACTION && !command.started) {
           command.started = true;
@@ -770,13 +1037,50 @@ class TargetScheduler {
 
         this->flush_last_ = false;
         this->cursor_ = (index + 1) % count;
-        if (complete)
+        if (complete) {
+          this->mark_retired_(command.command_id, TerminalDisposition::COMPLETED,
+                              TruncationReason::NONE, now_ms);
           this->erase_(target);
-        this->record_dispatch_(now_ms, airtime_ms, uart_ms_(raw.size()));
-        return raw;
+        }
+        this->record_dispatch_(dispatch, now_ms, airtime_ms, uart_ms_(dispatch.raw.size()));
+        return dispatch;
       }
     }
     return std::nullopt;
+  }
+
+  // The caller invokes this only after send_raw() has synchronously written
+  // and flushed the UART frame. Returning false identifies a stale, duplicate,
+  // or misattributed descriptor without inflating any handoff counter.
+  bool record_handoff(const Dispatch &dispatch, uint32_t timestamp_ms) {
+    const size_t slot = this->find_recent_slot_(dispatch.command_id);
+    if (slot == COMMAND_ID_RING_SIZE)
+      return false;
+    CommandTelemetry &telemetry = this->telemetry_[slot];
+    if (!telemetry.tally_active || telemetry.has_summary || telemetry.pending_dispatches != 1 ||
+        telemetry.pending_phase != dispatch.phase ||
+        telemetry.pending_copy_ordinal != dispatch.copy_ordinal)
+      return false;
+    const size_t phase = phase_index_(dispatch.phase);
+    if (telemetry.handoffs[phase] >= telemetry.requested[phase])
+      return false;
+    telemetry.pending_dispatches = 0;
+    telemetry.handoffs[phase]++;
+    switch (dispatch.phase) {
+      case DispatchPhase::ACTION:
+        this->diagnostics_.action_handoffs++;
+        break;
+      case DispatchPhase::TRAILER:
+        this->diagnostics_.trailer_handoffs++;
+        break;
+      case DispatchPhase::STOP:
+        this->diagnostics_.stop_handoffs++;
+        break;
+    }
+    if (dispatch.phase == DispatchPhase::ACTION && dispatch.copy_ordinal == 0)
+      this->diagnostics_.started++;
+    this->try_finalize_(dispatch.command_id, timestamp_ms);
+    return true;
   }
 
  protected:
@@ -789,6 +1093,7 @@ class TargetScheduler {
     int remaining{0};
     std::string command_id;
     uint32_t airtime_ms{0};
+    uint8_t copy_ordinal{0};
     // millis() when the owning command was displaced, so a redelivery arriving
     // while the STOP still drains reports its age since that instant, not 0.
     // Unlike RecentCommand below this does NOT land in existing padding: on the
@@ -843,18 +1148,37 @@ class TargetScheduler {
         // displaced mid-STOP. They go on air one per pacing gap; the frame is
         // stored once with its send count.
         const int copies = command.phase == Phase::STOP ? command.remaining : command.repeats;
+        const uint8_t copy_ordinal = command.phase == Phase::STOP
+                                         ? static_cast<uint8_t>(command.repeats - command.remaining)
+                                         : 0;
         this->flush_stops_.push_back(FlushStop{command.stop_raw, copies, command.command_id,
-                                               command.stop_airtime_ms, now_ms});
+                                               command.stop_airtime_ms, copy_ordinal, now_ms});
       }
+      this->mark_retired_(command.command_id, TerminalDisposition::DISPLACED,
+                          TruncationReason::DISPLACED, now_ms);
       this->mark_displaced_(command.command_id, now_ms);
+      this->diagnostics_.displacements++;
       displaced_ids.push_back(command.command_id);
       this->erase_(target);
+      this->try_finalize_(displaced_ids.back(), now_ms);
     }
+  }
+
+  size_t find_recent_slot_(const std::string &command_id) const {
+    for (size_t slot = 0; slot < COMMAND_ID_RING_SIZE; slot++) {
+      if (this->recent_ids_[slot].command_id == command_id)
+        return slot;
+    }
+    return COMMAND_ID_RING_SIZE;
   }
 
   bool seen_recently_(const std::string &command_id) const {
     for (const RecentCommand &recent : this->recent_ids_) {
       if (recent.command_id == command_id)
+        return true;
+    }
+    for (const RetainedSummary &retained : this->retained_summaries_) {
+      if (retained.occupied && retained.summary.command_id == command_id)
         return true;
     }
     return false;
@@ -876,7 +1200,7 @@ class TargetScheduler {
     return false;
   }
 
-  void remember_(const std::string &command_id, uint8_t state) {
+  size_t remember_(const std::string &command_id, uint8_t state) {
     // Prefer to evict an inactive slot. If flush_stops_ ever pushes the
     // active-id count past the ring size, the fallback overwrites the oldest
     // slot even if it is active -- which is safe because re-run protection no
@@ -884,22 +1208,32 @@ class TargetScheduler {
     // consult live scheduler state (commands_/flush_stops_) authoritatively,
     // so an evicted active id is still recognized as a duplicate. The ring
     // only shortens the dedup window for already-completed command ids.
-    for (RecentCommand &recent : this->recent_ids_) {
+    for (size_t index = 0; index < COMMAND_ID_RING_SIZE; index++) {
+      RecentCommand &recent = this->recent_ids_[index];
       if (recent.command_id == command_id) {
-        recent = RecentCommand{command_id, state, false, 0};
-        return;
+        recent.state = state;
+        recent.has_timestamp = false;
+        recent.started_at_ms = 0;
+        return index;
       }
     }
     for (size_t probe = 0; probe < COMMAND_ID_RING_SIZE; probe++) {
-      RecentCommand &slot = this->recent_ids_[this->recent_cursor_];
+      const size_t slot_index = this->recent_cursor_;
+      RecentCommand &slot = this->recent_ids_[slot_index];
       this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
       if (!this->is_active_(slot.command_id)) {
+        this->note_cache_eviction_(slot_index);
         slot = RecentCommand{command_id, state, false, 0};
-        return;
+        this->telemetry_[slot_index] = CommandTelemetry{};
+        return slot_index;
       }
     }
-    this->recent_ids_[this->recent_cursor_] = RecentCommand{command_id, state, false, 0};
+    const size_t slot_index = this->recent_cursor_;
+    this->note_cache_eviction_(slot_index);
+    this->recent_ids_[slot_index] = RecentCommand{command_id, state, false, 0};
+    this->telemetry_[slot_index] = CommandTelemetry{};
     this->recent_cursor_ = (this->recent_cursor_ + 1) % COMMAND_ID_RING_SIZE;
+    return slot_index;
   }
 
   // Update an existing ring slot's remembered lifecycle in place. timestamp_ms
@@ -925,6 +1259,160 @@ class TargetScheduler {
 
   void mark_started_(const std::string &command_id, uint32_t now_ms) {
     this->mark_recent_(command_id, 2, true, now_ms);
+  }
+
+  void note_cache_eviction_(size_t slot) {
+    const CommandTelemetry &telemetry = this->telemetry_[slot];
+    if (!telemetry.has_summary)
+      return;
+    const RecentCommand &recent = this->recent_ids_[slot];
+    if (telemetry.summary_pending) {
+      if (!this->retain_summary_(this->make_summary_(slot), recent.state,
+                                 recent.has_timestamp, recent.started_at_ms)) {
+        this->diagnostics_.summary_drops++;
+        this->diagnostics_.summary_cache_drops++;
+      }
+    } else {
+      this->diagnostics_.summary_cache_drops++;
+    }
+  }
+
+  bool retain_summary_(const TxSummary &summary, uint8_t lifecycle_state,
+                       bool lifecycle_has_timestamp, uint32_t lifecycle_timestamp_ms) {
+    RetainedSummary *available = nullptr;
+    for (RetainedSummary &record : this->retained_summaries_) {
+      if (record.occupied && record.summary.command_id == summary.command_id) {
+        record.lifecycle_state = lifecycle_state;
+        record.lifecycle_has_timestamp = lifecycle_has_timestamp;
+        record.lifecycle_timestamp_ms = lifecycle_timestamp_ms;
+        record.pending = true;
+        return true;
+      }
+      if (!record.occupied || !record.pending) {
+        if (available == nullptr || !record.occupied)
+          available = &record;
+        if (!record.occupied)
+          break;
+      }
+    }
+    if (available == nullptr)
+      return false;
+    if (available->occupied)
+      this->diagnostics_.summary_cache_drops++;
+    available->summary = summary;
+    available->lifecycle_state = lifecycle_state;
+    available->lifecycle_has_timestamp = lifecycle_has_timestamp;
+    available->lifecycle_timestamp_ms = lifecycle_timestamp_ms;
+    available->occupied = true;
+    available->pending = true;
+    return true;
+  }
+
+  std::optional<TxSummary> retained_summary_for_(const std::string &command_id) const {
+    for (const RetainedSummary &record : this->retained_summaries_) {
+      if (record.occupied && record.summary.command_id == command_id)
+        return record.summary;
+    }
+    return std::nullopt;
+  }
+
+  static size_t phase_index_(DispatchPhase phase) {
+    switch (phase) {
+      case DispatchPhase::ACTION:
+        return 0;
+      case DispatchPhase::TRAILER:
+        return 1;
+      case DispatchPhase::STOP:
+        return 2;
+    }
+    return 0;
+  }
+
+  static DispatchPhase dispatch_phase_(Phase phase) {
+    if (phase == Phase::TRAILER)
+      return DispatchPhase::TRAILER;
+    if (phase == Phase::STOP)
+      return DispatchPhase::STOP;
+    return DispatchPhase::ACTION;
+  }
+
+  void note_dispatch_(const Dispatch &dispatch) {
+    const size_t slot = this->find_recent_slot_(dispatch.command_id);
+    if (slot == COMMAND_ID_RING_SIZE)
+      return;
+    CommandTelemetry &telemetry = this->telemetry_[slot];
+    if (!telemetry.tally_active || telemetry.has_summary || telemetry.pending_dispatches != 0)
+      return;
+    telemetry.pending_dispatches = 1;
+    telemetry.pending_phase = dispatch.phase;
+    telemetry.pending_copy_ordinal = dispatch.copy_ordinal;
+  }
+
+  void mark_truncated_(const std::string &command_id, TruncationReason truncation) {
+    const size_t slot = this->find_recent_slot_(command_id);
+    if (slot == COMMAND_ID_RING_SIZE || this->telemetry_[slot].has_summary)
+      return;
+    this->telemetry_[slot].truncation = truncation;
+  }
+
+  void mark_retired_(const std::string &command_id, TerminalDisposition disposition,
+                     TruncationReason truncation, uint32_t) {
+    const size_t slot = this->find_recent_slot_(command_id);
+    if (slot == COMMAND_ID_RING_SIZE || this->telemetry_[slot].has_summary)
+      return;
+    CommandTelemetry &telemetry = this->telemetry_[slot];
+    telemetry.scheduler_retired = true;
+    telemetry.disposition = disposition;
+    if (truncation != TruncationReason::NONE)
+      telemetry.truncation = truncation;
+  }
+
+  bool has_scheduled_work_(const std::string &command_id) const {
+    for (const auto &item : this->commands_) {
+      if (item.second.command_id == command_id)
+        return true;
+    }
+    for (const FlushStop &entry : this->flush_stops_) {
+      if (entry.command_id == command_id)
+        return true;
+    }
+    return false;
+  }
+
+  void try_finalize_(const std::string &command_id, uint32_t timestamp_ms) {
+    const size_t slot = this->find_recent_slot_(command_id);
+    if (slot == COMMAND_ID_RING_SIZE)
+      return;
+    CommandTelemetry &telemetry = this->telemetry_[slot];
+    if (!telemetry.tally_active || telemetry.has_summary || !telemetry.scheduler_retired ||
+        telemetry.pending_dispatches != 0 || this->has_scheduled_work_(command_id))
+      return;
+    telemetry.summary_timestamp_ms = timestamp_ms;
+    telemetry.summary_boot_id = this->diagnostics_.boot_id;
+    telemetry.has_summary = true;
+    telemetry.summary_pending = true;
+    telemetry.tally_active = false;
+    this->diagnostics_.summarized++;
+  }
+
+  TxSummary make_summary_(size_t slot) const {
+    const CommandTelemetry &telemetry = this->telemetry_[slot];
+    TxSummary summary;
+    summary.command_id = this->recent_ids_[slot].command_id;
+    summary.boot_id = telemetry.summary_boot_id;
+    summary.timestamp_ms = telemetry.summary_timestamp_ms;
+    summary.action_requested = telemetry.requested[0];
+    summary.action_handoffs = telemetry.handoffs[0];
+    summary.action_not_handed_off = telemetry.requested[0] - telemetry.handoffs[0];
+    summary.trailer_requested = telemetry.requested[1];
+    summary.trailer_handoffs = telemetry.handoffs[1];
+    summary.trailer_not_handed_off = telemetry.requested[1] - telemetry.handoffs[1];
+    summary.stop_requested = telemetry.requested[2];
+    summary.stop_handoffs = telemetry.handoffs[2];
+    summary.stop_not_handed_off = telemetry.requested[2] - telemetry.handoffs[2];
+    summary.disposition = telemetry.disposition;
+    summary.truncation_reason = telemetry.truncation;
+    return summary;
   }
 
   static bool due_(uint32_t now_ms, uint32_t deadline_ms) {
@@ -977,7 +1465,8 @@ class TargetScheduler {
   // mid-transmission corrupts in that ring instead of pacing (field-observed:
   // 10 rapid dispatches, one completion ACK). Zero/unknown airtimes keep the
   // plain repeat gap.
-  void record_dispatch_(uint32_t now_ms, uint32_t airtime_ms, uint32_t serialize_ms) {
+  void record_dispatch_(const Dispatch &dispatch, uint32_t now_ms, uint32_t airtime_ms,
+                        uint32_t serialize_ms) {
     // Serialization is charged only when the frame will actually key RF
     // (airtime > 0). A non-B0 frame's bytes drain through the EFM8's ring
     // concurrently (its parser discards them without transmitting), so
@@ -988,6 +1477,7 @@ class TargetScheduler {
     this->rf_busy_until_ = now_ms + occupancy_ms;
     this->rf_dispatched_ = true;
     this->next_user_at_ = now_ms + this->repeat_gap_ms_;
+    this->note_dispatch_(dispatch);
   }
 
   const std::string &phase_raw_(const Command &command) const {
@@ -1067,7 +1557,11 @@ class TargetScheduler {
   std::vector<std::string> order_;
   std::vector<FlushStop> flush_stops_;
   std::array<RecentCommand, COMMAND_ID_RING_SIZE> recent_ids_{};
+  std::array<CommandTelemetry, COMMAND_ID_RING_SIZE> telemetry_{};
+  std::array<RetainedSummary, MAX_TARGETS> retained_summaries_{};
+  BootDiagnostics diagnostics_{};
   size_t recent_cursor_{0};
+  bool boot_initialized_{false};
 };
 
 // ESPHome emits the globals pstorage that references TargetScheduler BEFORE it
@@ -1083,6 +1577,11 @@ inline TargetScheduler &tx_scheduler(int64_t repeat_gap_ms) {
 
 inline LifecycleOutbox &lifecycle_outbox() {
   static LifecycleOutbox instance;
+  return instance;
+}
+
+inline DiagnosticsPublishGate &diagnostics_publish_gate() {
+  static DiagnosticsPublishGate instance;
   return instance;
 }
 
