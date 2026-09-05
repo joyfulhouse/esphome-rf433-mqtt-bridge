@@ -276,17 +276,20 @@ reason not to do it — they are reasons to do it with your eyes open.
 > The cause is in the port, not in your codes. It dropped the startup-delay compensation upstream
 > Portisch applies before each bucket, it performs a 16-bit division *after* asserting the RF edge
 > (~38–40 µs of arithmetic charged to the pulse already on air), and its Timer-1 reload is off by
-> one interval. The three add up to a roughly **additive** per-bucket error — the same handful of
-> microseconds on every bucket regardless of its length — which is why a fixed correction works
-> and a percentage one does not. We do not patch the firmware: it is an unmaintained upstream
-> binary and calibrating a fix needs measurement hardware this project does not have.
+> one interval. The three add up to an **additive** per-bucket error — a fixed number of
+> microseconds, *not* a percentage of the bucket's length — which is why a fixed correction is the
+> right shape and a proportional one is not. Additive does not mean identical on every edge: the
+> RTL-SDR measurement that came out at +76 µs overall resolved into roughly **+90 µs on pulses and
+> +56 µs on gaps**. We do not patch the firmware: it is an unmaintained upstream binary and
+> calibrating a fix needs measurement hardware this project does not have.
 >
 > **Re-capture every code on the V2.2 board itself, with the original remote in hand.** This is
 > not optional cleanup you can defer — it is the step that makes transmit work. Upstream
 > [issue #36][issue36] is the worked example: old EFM8BB1-captured codes did nothing until the
 > reporter re-sniffed with this firmware and regenerated `B0` from the fresh `B1`, at which point
 > transmission worked. Some users additionally hand-tune by subtracting the measured overshoot
-> from each bucket value.
+> from each bucket value — that is an **alternative** to caveat 2a's `tx_bucket_offset_us`, never
+> a companion to it.
 >
 > Keep the original remotes until every blind is confirmed working. Use this package's own
 > onboarding capture (`{"action":"sniff","seconds":30}`, see
@@ -295,17 +298,32 @@ reason not to do it — they are reasons to do it with your eyes open.
 > 🎛️ **2a. `tx_bucket_offset_us` — opt-in host-side correction, OFF by default.**
 >
 > If freshly captured codes *still* do not move a blind, the package can subtract a fixed number
-> of microseconds from every bucket of every outbound `B0` frame, cancelling the overshoot above.
+> of microseconds from every bucket of every outbound `B0` frame, narrowing the overshoot above.
+>
+> **It cannot cancel the overshoot, and no host-side value can.** A bucket index is referenced as
+> both a *pulse* and a *gap* inside the same frame, and each index carries exactly one 16-bit
+> duration, so one number cannot hold two corrections. With the measured +90 µs on pulses and
+> +56 µs on gaps, a single constant nulls only their **mean**: the best available setting still
+> leaves roughly **±17 µs on every edge** — pulses **still long** by ~17 µs (90 − 73), gaps
+> **short** by ~17 µs (56 − 73). That is a
+> real improvement on an uncorrected +56 µs to +90 µs, and it is the whole of what this knob buys
+> you. If a receiver rejects your frames at ±17 µs, the fix is not a different offset.
+>
 > Set it in your per-device YAML:
 >
 > ```yaml
 > substitutions:
 >   hardware_variant: ob38s003-mightymos
->   tx_bucket_offset_us: "60"   # OB38S003 / R2 V2.2 boards ONLY
+>   tx_bucket_offset_us: "73"   # OB38S003 / R2 V2.2 boards ONLY; see "Finding the value"
 > ```
 >
-> **Default is `"0"`, which is a byte-for-byte no-op** — an existing bridge that does not set it
-> transmits exactly the bytes it always did. **EFM8BB1 boards (R2 V1.0/V2.0) must leave it at
+> **Default is `"0"`, which leaves every well-formed frame byte-identical** — an existing bridge
+> that does not set it transmits exactly the bytes it always did. The one exception is deliberate
+> and applies at every offset including `"0"`: a frame carrying the `AAB0` magic that is *not*
+> valid, even-length hex — or is too short to carry the header that magic implies — is now
+> **dropped rather than transmitted**, because the serializer would otherwise invent nibbles the
+> author never wrote (see the malformed-frame note below).
+> **EFM8BB1 boards (R2 V1.0/V2.0) must leave it at
 > `"0"`**: they run stock Portisch, which already compensates, so a non-zero value there breaks
 > transmits that currently work.
 >
@@ -316,12 +334,77 @@ reason not to do it — they are reasons to do it with your eyes open.
 > > bridge keeps publishing `started` for every command, because `started` only proves the frame
 > > reached the coprocessor over UART, never that it was emitted or received. Pick one correction:
 > > untouched codes plus this knob, or hand-tuned codes plus `"0"`.
+> >
+> > Nothing in the frame distinguishes the two. A hand-tuned `B0` is structurally identical to an
+> > untuned one — same header, same table shape, only smaller numbers — so neither the bridge nor
+> > this knob can detect the mistake and warn you. The effective value is published on retained
+> > `/info` as `tx_offset_us` and printed at boot as `TX bucket offset`; those are the only places
+> > it is visible, and they tell you what the bridge is doing, not what your codes already assume.
 >
-> The right value is **found empirically, per board** — reported measurements span 30–90 µs, and
-> silicon, supply, and temperature all move it. Start at 0, raise it in small steps, and confirm
-> movement at each step. Buckets are floored at 100 µs and can never reach zero: a zero-length
-> bucket makes the coprocessor's Timer-1 ISR wrap to 65,535 intervals — about **659 ms of stuck
-> carrier** on a shared band.
+> **Finding the value.** What is V-shaped is the **worst edge**, not every edge. Below 56 µs both
+> roles are still long and above 90 µs both are short, but *between* them the two move in opposite
+> directions at once — one role long while the other is already short — so no offset makes every
+> edge better than the last. The quantity worth minimizing is therefore the larger of the two
+> errors, `max(|90 − offset|, |56 − offset|)`, and that minimax lands on the **mean of the pulse
+> and gap errors**, `(pulse_error + gap_error) / 2` — with the measured +90/+56 split, **73 µs**,
+> where the ±17 µs residual above is what remains. Start from your board's mean if you have measured
+> one, otherwise from 73, and search a **small range around it** rather than climbing toward the
+> pulse-only figure of 90; silicon, supply, and temperature all move it, so treat it as per-board.
+> The package accepts `0`–`120`, roughly 1.3× the highest number anyone has reported.
+>
+> **Three different numbers circulate for this error, and they are not alternatives to each
+> other:** `+30 µs` is one reporter's Flipper Zero measurement; `+76 µs` is the original
+> single-number RTL-SDR measurement of the same effect; `+90 µs`/`+56 µs` is that same RTL-SDR
+> measurement later resolved per edge (pulse/gap), whose mean is `73 µs`. Do not read `30–90` as a
+> range of equally likely values to sweep — it is the spread across two boards and two measurement
+> methods.
+>
+> Compensated buckets are floored at 100 µs, so compensation itself can never drive a bucket to
+> zero: a zero-length bucket makes the coprocessor's Timer-1 ISR wrap to 65,535 intervals — about
+> **659 ms of stuck carrier** on a shared band. Two limits on that guarantee. It exists **only
+> while `tx_bucket_offset_us` is non-zero** — it is part of the compensation pass, not a frame
+> validator — so on a default install a hand-crafted zero-bucket frame still reaches the
+> coprocessor verbatim. And when the floor does engage it means the offset has eaten the bucket:
+> the frame goes out no longer encoding your code. The bridge logs a warning naming the number of
+> floored buckets — immediately, then at most once a minute, because the condition is a property
+> of the configured offset and would otherwise repeat on every repeat of every dispatch. On a real
+> AOK capture (shortest bucket 280 µs) the floor cannot engage below an offset of 181 µs — which
+> is why the accepted range stops at 120.
+>
+> **Not every transmit is compensated.** This applies to the bucket table of `B0` frames sent
+> through `rf_bridge.send_raw`, which is every transmit this package performs. The two stock
+> transmit actions write to the UART without passing through it, and they are not in the same
+> position as each other:
+>
+> - `rf_bridge.send_advanced_code` (`0xA8`) carries a protocol **ID**. The coprocessor generates
+>   the edges from its own protocol table, so there are no host-supplied timings to correct.
+> - `rf_bridge.send_code` (`0xA5`) is different: its `sync`, `low`, and `high` fields **are**
+>   host-supplied microsecond timings, written straight from your YAML. They are **not** corrected
+>   by `tx_bucket_offset_us`, and whether they suffer issue #27 the way bucket timings do has
+>   **not been measured**. Treat A5 transmits on OB38S003 as unverified rather than as either
+>   working or broken.
+>
+> **A malformed `B0` frame is dropped, not transmitted.** If a frame carries the `AAB0` magic but
+> is not valid, even-length hex — or is too short to carry the header that magic implies — the
+> bridge refuses it and logs a warning; nothing reaches the coprocessor. The serializer would
+> otherwise turn an unparseable nibble into `0` and truncate an odd one, putting timings on air
+> that the author never wrote. This check runs whatever `tx_bucket_offset_us` is set to, including
+> `"0"`. Leading and trailing whitespace is trimmed first, so a frame read out of a text sensor
+> keeps working with its newline attached; whitespace *inside* a frame is refused, because
+> `AAB0 05…` gives no honest reading of where the nibbles begin.
+>
+> **What that check is, and is not.** The line it draws is **authorship**: the serializer must not
+> invent nibbles. It is not a ban on zero-length buckets, and it does not close the stuck-carrier
+> hazard in general. A frame whose bucket is a literal `0000` is valid hex, self-consistent, and
+> exactly what its author wrote, so it is accepted — and at the default `"0"`, where the 100 µs
+> floor does not run, it reaches the coprocessor as a `0` and can hold the carrier for ~659 ms.
+> **Nothing in this package prevents that**, and it is unchanged from every prior release.
+>
+> It is left open on purpose. A declared bucket need never be *referenced* by a data nibble (the
+> scheduler rejects references *above* `bucket_count`, not unused entries below it), so an
+> over-sized, zero-filled bucket table is legal, is admitted today, and never reaches the air.
+> Refusing every frame containing a zero bucket would drop those too. If you hand-write `B0`
+> frames, the responsibility for not encoding a zero-length bucket is yours.
 >
 > This is **compile-time**, not runtime-settable: changing it needs `esphome run` (recompile plus
 > OTA), so budget a flash per trial value. It applies only to the bucket table — data nibbles,

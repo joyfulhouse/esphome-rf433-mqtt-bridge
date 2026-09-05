@@ -34,16 +34,39 @@ constexpr size_t AOK_TRAILER_BITS = 2;
 // repeat at 8..9, then one 4-hex-char big-endian microsecond duration per
 // bucket, then the data nibbles.
 constexpr size_t B0_BUCKET_TABLE_START = 10;
+// Width of the AAB0 magic. A frame this long can be recognized as a B0 -- and
+// so held to B0 rules -- before it is long enough to carry the header those
+// rules read.
+constexpr size_t B0_MAGIC_CHARS = 4;
+// Whitespace a caller's frame may legitimately carry at either end. Reading a
+// frame out of a text sensor, a template, or a file hands the lambda a trailing
+// newline for free, and before compensation existed write_byte_str_'s
+// pair-at-a-time loop simply ignored an odd trailing character. This is the
+// ASCII set the scheduler's normalize_b0 strips at admission.
+inline constexpr char B0_TRIM_CHARS[] = " \t\n\v\f\r";
 // Floor for a compensated bucket duration. The OB38S003's Timer-1 ISR
 // decrements its remaining-interval counter BEFORE testing it for zero, so a
 // bucket that reaches zero wraps to 65,535 intervals -- roughly 659 ms of
 // stuck carrier on a shared 433.92 MHz band. This floor sits far above any
-// plausible timer quantum and far below the shortest real AOK bucket (280 us),
-// so it only ever engages on a duration compensation would otherwise destroy.
+// plausible timer quantum and far below the shortest real AOK bucket (280 us).
+//
+// It has two distinct outcomes, and only one of them is a rescue. A bucket
+// LONGER than the offset but landing under 100 us is raised back to 100 us --
+// shortened, but not destroyed. A bucket SHORTER than the offset would go
+// negative, so it comes out INFLATED to 100 us: longer than the duration that
+// was captured, not shorter. Either way the emitted bucket no longer carries
+// the captured timing, so b0_with_bucket_offset counts BOTH in its
+// clamped_buckets report and send_raw warns on any non-zero count.
 constexpr uint16_t B0_MIN_BUCKET_US = 100;
 
-static constexpr char HEX_DIGITS[] = "0123456789ABCDEF";
+// `inline`, not `static`: two inline functions below odr-use this object, and a
+// `static` (internal-linkage) array in a header gives every translation unit its
+// own copy, so those definitions would refer to different entities across TUs --
+// ill-formed, no diagnostic required ([basic.def.odr]/12).
+inline constexpr char HEX_DIGITS[] = "0123456789ABCDEF";
 
+// Parse one hex character, or -1 if it is not one. Use this to ASK whether a
+// character is valid hex.
 inline int hex_nibble(char value) {
   if (value >= '0' && value <= '9')
     return value - '0';
@@ -52,6 +75,23 @@ inline int hex_nibble(char value) {
   if (value >= 'a' && value <= 'f')
     return value - 'a' + 10;
   return -1;
+}
+
+// The nibble a character actually becomes ON THE WIRE. write_byte_str_ cannot
+// signal failure mid-frame, so it coerces anything unparseable to 0; this
+// function IS that rule, and it is the only expression of it in the codebase.
+//
+// Anything deciding what a frame WILL BE must use this, never hex_nibble.
+// Judging characters while the UART emits bytes is what let
+// `AABZ050108ZZZZ0055` through: hex_nibble('Z') is -1, so it failed the AAB0
+// magic and was waved past every check as "not a B0 frame", then serialized to
+// AA B0 05 01 08 00 00 00 55 -- a well-formed B0 frame carrying a zero bucket,
+// and with it the ~659 ms stuck carrier, from untrusted MQTT input at every
+// offset. One shared rule is what keeps the classifier's model of the wire from
+// drifting away from the wire again.
+inline uint8_t serialized_nibble(char value) {
+  const int parsed = hex_nibble(value);
+  return parsed < 0 ? 0U : static_cast<uint8_t>(parsed);
 }
 
 enum class B1FrameStatus : uint8_t {
@@ -232,16 +272,92 @@ inline std::string compact_hex(const std::vector<uint8_t> &raw) {
   return output;
 }
 
+// What the transmit path may do with a candidate outbound frame.
+enum class B0FrameStatus : uint8_t {
+  // Serialize the caller's characters verbatim. Either the frame is not an
+  // outbound bucket frame at all (A5/A8 command strings, sniff arming) -- not
+  // ours to judge -- or it is an AAB0 frame whose declared shape does not add
+  // up, which cannot be compensated but is still lossless on the wire.
+  PASSTHROUGH,
+  // An AAB0 frame whose characters cannot survive serialization: write_byte_str_
+  // coerces an unparseable nibble to 0 and drops a trailing odd nibble, so this
+  // frame would reach the coprocessor as something the caller never WROTE.
+  // Must not reach the UART at all.
+  //
+  // The line this draws is authorship, not safety: it stops the serializer
+  // INVENTING nibbles, which is why `ZZZZ` (which would be invented as the 0
+  // bucket, and its 659 ms stuck carrier) is refused. It is deliberately NOT a
+  // ban on zero buckets. A literal `0000` is valid hex, self-consistent, and
+  // exactly what its author wrote, so it classifies COMPENSABLE and -- at the
+  // default offset, where the B0_MIN_BUCKET_US floor does not run -- still
+  // reaches the coprocessor as a 0. That residual predates this pass and is
+  // documented in HARDWARE.md caveat 2a; it is not closed here because a
+  // declared bucket need never be REFERENCED by a data nibble (normalize_b0
+  // only rejects references ABOVE bucket_count), so zero-filled padding in an
+  // over-sized table is legal, admitted today, and never reaches the air.
+  MALFORMED,
+  // A self-consistent, fully-hex B0 bucket frame: lossless to serialize, and
+  // eligible for bucket compensation.
+  COMPENSABLE,
+};
+
+// Classify an outbound frame. Allocation-free, so the default (offset 0)
+// transmit path can screen every frame without paying for a copy it will
+// never rewrite.
+inline B0FrameStatus b0_frame_status(const std::string &frame) {
+  // The magic, and ONLY the magic, decides whether a frame is ours to judge --
+  // length must not, or a truncated `AAB0Z` would skip every check below and
+  // reach the UART as a fragment.
+  //
+  // It is matched on SERIALIZED nibbles, not characters: the question is not
+  // "does this look like AAB0?" but "will the coprocessor receive AA B0?", and
+  // only the bytes write_byte_str_ actually emits can answer that. This is why
+  // lowercase `aab0...` is judged (hex is case-insensitive) and, less
+  // obviously, why `AABZ...` is too -- the serializer coerces Z to 0, so that
+  // frame IS a B0 frame once it reaches the wire.
+  if (frame.size() < B0_MAGIC_CHARS || serialized_nibble(frame[0]) != 0xA ||
+      serialized_nibble(frame[1]) != 0xA || serialized_nibble(frame[2]) != 0xB ||
+      serialized_nibble(frame[3]) != 0x0)
+    return B0FrameStatus::PASSTHROUGH;
+  // From here the frame claims to be a B0, so its characters are held to what
+  // write_byte_str_ can serialize without silently altering them: a frame too
+  // short to carry the header it claims would serialize as a bare fragment, and
+  // an odd length loses its last nibble.
+  if (frame.size() < B0_BUCKET_TABLE_START || frame.size() % 2U != 0)
+    return B0FrameStatus::MALFORMED;
+  for (const char value : frame) {
+    if (hex_nibble(value) < 0)
+      return B0FrameStatus::MALFORMED;
+  }
+  const size_t body_length = static_cast<size_t>((hex_nibble(frame[4]) << 4) | hex_nibble(frame[5]));
+  const size_t bucket_count = static_cast<size_t>((hex_nibble(frame[6]) << 4) | hex_nibble(frame[7]));
+  // The declared bucket count and the declared body length must agree with each
+  // other and with the frame, exactly as the scheduler's normalize_b0 requires
+  // before admission. send_raw is a public ESPHome action, so a frame reaching
+  // here need not have come from the normalizer: without this check an
+  // over-declaring count would rewrite real data nibbles as bucket durations.
+  const size_t body_end = 6U + body_length * 2U;
+  if (frame.size() != 8U + body_length * 2U || B0_BUCKET_TABLE_START + bucket_count * 4U > body_end)
+    return B0FrameStatus::PASSTHROUGH;
+  return B0FrameStatus::COMPENSABLE;
+}
+
 // Subtract a fixed per-bucket microsecond offset from an outbound B0 frame.
 //
 // Sonoff R2 V2.2 boards run the vendored mightymos OB38S003 port, whose B0
 // transmitter holds every bucket LONGER than commanded (upstream
 // mightymos/RF-Bridge-OB38S003#27): the port dropped Portisch's startup-delay
 // compensation, performs a 16-bit division after asserting the RF edge, and
-// reloads Timer-1 one tick long. The measured error is additive (~+90 us on
-// pulses and ~+56 us on gaps against a calibrated RTL-SDR; ~+30 us for another
-// reporter), so subtracting one empirically-found constant from every bucket
-// restores on-air timing for receivers with tight windows.
+// reloads Timer-1 one tick long. The error is additive rather than proportional
+// to bucket length, but it is NOT the same on every edge: against a calibrated
+// RTL-SDR it measured ~+90 us on pulses and ~+56 us on gaps.
+//
+// A B0 bucket index is referenced as BOTH a pulse and a gap within one frame,
+// and each index carries a single 16-bit duration, so one value cannot hold two
+// corrections. Subtracting a constant therefore nulls only the MEAN of the two
+// errors and leaves roughly +/-17 us on every edge; no single host-side value
+// can remove that residual. The knob narrows the timing error, it does not
+// cancel it.
 //
 // This is applied at the UART boundary and NOWHERE else. The scheduler's
 // airtime and RF-pacing math deliberately keeps using the UNcompensated
@@ -250,43 +366,48 @@ inline std::string compact_hex(const std::vector<uint8_t> &raw) {
 // margin -- and reopen the UART-ring corruption fixed in field testing.
 // Over-reserving air is safe; under-reserving is not.
 //
-// Returns `frame` unchanged when `offset_us` is 0 -- the shipped default, so a
-// default build emits byte-for-byte what it always has -- and when `frame` is
-// not a B0 bucket frame. Only the 4-hex-char bucket table is rewritten, in the
-// same zero-padded uppercase hex the normalizer produces; the length byte,
-// embedded repeat, data nibbles, and trailer are copied verbatim.
+// Returns `frame` unchanged when `offset_us` is 0 -- the shipped default -- and
+// whenever b0_frame_status says the input is not COMPENSABLE. This rewrite is
+// therefore a byte-for-byte no-op on a default build; note that send_raw still
+// DROPS a MALFORMED frame at every offset, so "unchanged here" is not the same
+// as "transmitted". Only the 4-hex-char bucket
+// table is rewritten, in the same zero-padded uppercase hex the normalizer
+// produces; the length byte, embedded repeat, data nibbles, and trailer are
+// copied verbatim.
+//
+// An unchanged return is NOT a verdict that the frame is safe to transmit: a
+// MALFORMED frame also comes back unchanged, and send_raw drops those before
+// serialization rather than letting write_byte_str_ zero their bad nibbles.
+// Callers screen with b0_frame_status; this function only rewrites.
 //
 // Every emitted bucket is floored at B0_MIN_BUCKET_US and can never reach 0 --
-// see that constant for the 659 ms stuck-carrier hazard it exists to prevent.
-inline std::string b0_with_bucket_offset(const std::string &frame, uint16_t offset_us) {
-  if (offset_us == 0 || frame.size() < B0_BUCKET_TABLE_START || frame.compare(0, 4, "AAB0") != 0)
+// see that constant for the 659 ms stuck-carrier hazard it exists to prevent,
+// and for the two ways the floor engages. Either way the emitted bucket stops
+// carrying the captured timing, so when `clamped_buckets` is non-null it
+// receives how many buckets the floor caught and the caller can say so out loud.
+inline std::string b0_with_bucket_offset(const std::string &frame, uint16_t offset_us,
+                                         size_t *clamped_buckets = nullptr) {
+  if (clamped_buckets != nullptr)
+    *clamped_buckets = 0;
+  if (offset_us == 0 || b0_frame_status(frame) != B0FrameStatus::COMPENSABLE)
     return frame;
-  const int count_high = hex_nibble(frame[6]);
-  const int count_low = hex_nibble(frame[7]);
-  if (count_high < 0 || count_low < 0)
-    return frame;
-  const size_t bucket_count = static_cast<size_t>((count_high << 4) | count_low);
-  // The data nibbles begin where the bucket table ends. A frame too short to
-  // hold the table it declares is passed through whole rather than partially
-  // rewritten.
-  if (frame.size() < B0_BUCKET_TABLE_START + bucket_count * 4U)
-    return frame;
+  const size_t bucket_count = static_cast<size_t>((hex_nibble(frame[6]) << 4) | hex_nibble(frame[7]));
   std::string output = frame;
+  size_t clamped = 0;
   for (size_t bucket = 0; bucket < bucket_count; bucket++) {
     const size_t start = B0_BUCKET_TABLE_START + bucket * 4U;
     uint32_t duration_us = 0;
-    for (size_t index = 0; index < 4U; index++) {
-      const int value = hex_nibble(frame[start + index]);
-      if (value < 0)
-        return frame;
-      duration_us = (duration_us << 4) | static_cast<uint32_t>(value);
-    }
-    const uint32_t reduced = duration_us > offset_us ? duration_us - offset_us : 0U;
+    for (size_t index = 0; index < 4U; index++)
+      duration_us = (duration_us << 4) | static_cast<uint32_t>(hex_nibble(frame[start + index]));
+    const bool clear_of_floor = duration_us >= static_cast<uint32_t>(offset_us) + B0_MIN_BUCKET_US;
     const uint16_t emitted =
-        reduced < B0_MIN_BUCKET_US ? B0_MIN_BUCKET_US : static_cast<uint16_t>(reduced);
+        clear_of_floor ? static_cast<uint16_t>(duration_us - offset_us) : B0_MIN_BUCKET_US;
+    clamped += clear_of_floor ? 0U : 1U;
     for (size_t index = 0; index < 4U; index++)
       output[start + index] = HEX_DIGITS[(emitted >> (12U - index * 4U)) & 0x0F];
   }
+  if (clamped_buckets != nullptr)
+    *clamped_buckets = clamped;
   return output;
 }
 

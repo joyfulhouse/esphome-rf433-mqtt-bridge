@@ -10,6 +10,12 @@ namespace esphome::rf_bridge {
 
 static const char *const TAG = "rf_bridge";
 
+// Quiet window for the floored-bucket warning after its first occurrence. The
+// condition never changes within a build, so repeating it per repeat, per
+// trailer, and per fail-safe STOP adds no information -- only UART time inside
+// the dispatch loop and MQTT-republished log traffic.
+static constexpr uint32_t CLAMP_LOG_INTERVAL_MS = 60000;
+
 void RFBridgeComponent::finish_bucket_capture_(bool publish) {
   // Never ACK a delivery. Portisch's capture path is fire-and-forget (it
   // clears RF_DATA_STATUS and re-enables the receive interrupt immediately
@@ -185,13 +191,14 @@ void RFBridgeComponent::write_byte_str_(const std::string &codes) {
   // advanced-code action is config-authored). Convert nibbles in place -- the
   // previous substr+strtol form heap-allocated a temporary string per byte,
   // ~130 allocations for a production frame on every repeat of every dispatch.
-  const auto nibble = [](char value) -> uint8_t {
-    const int parsed = hex_nibble(value);
-    return parsed < 0 ? 0 : static_cast<uint8_t>(parsed);
-  };
+  // serialized_nibble, not a local copy of its rule: b0_frame_status matches the
+  // AAB0 magic through the same function, so the classifier's model of the wire
+  // and the wire cannot drift apart. See its comment for the frame that got
+  // through when they did.
   const size_t size = codes.length();
   for (size_t i = 0; i + 1 < size; i += 2)
-    this->write(static_cast<uint8_t>((nibble(codes[i]) << 4) | nibble(codes[i + 1])));
+    this->write(
+        static_cast<uint8_t>((serialized_nibble(codes[i]) << 4) | serialized_nibble(codes[i + 1])));
 }
 
 void RFBridgeComponent::loop() {
@@ -279,6 +286,11 @@ void RFBridgeComponent::learn() {
 
 void RFBridgeComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "RF_Bridge:");
+  // Printed unconditionally, including the 0 default. Double-compensation --
+  // hand-tuned codes plus a non-zero offset -- is silent on air and silent in
+  // MQTT, so the boot log has to be somewhere the effective value can be read
+  // off a running bridge without recovering the YAML that built it.
+  ESP_LOGCONFIG(TAG, "  TX bucket offset: %u us", static_cast<unsigned>(this->tx_bucket_offset_us_));
   this->check_uart_settings(19200);
 }
 
@@ -307,20 +319,99 @@ void RFBridgeComponent::start_bucket_sniffing() {
   this->flush();
 }
 
-void RFBridgeComponent::send_raw(const std::string &raw_code) {
-  ESP_LOGD(TAG, "Sending Raw Code: %s", raw_code.c_str());
+bool RFBridgeComponent::clamp_log_due_(uint32_t now_ms) {
+  // Plain unsigned subtraction, matching rf433_inbound_guard.h: elapsed wraps
+  // modulo 2^32 exactly like the clock it came from, so a rollover between
+  // calls still yields the true (small) elapsed duration.
+  if (this->clamp_logged_ && (now_ms - this->last_clamp_log_ms_) < CLAMP_LOG_INTERVAL_MS)
+    return false;
+  this->clamp_logged_ = true;
+  this->last_clamp_log_ms_ = now_ms;
+  return true;
+}
 
-  // The single transmit choke point: scheduler dispatch, the OTA
-  // wait-for-idle pump, and the fail-safe STOP drain all reach the UART
+void RFBridgeComponent::send_raw(const std::string &raw_code) {
+  // The only path carrying host-supplied BUCKET timings: scheduler dispatch,
+  // the OTA wait-for-idle pump, and the fail-safe STOP drain all reach the UART
   // through here, so OB38S003 bucket compensation is applied once, at the last
-  // moment before serialization, and no transmit path can bypass it. The
-  // default offset of 0 skips it entirely -- a default build runs exactly the
-  // code it always did and writes exactly the bytes it always wrote.
-  if (this->tx_bucket_offset_us_ == 0) {
-    this->write_byte_str_(raw_code);
-  } else {
-    this->write_byte_str_(b0_with_bucket_offset(raw_code, this->tx_bucket_offset_us_));
+  // moment before serialization.
+  //
+  // The two other registered transmit actions write their own frames and do not
+  // pass through here. send_advanced_code (0xA8) carries a protocol ID, so the
+  // coprocessor generates its edges from its own protocol table and there is
+  // nothing host-supplied to compensate. send_code (0xA5) is NOT in that
+  // position: its sync/low/high fields are host-supplied timings straight from
+  // YAML, and whether they suffer issue #27 the way bucket timings do has not
+  // been measured. This knob does not touch them either way.
+  //
+  // Trim surrounding whitespace before anything looks at the frame. Reading a
+  // frame out of a text sensor or a template hands the lambda a trailing
+  // newline for free, and write_byte_str_'s pair-at-a-time loop used to ignore
+  // an odd trailing character, so such a frame transmitted correctly until this
+  // component started enforcing parity. Everything below -- classification AND
+  // both serialization paths -- uses `frame`, so the trailing bytes cannot
+  // reach the UART either. Interior whitespace is deliberately NOT stripped: it
+  // fails the hex check and is refused, because `AAB0 05` gives no honest
+  // reading of where the caller's nibbles begin.
+  size_t begin = raw_code.find_first_not_of(B0_TRIM_CHARS);
+  size_t end = 0;
+  if (begin == std::string::npos)
+    begin = 0;
+  else
+    end = raw_code.find_last_not_of(B0_TRIM_CHARS) + 1U;
+  // Bind rather than copy when there is nothing to trim: send_raw runs once per
+  // repeat of every dispatch, and the default path must not start allocating.
+  const bool trimmed = begin != 0U || end != raw_code.size();
+  const std::string trimmed_frame = trimmed ? raw_code.substr(begin, end - begin) : std::string();
+  const std::string &frame = trimmed ? trimmed_frame : raw_code;
+
+  const B0FrameStatus status = b0_frame_status(frame);
+  if (status == B0FrameStatus::MALFORMED) {
+    // Not merely uncompensatable -- unserializable. write_byte_str_ coerces an
+    // unparseable nibble to 0 and drops a trailing odd one, so transmitting
+    // this frame would put on air a code its author never wrote.
+    //
+    // The line drawn here is AUTHORSHIP, not safety: the serializer must not
+    // invent nibbles. It is deliberately not a ban on zero-length buckets -- a
+    // literal `0000` is valid hex and exactly what its author wrote, so it is
+    // accepted and, at the default offset where the floor does not run, still
+    // reaches the coprocessor as a 0. That residual is documented in
+    // HARDWARE.md caveat 2a; see B0FrameStatus for why closing it here would be
+    // over-strict.
+    ESP_LOGW(TAG, "Refusing malformed B0 frame (non-hex, odd length, or truncated), nothing sent: %s",
+             frame.c_str());
+    return;
   }
+  // A default build, and any frame this pass cannot compensate, writes exactly
+  // the bytes it always wrote -- for every frame that reaches here, which is
+  // every well-formed one. MALFORMED already returned above.
+  if (this->tx_bucket_offset_us_ == 0 || status != B0FrameStatus::COMPENSABLE) {
+    ESP_LOGD(TAG, "Sending Raw Code: %s", frame.c_str());
+    this->write_byte_str_(frame);
+    this->flush();
+    return;
+  }
+
+  size_t clamped_buckets = 0;
+  const std::string compensated =
+      b0_with_bucket_offset(frame, this->tx_bucket_offset_us_, &clamped_buckets);
+  // Log what reaches the coprocessor, not what the caller handed us: the bucket
+  // table differs, and a lowercase input comes back mixed-case.
+  ESP_LOGD(TAG, "Sending Raw Code: %s", compensated.c_str());
+  // The floor keeps the coprocessor off a 659 ms stuck carrier, but a floored
+  // bucket no longer carries the captured duration: the frame goes out encoding
+  // something the receiver was never taught. Silent is the one thing that must
+  // not happen. Throttled because the condition is deterministic -- it fires on
+  // every repeat of every dispatch or on none of them -- and this loop paces
+  // against a 5 ms RF margin with warnings republished over MQTT.
+  if (clamped_buckets != 0 && this->clamp_log_due_(App.get_loop_component_start_time())) {
+    ESP_LOGW(TAG,
+             "tx_bucket_offset_us=%u floored %u bucket(s) at %u us; this frame no longer encodes "
+             "its captured timing -- lower the offset",
+             static_cast<unsigned>(this->tx_bucket_offset_us_),
+             static_cast<unsigned>(clamped_buckets), static_cast<unsigned>(B0_MIN_BUCKET_US));
+  }
+  this->write_byte_str_(compensated);
   this->flush();
 }
 

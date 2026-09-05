@@ -86,7 +86,7 @@ HARDWARE.md; summarised here so this directory is self-contained.
 
 | Issue | Effect | Handling |
 |---|---|---|
-| [#27](https://github.com/mightymos/RF-Bridge-OB38S003/issues/27) (open) | Transmitted `B0` bucket timings run long on air — roughly **+30 µs** per bucket measured with a Flipper Zero, and **+76 µs** measured against a calibrated RTL-SDR. The port dropped Portisch's per-bucket startup-delay compensation, does a 16-bit division *after* asserting the RF edge (~38–40 µs charged to the pulse already on air), and reloads Timer-1 one interval long — an **additive** error, the same few microseconds on every bucket | **Re-capture and re-tune every bucket timing on the V2.2 board itself**; codes captured on an EFM8BB1 Portisch bridge may not replay. Optionally then set the package's `tx_bucket_offset_us` substitution (**default `"0"`, a byte-for-byte no-op**) to subtract a fixed per-bucket correction at the UART boundary — see the notes below the table. |
+| [#27](https://github.com/mightymos/RF-Bridge-OB38S003/issues/27) (open) | Transmitted `B0` bucket timings run long on air — roughly **+30 µs** per bucket measured with a Flipper Zero, and **+76 µs** measured against a calibrated RTL-SDR (that same RTL-SDR measurement resolves per edge into **+90 µs on pulses, +56 µs on gaps**). The port dropped Portisch's per-bucket startup-delay compensation, does a 16-bit division *after* asserting the RF edge (~38–40 µs charged to the pulse already on air), and reloads Timer-1 one interval long — an error that is **additive** rather than proportional to bucket length, but not identical on every edge | **Re-capture every code on the V2.2 board itself**; codes captured on an EFM8BB1 Portisch bridge may not replay. Then pick **one** correction, never both: hand-tune the bucket values yourself, **or** leave them untouched and set the package's `tx_bucket_offset_us` substitution (**default `"0"`, byte-identical for every well-formed frame**) — see the notes below the table. |
 | [#19](https://github.com/mightymos/RF-Bridge-OB38S003/issues/19) (open) | After ~24–48 h the radio MCU's **receive** path stops decoding codes. Transmit and the ESP8285/Wi-Fi keep working normally, and restarting the ESP does not clear it | Reset the radio MCU on a schedule (`AA FE 55`) or power-cycle the board; there is no firmware fix. Alarm on missing **inbound** traffic — availability stays `online` throughout. |
 | No stock image published | Stock OB38S003 firmware is read-protected and is destroyed by the `erase` that unprotects the chip | There is nothing to roll back to. Unlike the EFM8BB1 path, no vendor original `.hex` exists. |
 
@@ -94,22 +94,36 @@ HARDWARE.md; summarised here so this directory is self-contained.
 
 Fixing the timing properly means editing this firmware, and we cannot: upstream is unmaintained
 (see above), and calibrating a timing fix needs RF measurement hardware this project does not
-have. Because the error is additive, the host can cancel it exactly as well by subtracting a
-constant from every bucket before the frame goes out over UART — no rebuild of an 8051 image, no
-new binary to trust, and the correction stays per-board where the measurement actually lives.
+have. Because the error is additive, the host can *narrow* it by subtracting a constant from every
+bucket before the frame goes out over UART — no rebuild of an 8051 image, no new binary to trust,
+and the correction stays per-board where the measurement actually lives.
+
+Narrow, not cancel. A bucket index is used as both a pulse and a gap within one frame and carries
+a single 16-bit duration, so one constant cannot correct +90 µs and +56 µs separately. Subtracting
+the mean of the two nulls the mean and leaves roughly **±17 µs on every edge**; no single
+host-side value removes that residual.
 
 That is `tx_bucket_offset_us`, a package substitution documented in
 [HARDWARE.md → caveat 2a](../../HARDWARE.md#alternate-path--r2-v22-with-the-ob38s003-radio):
 
-- **Default `"0"`, opt-in, and a byte-for-byte no-op** — a bridge that does not set it emits
-  exactly the bytes it always did. EFM8BB1 boards must leave it at `"0"`; stock Portisch already
-  compensates.
-- **Never combine it with hand-tuned codes.** If you already subtracted the overshoot from your
-  bucket values yourself, this knob subtracts it a second time, the buckets fall as far short of
-  the receiver's window as they were long, and **blinds silently stop responding** — the bridge
-  still publishes `started`, which only proves UART dispatch, never RF emission.
-- **Found empirically per board** (reported values span 30–90 µs) and **compile-time**: changing
-  it requires a recompile and an OTA, not a runtime setting.
+- **Default `"0"`, opt-in, and byte-identical for every well-formed frame** — a bridge that does
+  not set it emits exactly the bytes it always did. EFM8BB1 boards must leave it at `"0"`; stock
+  Portisch already compensates. One deliberate exception applies at every offset including `"0"`:
+  a frame carrying the `AAB0` magic that is not valid, even-length hex — or is too short to carry
+  the header that magic implies — is dropped rather than transmitted, because the serializer would
+  otherwise invent nibbles the author never wrote.
+- **It replaces hand-tuning; it does not follow it.** These are two ways to apply the same
+  correction, so pick one. If you already subtracted the overshoot from your bucket values, this
+  knob subtracts it a second time, the buckets fall as far short of the receiver's window as they
+  were long, and **blinds silently stop responding** — the bridge still publishes `started`, which
+  only proves UART dispatch, never RF emission. A hand-tuned frame is structurally identical to an
+  untuned one, so nothing can detect the mistake for you: the knob will over-correct it silently.
+- **Found empirically per board** and **compile-time**: changing it requires a recompile and an
+  OTA, not a runtime setting. The residual is V-shaped in the offset with its minimum at the mean
+  of the pulse and gap errors — `73 µs` for the +90/+56 measurement above — so search a small
+  range around the mean. The three figures quoted here are one effect measured three ways, not a
+  range to sweep: `+30 µs` is the Flipper Zero reading, `+76 µs` the original single-number
+  RTL-SDR reading, and `+90`/`+56` that same RTL-SDR reading resolved per edge.
 
 ## Updating this pin
 

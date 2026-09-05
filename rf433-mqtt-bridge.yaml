@@ -34,19 +34,29 @@ substitutions:
   # emitted verbatim into the generated JSON/C++ string carrying "hw", so a `\`
   # or `"` would malform that literal.
   hardware_variant: efm8bb1-portisch
-  # OFF by default ("0" is a byte-for-byte no-op) and for OB38S003 / R2 V2.2
+  # OFF by default ("0" leaves every well-formed frame byte-identical; a
+  # malformed AAB0 frame is dropped at any offset) and for OB38S003 / R2 V2.2
   # boards ONLY: microseconds subtracted from every bucket of an outbound B0
   # frame to compensate that firmware's long transmit timing (upstream
   # mightymos/RF-Bridge-OB38S003#27). EFM8BB1 boards run stock Portisch, which
   # already compensates -- a non-zero value there breaks working transmits.
   #
-  # DO NOT combine with hand-tuned codes. If you already subtracted the
-  # measured overshoot from your bucket values, leave this at "0" or you will
-  # over-correct and your blinds will silently stop responding: `started` still
-  # fires, because it only proves UART dispatch, not RF emission.
+  # This NARROWS the error; it cannot cancel it. One bucket index is both a
+  # pulse and a gap in the same frame and holds one 16-bit duration, while the
+  # error measured ~+90 us on pulses and ~+56 us on gaps. A single constant
+  # nulls only the MEAN of the two and leaves roughly +/-17 us on every edge.
   #
-  # Compile-time (recompile + OTA to change) and found empirically per board;
-  # field evidence spans 30-90 us. See HARDWARE.md.
+  # DO NOT combine with hand-tuned codes -- they are alternatives, not steps.
+  # If you already subtracted the measured overshoot from your bucket values,
+  # leave this at "0" or you will over-correct and your blinds will silently
+  # stop responding: `started` still fires, because it only proves UART
+  # dispatch, not RF emission. A hand-tuned frame looks exactly like an untuned
+  # one, so nothing here can detect the mistake for you.
+  #
+  # Compile-time (recompile + OTA to change) and found empirically per board.
+  # The residual is V-shaped in the offset with its minimum at the mean of the
+  # pulse and gap errors -- 73 us for the measurement above -- so search a
+  # small range around the mean. Accepted range 0-120. See HARDWARE.md.
   tx_bucket_offset_us: "0"
   mqtt_broker: homeassistant.local
   mqtt_port: "1883"
@@ -587,6 +597,19 @@ interval:
                        // Additive to contract v3: consumers that ignore
                        // unknown fields are unaffected.
                        root["hw"] = "${hardware_variant}";
+                       // Effective host-side bucket compensation. Published
+                       // because double-compensation (hand-tuned codes plus a
+                       // non-zero offset) is invisible on air and invisible in
+                       // `started`: this is the only place a fleet-wide audit
+                       // can see which bridges are correcting and by how much.
+                       //
+                       // Read back from the component, never spliced from
+                       // ${tx_bucket_offset_us}: a substitution is textual, so
+                       // "073" validates as decimal 73 and then compiles as
+                       // OCTAL 59 here while the wire still uses 73, and "08"
+                       // would not compile at all.
+                       root["tx_offset_us"] =
+                           id(portisch_rf_bridge).get_tx_bucket_offset_us();
                        root["v"] = 3;
                      }, 0, true)) {
             id(next_info_ms) = now_ms + 60000;

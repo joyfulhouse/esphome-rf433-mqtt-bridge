@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import textwrap
@@ -10,11 +11,38 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_rx_firmware import _compile_and_run, _write_rf_bridge_stubs
+from tests._native import (
+    RF_BRIDGE_DIR,
+    compile_and_run,
+    rf_bridge_member_bodies,
+    write_rf_bridge_stubs,
+)
 
 PROJECT_ROOT = Path(__file__).parents[1]
 SCHEDULER_HEADER = PROJECT_ROOT / "rf433_scheduler.h"
 BRIDGE_YAML = PROJECT_ROOT / "rf433-mqtt-bridge.yaml"
+
+
+def _without_comments(source: str) -> str:
+    """Strip C++ line and block comments, so a source pin tests code and not prose.
+
+    One leftmost alternation, never two sequential passes. `re.sub` scans
+    leftmost-first BY POSITION; alternation order only breaks ties at the same
+    offset. So at a `//` the line branch matches and consumes to end of line,
+    and an embedded `/*` never opens a block; at a `/*` the line branch cannot
+    match, so the block branch runs. That is exactly how a C++ lexer treats the
+    two token classes.
+
+    Stripping in two passes instead gets this wrong in both directions, because
+    a URL inside a block comment carries a `//`: the line pass eats from
+    `https://` through the closing `*/`, leaving an orphaned `/*`. With no later
+    `*/` the block pass then removes nothing and the prose before the URL
+    survives (a false GREEN -- the escape this pin exists to stop); with a later
+    `*/` the orphan pairs with it and swallows the real code in between (a false
+    RED on a comment-only edit). URLs in comments are established convention
+    here -- components/mqtt/ already carries them.
+    """
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
 
 
 def _firmware_lambda(section_start: str, section_end: str) -> str:
@@ -30,6 +58,11 @@ def _firmware_lambda(section_start: str, section_end: str) -> str:
         "${hardware_variant}": "test-hw",
         "${listen_enabled}": "false",
         "${repeat_gap_ms}": "35",
+        # A tripwire, not a value the shipped lambdas read. Substitutions are
+        # textual: "073" passes cv.int_range as decimal 73 and then compiles as
+        # OCTAL 59. Any payload that goes back to splicing this into C++ reports
+        # 59 while the component -- and the wire -- use 73.
+        "${tx_bucket_offset_us}": "073",
     }
     for key, value in substitutions.items():
         body = body.replace(key, value)
@@ -1436,11 +1469,17 @@ struct FakeMqtt {
 struct FakeBridge {
   std::vector<std::string> sent;
   bool sniffing{false};
+  // The component owns the effective offset. /info must read it back through
+  // this getter: the substitution feeding the same value into the component
+  // config is spelled "073" in this harness, so any payload built by splicing
+  // that text into C++ reports octal 59 instead.
+  uint16_t tx_bucket_offset_us{73};
 
   void send_raw(const std::string &raw) { this->sent.push_back(raw); }
   void start_bucket_sniffing() { this->sniffing = true; }
   void stop_advanced_sniffing() { this->sniffing = false; }
   bool receive_idle() const { return true; }
+  uint16_t get_tx_bucket_offset_us() const { return this->tx_bucket_offset_us; }
 } portisch_rf_bridge;
 
 uint32_t fake_now_ms{0};
@@ -1557,6 +1596,14 @@ int main() {
       assert(message.payload.at("v") == "3");
       // hw is additive to contract v3: hardware_variant flows through verbatim.
       assert(message.payload.at("hw") == "test-hw");
+      // So is tx_offset_us, the effective bucket compensation. Double
+      // compensation is silent on air and silent in `started`; the retained
+      // payload is where a fleet can see which bridges are correcting.
+      //
+      // 73, read back from the component. The substitution that configured it
+      // is spelled "073", so a payload built by splicing that text would say
+      // 59 -- advertising a correction the bridge is not applying.
+      assert(message.payload.at("tx_offset_us") == "73");
       saw_info = true;
     }
   }
@@ -1608,6 +1655,15 @@ def test_esphome_package_uses_lightweight_correlated_started_status() -> None:
     # a lambda) so it lands at the single send_raw UART choke point.
     assert 'tx_bucket_offset_us: "0"' in package
     assert "tx_bucket_offset_us: ${tx_bucket_offset_us}" in package
+    # The accepted range stops at ~1.3x the highest reported error, not at the
+    # uint16 the wire could carry: from 181 us upward the shortest real AOK
+    # bucket (280 us) hits the 100 us floor and the emitted frame silently stops
+    # encoding the code, with `started` still firing on every send. Pin the
+    # constant AND its use -- a schema that hardcodes its own max would leave the
+    # constant defined, documented, and enforcing nothing.
+    component_python = (RF_BRIDGE_DIR / "__init__.py").read_text()
+    assert "MAX_TX_BUCKET_OFFSET_US = 120" in component_python
+    assert "max=MAX_TX_BUCKET_OFFSET_US" in component_python
     assert "TargetScheduler" in scheduler
     assert "rf433::tx_scheduler" in package
     assert 'x["command_id"]' in package
@@ -1869,12 +1925,100 @@ int main() {
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
+def test_native_shared_hex_digits_is_one_object_across_translation_units(
+    tmp_path: Path,
+) -> None:
+    """The header's shared hex table must be a single entity, not a per-TU copy.
+
+    `static constexpr` at namespace scope in a header gives every translation
+    unit its own internal-linkage array. compact_hex and b0_with_bucket_offset
+    both odr-use it, so their inline definitions would then refer to different
+    entities in different TUs -- ill-formed, no diagnostic required
+    ([basic.def.odr]/12). No compiler reports it, so the only way to hold the
+    fix is to link two TUs and compare the address each one sees.
+
+    That comparison is only meaningful on a toolchain that keeps two identical
+    read-only arrays apart, which is not guaranteed -- constant merging or
+    identical-data folding would make the `static` spelling pass too. Each unit
+    therefore also carries SHADOW_HEX_DIGITS, a deliberately per-TU copy holding
+    the same bytes, and the binary asserts those two addresses DIFFER. On a
+    merging toolchain that control fails, so this test goes red rather than
+    quietly proving nothing.
+    """
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the native linkage test")
+    unit = r"""
+#include <string>
+#include <vector>
+#include "components/rf_bridge/rf_bridge_protocol.h"
+
+// The control: exactly what `static constexpr` in the header would produce --
+// one internal-linkage copy per translation unit, same bytes in each.
+namespace {
+constexpr char SHADOW_HEX_DIGITS[] = "0123456789ABCDEF";
+}  // namespace
+
+// Odr-use the table exactly as the header's own inline functions do.
+const void *hex_digits_seen_by_%(name)s() {
+  return esphome::rf_bridge::compact_hex(std::vector<uint8_t>{0xAB}) == "AB"
+             ? static_cast<const void *>(esphome::rf_bridge::HEX_DIGITS)
+             : nullptr;
+}
+
+const void *shadow_seen_by_%(name)s() { return SHADOW_HEX_DIGITS; }
+"""
+    (tmp_path / "unit_one.cpp").write_text(unit % {"name": "one"})
+    (tmp_path / "unit_two.cpp").write_text(
+        unit % {"name": "two"}
+        + r"""
+#include <cassert>
+
+const void *hex_digits_seen_by_one();
+const void *shadow_seen_by_one();
+
+int main() {
+  // Control first: if the toolchain merges identical read-only arrays, the
+  // assertion below cannot distinguish `inline` from `static` and the whole
+  // test is vacuous. Fail here instead.
+  assert(shadow_seen_by_one() != shadow_seen_by_two());
+
+  assert(hex_digits_seen_by_one() != nullptr);
+  assert(hex_digits_seen_by_one() == hex_digits_seen_by_two());
+  return 0;
+}
+"""
+    )
+    binary = tmp_path / "linkage_test"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(PROJECT_ROOT),
+            str(tmp_path / "unit_one.cpp"),
+            str(tmp_path / "unit_two.cpp"),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
 def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) -> None:
     """OB38S003 compensation: no-op at 0, exact subtraction above it, safe floor."""
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
+        #include <cstddef>
         #include <cstdint>
         #include <string>
         #include "components/rf_bridge/rf_bridge_protocol.h"
@@ -1882,6 +2026,12 @@ def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) 
         using esphome::rf_bridge::b0_with_bucket_offset;
 
         int main() {
+          // 73 us, not 90: the measured error is ~+90 us on pulses and ~+56 us on
+          // gaps, one bucket index serves as both, and a single 16-bit duration
+          // cannot carry two corrections. 73 is the mean -- the minimum of the
+          // V-shaped residual and the value HARDWARE.md now points tuning at.
+          const uint16_t offset = 73;
+
           // Production AOK frame: 4 buckets (5140, 620, 280, 5140 us) at hex chars
           // 10..25, then 134 data nibbles, then the 55 trailer.
           const std::string frame =
@@ -1889,49 +2039,169 @@ def test_native_tx_bucket_offset_rewrites_only_the_bucket_table(tmp_path: Path) 
               "192929292A192A1A1A1A1A1A19292A1A1A1A1A1A1A1A1A1A1A1A192A1929292A1A19292A1A1A1A1955";
           assert(frame.size() == 162);
 
-          // (a) The shipped default is a provable byte-for-byte no-op. Existing
-          // deployments must serialize exactly the bytes they always have -- including
-          // the safety floor, which must not "fix" a bucket while compensation is off.
+          // (a) At the shipped default this rewrite is a provable byte-for-byte
+          // no-op -- including the safety floor, which must not "fix" a bucket while
+          // compensation is off. (Whether the frame is then SENT is send_raw's call:
+          // it drops a MALFORMED frame at every offset. See the choke-point test.)
           assert(b0_with_bucket_offset(frame, 0) == frame);
           assert(b0_with_bucket_offset("AAB005010800000055", 0) == "AAB005010800000055");
 
           // (b) A non-zero offset subtracts from EVERY bucket and touches nothing
-          // else: 5140-90=0x13BA, 620-90=0x0212, 280-90=0x00BE, 5140-90=0x13BA.
-          const std::string compensated = b0_with_bucket_offset(frame, 90);
+          // else: 5140-73=0x13CB, 620-73=0x0223, 280-73=0x00CF, 5140-73=0x13CB.
+          size_t clamped = 99;
+          const std::string compensated = b0_with_bucket_offset(frame, offset, &clamped);
           assert(compensated.size() == frame.size());
-          assert(compensated.compare(10, 16, "13BA021200BE13BA") == 0);
+          assert(compensated.compare(10, 16, "13CB022300CF13CB") == 0);
+          // No bucket of a real frame comes near the floor, so nothing is reported.
+          assert(clamped == 0);
           // Header (AAB0, length byte, bucket count, embedded repeat) is verbatim...
           assert(compensated.compare(0, 10, frame, 0, 10) == 0);
           // ...as are every data nibble and the trailer beyond the bucket table.
           assert(compensated.compare(26, std::string::npos, frame, 26, std::string::npos) == 0);
           // Uppercase, zero-padded, four hex chars per bucket, exactly as the
-          // normalizer emits: 0x00BE must not collapse to "BE".
-          assert(compensated.find("00BE") == 18);
+          // normalizer emits: 0x00CF must not collapse to "CF".
+          assert(compensated.find("00CF") == 18);
 
           // (c) Underflow can never emit a zero-or-negative bucket. The OB38S003
           // Timer-1 ISR decrements before testing zero, so a 0 bucket wraps to 65,535
-          // intervals (~659 ms of stuck carrier). One bucket of 0 us, 1 data nibble.
-          const std::string zero_bucket = "AAB005010800000055";
-          assert(b0_with_bucket_offset(zero_bucket, 90) == "AAB005010800640055");  // 0 -> 100 us
-          // A bucket that would land below the floor is raised to it, not wrapped.
-          const std::string small_bucket = "AAB005010800640055";  // 100 us
-          assert(b0_with_bucket_offset(small_bucket, 90) == small_bucket);  // 10 -> 100 us
-          // 200 -> 110 us: a bucket clear of the floor is reduced exactly.
-          assert(b0_with_bucket_offset("AAB005010800C80055", 90) == "AAB0050108006E0055");
-          // The maximum accepted offset still cannot drive any bucket to zero.
-          for (uint16_t offset = 1; offset <= 255; offset++) {
-            const std::string floored = b0_with_bucket_offset(zero_bucket, offset);
-            assert(floored.compare(10, 4, "0000") != 0);
+          // intervals (~659 ms of stuck carrier). Exact values across the floor
+          // boundary, each on a single-bucket frame: 1 bucket, 1 data nibble.
+          //   duration == offset      -> 0 us   -> floored, reported
+          //   duration == offset + 1  -> 1 us   -> floored, reported
+          //   duration == offset + 99 -> 99 us  -> floored, reported (last one caught)
+          //   duration == offset + 100-> 100 us -> emitted exactly, NOT reported
+          //   duration  = 280 us      -> 207 us -> emitted exactly, NOT reported
+          // The last two run at MAX_TX_BUCKET_OFFSET_US, where the floor reaches
+          // highest: 220 us is the shortest bucket the largest accepted offset
+          // leaves intact, and even there a 0 us bucket comes out at 100, never 0.
+          struct FloorCase {
+            const char *frame;
+            uint16_t offset_us;
+            const char *expected;
+            size_t clamped;
+          };
+          const FloorCase cases[] = {
+              {"AAB005010800000055", offset, "AAB005010800640055", 1},  // 0 us   -> 100 us
+              {"AAB005010800490055", offset, "AAB005010800640055", 1},  // 73 us  -> 100 us
+              {"AAB0050108004A0055", offset, "AAB005010800640055", 1},  // 74 us  -> 100 us
+              {"AAB005010800AC0055", offset, "AAB005010800640055", 1},  // 172 us -> 100 us
+              {"AAB005010800AD0055", offset, "AAB005010800640055", 0},  // 173 us -> 100 exactly
+              {"AAB005010801180055", offset, "AAB005010800CF0055", 0},  // 280 us -> 207 us
+              {"AAB005010800DC0055", 120, "AAB005010800640055", 0},     // 220 us -> 100 exactly
+              {"AAB005010800000055", 120, "AAB005010800640055", 1},     // 0 us   -> 100 us
+          };
+          for (const FloorCase &floor_case : cases) {
+            size_t floored_buckets = 99;
+            assert(b0_with_bucket_offset(floor_case.frame, floor_case.offset_us,
+                                         &floored_buckets) == floor_case.expected);
+            assert(floored_buckets == floor_case.clamped);
           }
 
-          // Anything that is not a B0 bucket frame is passed through whole rather
-          // than partially rewritten: send_raw is a public ESPHome action.
-          assert(b0_with_bucket_offset("", 90).empty());
-          assert(b0_with_bucket_offset("AAA55", 90) == "AAA55");
+          // (d) Lowercase is the same frame on the wire. hex_nibble accepts lowercase
+          // everywhere else, so an uppercase-only magic test would ship a
+          // lambda-authored `aab0...` frame UNCOMPENSATED. Only the rewritten bucket
+          // table takes the normalizer's uppercase; the rest is copied as authored.
+          assert(b0_with_bucket_offset("aab005010801180055", offset) == "aab005010800CF0055");
+
+          // (e) Anything that is not a self-consistent, fully-hex B0 bucket frame
+          // comes back unchanged rather than partially rewritten. An unchanged
+          // return is NOT a verdict that the frame is safe to send -- see (g).
+          assert(b0_with_bucket_offset("", offset).empty());
+          assert(b0_with_bucket_offset("AAA55", offset) == "AAA55");
+          // An A8 advanced-code frame of exactly the same length, and otherwise
+          // self-consistent -- honest length byte, in-range count, valid hex. The
+          // magic is the only thing that separates it from the B0 above, so a size
+          // guard, a hex guard, and a length guard all pass it through to the
+          // rewrite. Only the AAB0 test stops it.
+          assert(b0_with_bucket_offset("AAA805010801180055", offset) == "AAA805010801180055");
           // Declared bucket table runs past the end of the frame.
-          assert(b0_with_bucket_offset("AAB0050108", 90) == "AAB0050108");
-          assert(b0_with_bucket_offset("AAB005ZZ0800000055", 90) == "AAB005ZZ0800000055");
-          assert(b0_with_bucket_offset("AAB0050108ZZZZ0055", 90) == "AAB0050108ZZZZ0055");
+          assert(b0_with_bucket_offset("AAB0050108", offset) == "AAB0050108");
+          // Malformed hex anywhere disqualifies the frame: write_byte_str_ coerces an
+          // unparseable nibble to 0, so compensating one would emit a frame that is
+          // both corrected and corrupt.
+          assert(b0_with_bucket_offset("AAB005ZZ0800000055", offset) == "AAB005ZZ0800000055");
+          assert(b0_with_bucket_offset("AAB0050108ZZZZ0055", offset) == "AAB0050108ZZZZ0055");
+          assert(b0_with_bucket_offset("AAB00501080118ZZ55", offset) == "AAB00501080118ZZ55");
+
+          // (f) The declared bucket count and the declared length byte must agree
+          // with each other and with the frame, as normalize_b0 requires at
+          // admission. Both frames below are long enough overall for the table they
+          // declare, so a size-only guard rewrites real data nibbles as durations.
+          size_t untouched = 99;
+          // Length byte says 5 bytes of body (an 18-char frame); this one is 20.
+          const std::string wrong_length = "AAB00501080118005555";
+          assert(b0_with_bucket_offset(wrong_length, offset, &untouched) == wrong_length);
+          assert(untouched == 0);
+          // Honest 42-char frame, one 280 us bucket, count byte over-declared to 8:
+          // 10 + 8*4 = 42 swallows every data nibble AND the 55 trailer, while the
+          // declared body ends at 40.
+          const std::string over_declared = "AAB011080801180808080808080808080808080855";
+          const std::string honest = "AAB011010801180808080808080808080808080855";
+          assert(over_declared.size() == 42 && honest.size() == 42);
+          assert(b0_with_bucket_offset(over_declared, offset) == over_declared);
+          // The same frame with a truthful count is compensated normally, so the
+          // check rejects the inconsistency and not the shape.
+          assert(b0_with_bucket_offset(honest, offset) ==
+                 "AAB011010800CF0808080808080808080808080855");
+
+          // (g) The classification send_raw acts on. "Unchanged" above covers two
+          // very different verdicts, and only this distinguishes them: a
+          // PASSTHROUGH frame is serialized as written, a MALFORMED one must not
+          // reach the UART at all -- write_byte_str_ turns `ZZ` into 00, which is
+          // the zero bucket and its 659 ms stuck carrier.
+          using esphome::rf_bridge::b0_frame_status;
+          using esphome::rf_bridge::B0FrameStatus;
+          assert(b0_frame_status(frame) == B0FrameStatus::COMPENSABLE);
+          assert(b0_frame_status("aab005010801180055") == B0FrameStatus::COMPENSABLE);
+          assert(b0_frame_status(honest) == B0FrameStatus::COMPENSABLE);
+          // Not a B0 frame: not ours to judge, and A5/A8/sniff strings must keep
+          // transmitting exactly as they always have.
+          assert(b0_frame_status("") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAA55") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAA805010801180055") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAA8ZZ01080118ZZ55") == B0FrameStatus::PASSTHROUGH);
+          // A B0 frame whose declared shape does not add up: uncompensatable, but
+          // every character still serializes to the byte the caller wrote.
+          assert(b0_frame_status(wrong_length) == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status(over_declared) == B0FrameStatus::PASSTHROUGH);
+          // A B0 frame the serializer would silently alter.
+          assert(b0_frame_status("AAB005ZZ0800000055") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AAB0050108ZZZZ0055") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AAB00501080118ZZ55") == B0FrameStatus::MALFORMED);
+          // Odd length: write_byte_str_ walks in pairs and drops the last nibble,
+          // so the coprocessor would receive a truncated frame.
+          assert(b0_frame_status("AAB0050108011800555") == B0FrameStatus::MALFORMED);
+          // Claims the magic but is too short to carry the header that magic
+          // implies. Only the magic may decide whether a frame is ours to judge:
+          // screening on length first let these reach the UART as fragments.
+          assert(b0_frame_status("AAB0Z") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AAB0") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AAB005") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("aab0") == B0FrameStatus::MALFORMED);
+          // Shorter than the magic itself cannot claim to be a B0 at all.
+          assert(b0_frame_status("AAB") == B0FrameStatus::PASSTHROUGH);
+          // The magic is matched on SERIALIZED nibbles: an invalid 4th character
+          // is coerced to 0 by write_byte_str_, so these ARE AAB0 frames on the
+          // wire and must be judged as such. Judging characters instead let them
+          // through as "not a B0 frame" while the UART emitted AA B0 ... 00 00.
+          assert(b0_frame_status("AABZ050108ZZZZ0055") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("AABG050108ZZZZ0055") == B0FrameStatus::MALFORMED);
+          assert(b0_frame_status("aabZ050108ZZZZ0055") == B0FrameStatus::MALFORMED);
+          // ...and the coercion widens ONLY the 4th position. A non-hex byte
+          // coerces to 0, and 0 is neither 0xA nor 0xB, so the first three still
+          // demand A/a, A/a, B/b exactly -- this cannot over-match. In
+          // particular the B1 capture prefix keeps its old verdict.
+          assert(b0_frame_status("ZAB0050108011800CF") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AZB0050108011800CF") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAZ0050108011800CF") == B0FrameStatus::PASSTHROUGH);
+          assert(b0_frame_status("AAB1050108011800CF") == B0FrameStatus::PASSTHROUGH);
+          // A literal zero bucket is valid hex, self-consistent, and exactly
+          // what its author wrote, so it is COMPENSABLE rather than MALFORMED.
+          // The MALFORMED line is authorship -- the serializer must not INVENT
+          // nibbles -- not a ban on zero buckets. At the default offset this
+          // frame still reaches the wire as a 0; see the residual documented in
+          // HARDWARE.md caveat 2a.
+          assert(b0_frame_status("AAB005010800000055") == B0FrameStatus::COMPENSABLE);
           return 0;
         }
         """,
@@ -1946,7 +2216,7 @@ def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path)
     corruption fixed in field testing. The scheduler must keep dispatching, and
     accounting for, UNcompensated durations.
     """
-    _compile_and_run(
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -1985,26 +2255,245 @@ def test_native_tx_bucket_offset_leaves_airtime_pacing_untouched(tmp_path: Path)
 
           // Had the offset been applied at admission instead, the airtime driving the
           // RF pacing gate would have collapsed by offset * pulses * embedded repeat
-          // = 90 * 134 * 8 = 96,480 us, far past the 5 ms margin.
+          // = 73 * 134 * 8 = 78,256 us, far past the 5 ms margin.
           uint64_t compensated_airtime_us = 0;
-          assert(rf433::normalize_b0_with_airtime(b0_with_bucket_offset(frame, 90), normalized,
+          assert(rf433::normalize_b0_with_airtime(b0_with_bucket_offset(frame, 73), normalized,
                                                   reason, compensated_airtime_us));
-          assert(compensated_airtime_us == 463680 && compensated_airtime_us + 96480 == airtime_us);
+          assert(compensated_airtime_us == 481904 && compensated_airtime_us + 78256 == airtime_us);
           return 0;
         }
         """,
     )
 
 
-def test_native_send_raw_is_the_single_compensation_choke_point(tmp_path: Path) -> None:
-    """send_raw is where compensation happens, and only there.
+@pytest.mark.parametrize(
+    ("source", "must_survive", "must_not_survive"),
+    [
+        pytest.param(
+            "  /* Inlined equivalent of serialized_nibble(); see\n"
+            "     https://github.com/mightymos/RF-Bridge-OB38S003/issues/27 */\n"
+            "  this->write(nibble(codes[i]));\n",
+            ("this->write(nibble(codes[i]));",),
+            ("serialized_nibble(",),
+            id="url-after-token-no-later-close",
+        ),
+        pytest.param(
+            "  /* upstream https://github.com/mightymos/RF-Bridge-OB38S003/issues/27 */\n"
+            "  this->write(serialized_nibble(codes[i]));\n"
+            "  /* end of hot loop */\n",
+            ("this->write(serialized_nibble(codes[i]));",),
+            ("upstream", "end of hot loop"),
+            id="url-with-later-close",
+        ),
+        pytest.param(
+            "  // plain line comment\n  keep_me();\n",
+            ("keep_me();",),
+            ("plain line comment",),
+            id="plain-line-comment",
+        ),
+        pytest.param(
+            "  /* plain block\n     comment spanning lines */\n  keep_me();\n",
+            ("keep_me();",),
+            ("plain block", "comment spanning lines"),
+            id="plain-block-comment",
+        ),
+        pytest.param(
+            # The trailing block comment is what makes this case bite: without a
+            # later `*/`, a block-first strip matches nothing here and the case
+            # stays green under the very regression it names. With one, the
+            # orphaned `/*` in the line comment pairs with it and swallows
+            # keep_me() -- which is the forward-swallow this fixture exists to
+            # catch.
+            "  // TODO: /* revisit\n  keep_me();\n  /* trailing block */\n",
+            ("keep_me();",),
+            ("TODO", "revisit", "trailing block"),
+            id="unterminated-open-inside-line-comment",
+        ),
+    ],
+)
+def test_without_comments_strips_prose_without_eating_code(
+    source: str,
+    must_survive: tuple[str, ...],
+    must_not_survive: tuple[str, ...],
+) -> None:
+    """Pure-function cover for the strip that assertions (1) and (3) rely on.
 
-    Drives the real vendored component against the host UART stub: the default
-    build must serialize the caller's bytes untouched, and a configured offset
-    must reach the wire through the one call every transmit path makes.
+    Those two assertions are only as good as this helper, and the component
+    carries no URL-bearing comment for a broken strip to bite on -- so a
+    regression here would leave every shipped test green while the pin silently
+    stopped pinning. That is the same by-convention-not-by-enforcement gap the
+    pin itself exists to close, one level up.
+
+    It stops here rather than regressing further: this helper is a PURE
+    FUNCTION, so its correctness is behavior -- string in, string out -- and an
+    ordinary unit test covers it. Nothing needs to pin this test in turn.
+
+    The first two cases are the fixtures that proved a two-pass line-then-block
+    strip wrong in both directions; the rest are the ordinary shapes plus the
+    case a block-first order would get wrong.
     """
-    _write_rf_bridge_stubs(tmp_path)
-    _compile_and_run(
+    stripped = _without_comments(source)
+    for fragment in must_survive:
+        assert fragment in stripped
+    for fragment in must_not_survive:
+        assert fragment not in stripped
+
+
+def test_without_comments_leaves_comment_free_source_untouched() -> None:
+    """No comments in, byte-identical out: the strip never rewrites code."""
+    source = "  const size_t size = codes.length();\n  this->write(serialized_nibble(codes[i]));\n"
+    assert _without_comments(source) == source
+
+
+def test_send_raw_compensates_and_is_the_only_transmit_the_package_uses(
+    tmp_path: Path,
+) -> None:
+    """send_raw compensates, and no shipped transmit path goes around it.
+
+    Two halves, because calling send_raw in a test proves nothing about the
+    three production call sites. The native half drives the real vendored
+    component against the host UART stub. The source half pins the claim the
+    comment in send_raw makes: every transmit in the shipped package resolves
+    to `portisch_rf_bridge.send_raw`, and the component members that serialize
+    host-supplied hex are exactly the two expected names.
+    """
+    package = BRIDGE_YAML.read_text()
+    members = rf_bridge_member_bodies()
+
+    # The invariant is the equality, not the count: a fourth transmit is fine as
+    # long as it is also a send_raw on the one compensated component. Scheduler
+    # dispatch, the fail-safe STOP drain, and the OTA wait-for-idle pump are
+    # today's three.
+    assert package.count(".send_raw(") == package.count("id(portisch_rf_bridge).send_raw(") > 0
+    # The two other registered transmit actions are unused here. Matched as
+    # lambda calls -- `id(...)` ends in `)`, so the dotted YAML action spelling
+    # would never appear. send_advanced_code (0xA8) carries a protocol ID and has
+    # no host timings to compensate; send_code (0xA5) carries host-supplied
+    # sync/low/high timings that this knob does NOT correct and that nobody has
+    # measured against issue #27. Keeping both out of the package keeps that
+    # question academic.
+    # Both spellings. The trailing `(` matches only a lambda call, so the YAML
+    # action form (`- rf_bridge.send_code:`) slips past it -- a package that
+    # added the A5 action that way would ship an uncompensated, and per
+    # HARDWARE.md explicitly unmeasured, transmit with this guard still green.
+    assert ".send_advanced_code(" not in package
+    assert ".send_code(" not in package
+    assert "rf_bridge.send_advanced_code" not in package
+    assert "rf_bridge.send_code" not in package
+
+    # Inside the component, the members that serialize a host-supplied hex STRING
+    # are exactly these two. This does not cover raw byte writers: send_code
+    # assembles its frame with bare this->write(...) calls and would pass this
+    # guard, which is why the package-level assertions above matter.
+    assert sorted(name for name, body in members.items() if "this->write_byte_str_(" in body) == [
+        "send_advanced_code",
+        "send_raw",
+    ]
+    assert "b0_with_bucket_offset(" in members["send_raw"]
+    assert "b0_with_bucket_offset(" not in members["send_advanced_code"]
+
+    # ONE shared rule for "what nibble does this character become on the wire",
+    # pinned at the source level. That is deliberate, and it is not the usual
+    # text-pin-standing-in-for-a-behavioral-test smell: the property being
+    # protected is ITSELF textual -- the rule is written down once, and both the
+    # serializer and the classifier call that one copy. There is provably no
+    # behavioral signal to assert instead. A local lambda with identical
+    # semantics is observationally indistinguishable at runtime (-O2 emits
+    # byte-identical code and no out-of-line symbol), so every behavioral test
+    # in this suite stays green if the serializer grows its own copy back.
+    #
+    # That copy is exactly the pre-round-6 shape, and it is what produced five
+    # separate drift bugs in this PR: the lowercase gate, the truncated frame,
+    # the trailing newline, the odd-length parity check, and AABZ. This block is
+    # what stops the next reader from "simplifying" a one-line lambda back into
+    # place -- a change that would look obviously correct.
+    component_sources = sorted(RF_BRIDGE_DIR.glob("*.h")) + sorted(RF_BRIDGE_DIR.glob("*.cpp"))
+    # (1) The serializer routes through the shared rule. Comments are stripped
+    # first: a developer inlining the rule would naturally leave one naming it
+    # ("Inlined equivalent of serialized_nibble() ..."), which contains this
+    # very substring and satisfies the raw-body form of this assertion in
+    # either comment spelling.
+    serializer_code = _without_comments(members["write_byte_str_"])
+    assert "serialized_nibble(" in serializer_code
+    # (5) ...and that call resolves to the shared rule, not to a local of the
+    # SAME name. Keeping the name is the minimal-diff inlining -- zero call-site
+    # edits -- and it slips every other assertion here: the calls still read
+    # `serialized_nibble(`, an `if`-shaped body dodges (2), and a lambda spells
+    # its definition `serialized_nibble = [](char`, not `serialized_nibble(char`,
+    # so (4) never sees it. Only the same name evades; a renamed copy already
+    # fails (1).
+    assert not re.search(
+        r"\bauto\s+serialized_nibble\b|\bserialized_nibble\s*[={]", serializer_code
+    )
+    # (2) No second copy of invalid-nibble-becomes-0 in its TERNARY shape.
+    # Matched by shape, not by name: the reverted form is an anonymous lambda
+    # that can be called anything, so pinning the identifier alone would miss it.
+    assert [
+        path.name
+        for path in component_sources
+        for _ in re.finditer(r"<\s*0\s*\?\s*0", path.read_text())
+    ] == ["rf_bridge_protocol.h"]
+    # (3) The classifier's magic comparison calls the same function, so a frame
+    # whose SERIALIZED bytes open AA B0 is judged whatever characters spelled it.
+    # Comment-stripped for the same reason as (1), and it is the same escape: a
+    # character-judging rewrite (`frame.compare(0, 4, "AAB0")`) carrying a
+    # comment like "same rule as serialized_nibble()" satisfies the presence
+    # check from prose AND the absence check genuinely, passing under the very
+    # mutation this names. Unlike (1) the classifier is also backstopped
+    # behaviorally -- b0_frame_status("AABZ...") == MALFORMED and its siblings
+    # fail under any such rewrite -- so here the pin is defense in depth, where
+    # for the serializer it is the only line.
+    protocol = (RF_BRIDGE_DIR / "rf_bridge_protocol.h").read_text()
+    magic_check = _without_comments(
+        protocol.split("inline B0FrameStatus b0_frame_status(", maxsplit=1)[1].split(
+            "return B0FrameStatus::PASSTHROUGH;", maxsplit=1
+        )[0]
+    )
+    assert "serialized_nibble(" in magic_check
+    assert "hex_nibble(" not in magic_check
+    # (4) A BOUNDED regression guard against a same-named second definition, not
+    # an exhaustive C++ definition recognizer. It matches the definition shape
+    # `name ( [const] type ident ) [const] {` over comment-stripped source, which
+    # covers the natural copy spellings: a single-token-typed parameter
+    # (`(char v)`, `(int v)`, `(uint8_t v)`), a const-qualified one
+    # (`(const char v)`), at file scope or as a class-method / class-static
+    # member. The earlier literal `serialized_nibble(char` covered only the first
+    # of those. A call never carries `type ident)` -- `serialized_nibble(codes[i])`
+    # cannot match -- so the real call sites do not trip this, and the header's
+    # one legitimate definition is the only expected hit.
+    #
+    # Deliberately OUT of scope, mirroring the natural-vs-adversarial fence used
+    # throughout this block: multiword or reference parameter types
+    # (`unsigned char`, `const char &`), `noexcept` / trailing-return suffixes,
+    # unnamed parameters (`(char)`), and `decltype`. Someone reaching for those
+    # to inline a one-liner is not the failure mode this guards against.
+    #
+    # What these do NOT enforce, so nobody over-trusts them: a differently-named
+    # private copy written as an `if` rather than a ternary evades both (2) and
+    # (4). Inside write_byte_str_ it is still caught -- by (1) when renamed (the
+    # real call disappears), by (5) when it keeps the name. Elsewhere in the
+    # component it is not caught. The scan is components/rf_bridge/*.{h,cpp};
+    # rf433_scheduler.h is out of scope (no UART write path, and normalize_b0
+    # rejects bad input rather than coercing it, so it cannot host this bug).
+    definition = re.compile(
+        r"\bserialized_nibble\s*\(\s*(?:const\s+)?[\w:]+\s+\w+\s*\)\s*(?:const\s*)?\{"
+    )
+    assert [
+        path.name
+        for path in component_sources
+        for _ in definition.finditer(_without_comments(path.read_text()))
+    ] == ["rf_bridge_protocol.h"]
+
+    # The effective offset is readable off a running bridge, so the silent
+    # double-compensation trap has one place it stops being silent.
+    assert "TX bucket offset" in members["dump_config"]
+    # /info reads the same value from the component instead of splicing the
+    # substitution text into the payload lambda, where "073" would compile as 59.
+    assert "id(portisch_rf_bridge).get_tx_bucket_offset_us()" in package
+    assert 'root["tx_offset_us"] = ${tx_bucket_offset_us}' not in package
+
+    write_rf_bridge_stubs(tmp_path)
+    compile_and_run(
         tmp_path,
         r"""
         #include <cassert>
@@ -2024,6 +2513,12 @@ def test_native_send_raw_is_the_single_compensation_choke_point(tmp_path: Path) 
           }
         };
 
+        static size_t warnings_since_reset() {
+          return esphome::host_test_warnings().size();
+        }
+
+        static void reset_warnings() { esphome::host_test_warnings().clear(); }
+
         int main() {
           const std::string frame = "AAB005010801180055";
 
@@ -2031,13 +2526,17 @@ def test_native_send_raw_is_the_single_compensation_choke_point(tmp_path: Path) 
           ProbeBridge plain;
           plain.send_raw(frame);
           assert(plain.serialized() == frame);
+          // A frame that IS sent hands the UART off exactly once. This is the
+          // live counterexample that keeps the flush_count() == 0 assertions on
+          // the refusal paths below from being vacuously true.
+          assert(plain.flush_count() == 1);
 
-          // Configured build: 280 - 90 = 190 = 0x00BE reaches the wire, and
+          // Configured build: 280 - 73 = 207 = 0x00CF reaches the wire, and
           // nothing outside the bucket table moves.
           ProbeBridge compensated;
-          compensated.set_tx_bucket_offset_us(90);
+          compensated.set_tx_bucket_offset_us(73);
           compensated.send_raw(frame);
-          assert(compensated.serialized() == "AAB005010800BE0055");
+          assert(compensated.serialized() == "AAB005010800CF0055");
 
           // Explicit zero stays the no-op, so a per-board override of "0" is
           // indistinguishable from an unconfigured bridge.
@@ -2045,6 +2544,134 @@ def test_native_send_raw_is_the_single_compensation_choke_point(tmp_path: Path) 
           zeroed.set_tx_bucket_offset_us(0);
           zeroed.send_raw(frame);
           assert(zeroed.serialized() == frame);
+
+          // A malformed B0 frame reaches the UART as NOTHING. Returning it
+          // unchanged is not enough: write_byte_str_ turns `ZZ` into 00, which is
+          // the zero bucket and its ~659 ms of stuck carrier -- manufactured by
+          // the serializer out of a frame the caller never wrote. Assert at the
+          // wire, because every check above this point cannot see it.
+          //
+          // The last three of the first group claim the AAB0 magic but are too
+          // short to carry the header it implies. The AABZ group is the one the
+          // classifier could not see at all: hex_nibble('Z') is -1, so the magic
+          // did not match and the frame was waved past every check as "not a B0
+          // frame" -- yet write_byte_str_ coerces Z to 0, so it reached the
+          // coprocessor as AA B0 05 01 08 00 00 00 55: a well-formed B0 frame
+          // carrying a ZERO bucket, and with it the ~659 ms stuck carrier. The
+          // magic is now matched on serialized nibbles, so what the classifier
+          // judges and what the UART emits cannot disagree.
+          for (const uint16_t configured : {static_cast<uint16_t>(0), static_cast<uint16_t>(73)}) {
+            for (const char *bad : {"AAB00501080118ZZ55", "AAB0050108ZZZZ0055",
+                                    "AAB005ZZ0800000055", "AAB0050108011800555",
+                                    "AAB0Z", "AAB0", "AAB005",
+                                    "AABZ050108ZZZZ0055", "AABG050108ZZZZ0055",
+                                    "aabZ050108ZZZZ0055", "AAB_050108011800CF"}) {
+              reset_warnings();
+              ProbeBridge refused;
+              refused.set_tx_bucket_offset_us(configured);
+              refused.send_raw(bad);
+              assert(refused.serialized().empty());
+              // Not merely "wrote no bytes": a refusal must not touch the UART
+              // at all, so it never reaches the flush either.
+              assert(refused.flush_count() == 0);
+              // Dropped frames are never silent.
+              assert(warnings_since_reset() == 1);
+            }
+          }
+
+          // Surrounding whitespace must not cost a transmit. An ESPHome lambda
+          // that reads a frame out of a text sensor or a template gets the
+          // trailing newline for free; write_byte_str_'s pair-at-a-time loop
+          // used to ignore an odd trailing character, so these transmitted
+          // correctly before this component enforced parity. Byte-identical to
+          // the untrimmed frame on both the default and the compensated path.
+          for (const uint16_t configured : {static_cast<uint16_t>(0), static_cast<uint16_t>(73)}) {
+            const std::string expected =
+                configured == 0 ? frame : std::string("AAB005010800CF0055");
+            for (const std::string &padded : {frame + "\n", frame + " ", frame + "\r\n",
+                                              "\n" + frame, "  " + frame + "\t\r\n"}) {
+              reset_warnings();
+              ProbeBridge padded_bridge;
+              padded_bridge.set_tx_bucket_offset_us(configured);
+              padded_bridge.send_raw(padded);
+              // The TRIMMED frame is what is serialized: the stray bytes reach
+              // neither the classifier nor the UART. A \r\n pair is even-length
+              // and fully "hex" to nobody -- untrimmed it would append a
+              // serializer-invented 0x00 byte.
+              assert(padded_bridge.serialized() == expected);
+              assert(padded_bridge.flush_count() == 1);
+              assert(warnings_since_reset() == 0);
+            }
+          }
+
+          // Nothing at all, and nothing but whitespace, must reach neither the
+          // UART nor a substr() with a npos offset -- that throws
+          // std::out_of_range, which on an ESP8266 build without exceptions is a
+          // device reset rather than a dropped frame.
+          // `send_raw(id(some_text).state)` on an empty or unavailable sensor is
+          // an ordinary way to get here.
+          for (const char *blank : {"", " ", "\t\r\n", "   "}) {
+            reset_warnings();
+            ProbeBridge empty_bridge;
+            empty_bridge.send_raw(blank);
+            assert(empty_bridge.serialized().empty());
+            // Not a B0 frame, so not refused -- just nothing to write.
+            assert(warnings_since_reset() == 0);
+          }
+
+          // Interior whitespace is NOT stripped, and that is deliberate: the
+          // frame claims the B0 magic, so it is judged, and " " is not hex.
+          // There is no honest reading of where the caller's nibbles begin, so
+          // it is refused rather than silently re-packed.
+          reset_warnings();
+          ProbeBridge interior;
+          interior.send_raw("AAB0 5010801180055");
+          assert(interior.serialized().empty());
+          assert(interior.flush_count() == 0);
+          assert(warnings_since_reset() == 1);
+
+          // Frames without the AAB0 magic are not ours to judge and still
+          // transmit exactly as written, bad hex and all.
+          reset_warnings();
+          ProbeBridge advanced;
+          advanced.set_tx_bucket_offset_us(73);
+          advanced.send_raw("AAA805010801180055");
+          assert(advanced.serialized() == "AAA805010801180055");
+          assert(warnings_since_reset() == 0);
+
+          // The floored-bucket warning fires on behavior, not on the presence of
+          // an ESP_LOGW in the source: a frame that clamps warns, an identical
+          // send that does not clamp stays quiet.
+          reset_warnings();
+          ProbeBridge quiet;
+          quiet.set_tx_bucket_offset_us(73);
+          quiet.send_raw(frame);  // 280 -> 207 us, clear of the floor
+          assert(quiet.serialized() == "AAB005010800CF0055");
+          assert(warnings_since_reset() == 0);
+
+          reset_warnings();
+          esphome::App.set_loop_component_start_time(1000);
+          ProbeBridge clamping;
+          clamping.set_tx_bucket_offset_us(73);
+          clamping.send_raw("AAB005010800000055");  // 0 -> floored to 100 us
+          assert(clamping.serialized() == "AAB005010800640055");
+          assert(warnings_since_reset() == 1);
+
+          // Throttled: send_raw runs once per repeat, per trailer, and per
+          // fail-safe STOP, inside a loop pacing against a 5 ms RF margin, and the
+          // condition is a property of the configured offset -- it cannot change
+          // between repeats. First occurrence, then at most once a minute.
+          for (uint32_t elapsed_ms = 1; elapsed_ms < 60000; elapsed_ms += 12345) {
+            esphome::App.set_loop_component_start_time(1000 + elapsed_ms);
+            clamping.send_raw("AAB005010800000055");
+          }
+          assert(warnings_since_reset() == 1);
+          esphome::App.set_loop_component_start_time(1000 + 60000);
+          clamping.send_raw("AAB005010800000055");
+          assert(warnings_since_reset() == 2);
+          // Every one of those sends still reached the wire: the warning is
+          // throttled, the transmit is not.
+          assert(clamping.serialized().size() == 18U * (2U + 5U));
           return 0;
         }
         """,

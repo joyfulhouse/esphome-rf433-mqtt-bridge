@@ -64,9 +64,16 @@ class RFBridgeComponent : public uart::UARTDevice, public Component {
   void start_bucket_sniffing();
   void send_raw(const std::string &code);
   // Compile-time OB38S003 transmit compensation, in microseconds subtracted
-  // from every bucket of an outbound B0 frame. 0 (the default) is a byte-for-
-  // byte no-op; see b0_with_bucket_offset in rf_bridge_protocol.h.
+  // from every bucket of an outbound B0 frame. 0 (the default) leaves every
+  // well-formed frame byte-identical; send_raw still drops a MALFORMED B0 frame
+  // at every offset. See b0_with_bucket_offset in rf_bridge_protocol.h.
   void set_tx_bucket_offset_us(uint16_t offset_us) { this->tx_bucket_offset_us_ = offset_us; }
+  // The one place anything may read the effective offset. The package publishes
+  // it on retained /info through this getter rather than splicing the YAML
+  // substitution into the payload lambda: `073` survives config validation as
+  // decimal 73 but compiles as octal 59, so a spliced literal can advertise a
+  // number the wire never used.
+  uint16_t get_tx_bucket_offset_us() const { return this->tx_bucket_offset_us_; }
   void beep(uint16_t ms);
   // True while no received frame is mid-parse. The package's B1 keepalive
   // re-arm gates on this so it never clips a capture that is being delivered.
@@ -77,11 +84,18 @@ class RFBridgeComponent : public uart::UARTDevice, public Component {
   void reset_receive_state_();
   bool parse_bridge_byte_(uint8_t byte);
   void write_byte_str_(const std::string &codes);
+  // Once-per-minute gate for the floored-bucket warning, first occurrence
+  // always through. Per instance, not a function-static: the condition is a
+  // property of one bridge's configured offset, and every repeat of every
+  // dispatch calls send_raw.
+  bool clamp_log_due_(uint32_t now_ms);
 
   std::vector<uint8_t> rx_buffer_;
   uint32_t last_bridge_byte_{0};
   bool bucket_candidate_{false};
   uint16_t tx_bucket_offset_us_{0};
+  uint32_t last_clamp_log_ms_{0};
+  bool clamp_logged_{false};
 
   CallbackManager<void(RFBridgeData)> data_callback_;
   CallbackManager<void(RFBridgeAdvancedData)> advanced_data_callback_;

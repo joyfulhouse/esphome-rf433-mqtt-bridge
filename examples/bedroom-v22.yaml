@@ -27,10 +27,12 @@ substitutions:
   hardware_variant: ob38s003-mightymos
   # OB38S003-only transmit compensation, OFF by default. This firmware holds
   # every B0 bucket longer than commanded (upstream issue #27); if freshly
-  # captured codes still do not move a blind, raise this a few microseconds at
-  # a time — reporters landed between 30 and 90 — recompiling and re-flashing
-  # for each value. Leave it at "0" if you hand-tuned your bucket values by
-  # subtracting the overshoot yourself, or you will over-correct.
+  # captured codes still do not move a blind, try a small range around 73 —
+  # the mean of the measured +90 µs on pulses and +56 µs on gaps, and the point
+  # where the residual bottoms out — recompiling and re-flashing for each value.
+  # It narrows that error, it cannot cancel it: one constant per bucket leaves
+  # roughly ±17 µs on every edge. Leave it at "0" if you hand-tuned your bucket
+  # values by subtracting the overshoot yourself, or you will over-correct.
   tx_bucket_offset_us: "0"
   # With Home Assistant's Mosquitto add-on, the broker is your HA host.
   # Use an authenticated, least-privilege bridge account; anonymous MQTT is
