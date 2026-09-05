@@ -378,10 +378,13 @@ reason not to do it — they are reasons to do it with your eyes open.
 > floored buckets: immediately, then at most once a minute, because the condition is
 > deterministic per frame and would otherwise repeat on every repeat of every dispatch. When the
 > floor engages, the frame goes out no longer encoding the timing it was written with — silent
-> is the one thing that must not happen. Unreferenced bucket-table entries are never rewritten,
-> whatever their duration: they never key the transmitter. And on a real AOK capture (shortest
-> bucket 280 µs) the compensation floor cannot engage below an offset of 181 µs — which is why
-> the accepted range stops at 120.
+> is the one thing that must not happen. At the default offset of `"0"`, unreferenced
+> bucket-table entries are never rewritten, whatever their duration: they never key the
+> transmitter and pass through byte-verbatim. At a non-zero offset the compensation pass rewrites
+> the *whole* bucket table, referenced entries or not — see
+> [#24](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/24). And on a real AOK
+> capture (shortest bucket 280 µs) the compensation floor cannot engage below an offset of 181 µs
+> — which is why the accepted range stops at 120.
 >
 > **Not every transmit is compensated.** This applies to the bucket table of `B0` frames sent
 > through `rf_bridge.send_raw`, which is every transmit this package performs. The two stock

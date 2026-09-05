@@ -2694,6 +2694,11 @@ int main() {
   // the repo root on the include path, so it cannot include the component
   // header and carries the floor by value. The two copies must never drift.
   assert(rf433::B0_MIN_BUCKET_US == esphome::rf_bridge::B0_MIN_BUCKET_US);
+  // The rejection reason names the floor as a decimal. Derive the expectation
+  // from the constant itself so the literal in rf433_scheduler.h cannot drift
+  // from the value it quotes without going red here.
+  const std::string min_bucket_reason =
+      "frame references a bucket shorter than " + std::to_string(rf433::B0_MIN_BUCKET_US) + " us";
 
   std::string normalized;
   std::string reason;
@@ -2705,14 +2710,14 @@ int main() {
   for (const char *bucket : {"0000", "0009", "000A", "0040", "0041", "0063"}) {
     const std::string frame = std::string("AAB0050108") + bucket + "0055";
     assert(!rf433::normalize_b0(frame, normalized, reason));
-    assert(reason == "frame references a bucket shorter than 100 us");
+    assert(reason == min_bucket_reason);
   }
   assert(rf433::normalize_b0("AAB005010800640055", normalized, reason));
 
   // The issue's exact reported frame (a referenced 1 us bucket) is rejected
   // with the same reason.
   assert(!rf433::normalize_b0("AAB005010800010055", normalized, reason));
-  assert(reason == "frame references a bucket shorter than 100 us");
+  assert(reason == min_bucket_reason);
 
   // An UNREFERENCED sub-floor bucket stays legal: length 07, bucket count 02,
   // buckets 100 us and 1 us, and data "00" references only bucket 0. An
@@ -2736,7 +2741,27 @@ def test_native_send_raw_floors_referenced_buckets_at_offset_zero(tmp_path: Path
 #include <string>
 #include <vector>
 
+#include "components/rf_bridge/rf_bridge_protocol.h"
+
+// compact_hex renders the packed UART bytes UPPERCASE whatever characters the
+// caller wrote, so comparing serialized() against a literal can never see the
+// emit path uppercasing a lowercase frame first (a round-trip through
+// HEX_DIGITS, which is what b0_with_bucket_offset does at a non-zero offset).
+// Intercept the serializer's per-character reads instead: the protocol header
+// is already included above, so its pragma-once guard skips it inside
+// rf_bridge.cpp and this rename rewires only the .cpp's own call in
+// write_byte_str_ -- the header's classifier keeps the shared original.
+static std::string g_serialized_chars;
+static uint8_t (*g_shared_nibble)(char) = &esphome::rf_bridge::serialized_nibble;
+namespace esphome::rf_bridge {
+inline uint8_t observed_nibble(char value) {
+  g_serialized_chars.push_back(value);
+  return g_shared_nibble(value);
+}
+}  // namespace esphome::rf_bridge
+#define serialized_nibble observed_nibble
 #include "components/rf_bridge/rf_bridge.cpp"
+#undef serialized_nibble
 
 using esphome::rf_bridge::RFBridgeComponent;
 
@@ -2746,6 +2771,7 @@ struct ProbeBridge : RFBridgeComponent {
   std::string serialized() const {
     return esphome::rf_bridge::compact_hex(this->written_bytes());
   }
+  const std::vector<uint8_t> &wire_bytes() const { return this->written_bytes(); }
 };
 
 static size_t warnings_since_reset() { return esphome::host_test_warnings().size(); }
@@ -2794,11 +2820,19 @@ int main() {
     // what b0_with_bucket_offset would do at a non-zero offset, is exactly
     // the behavior this path exists to avoid).
     reset_warnings();
+    g_serialized_chars.clear();
     ProbeBridge lowercase;
     if (explicit_zero)
       lowercase.set_tx_bucket_offset_us(0);
     lowercase.send_raw("aab005010801180055");
-    assert(lowercase.serialized() == "AAB005010801180055");
+    // Raw byte comparison, no case normalization: the wire carries exactly the
+    // bytes the lowercase input encodes...
+    assert(lowercase.wire_bytes() ==
+           std::vector<uint8_t>({0xAA, 0xB0, 0x05, 0x01, 0x08, 0x01, 0x18, 0x00, 0x55}));
+    // ...and the serializer consumed the caller's characters as written,
+    // lowercase included. compact_hex(written_bytes()) -- serialized() --
+    // uppercases by construction and could not see an uppercase round-trip.
+    assert(g_serialized_chars == "aab005010801180055");
     assert(lowercase.flush_count() == 1);
     assert(warnings_since_reset() == 0);
 

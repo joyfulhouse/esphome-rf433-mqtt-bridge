@@ -22,9 +22,12 @@ Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is d
   occurrence; on the EFM8BB1 (Portisch) 0–64 µs underflows to ~65.5 ms. `/tx` admission now
   rejects such frames with `"reason":"frame references a bucket shorter than 100 us"`, and
   `send_raw` (a public action that bypasses admission) floors every *referenced* sub-100 µs
-  bucket to 100 µs at every offset, logging a throttled warning. Unreferenced bucket-table
-  entries are never rewritten and never reach the air; frames whose referenced buckets are all
-  ≥ 100 µs transmit byte-identical. No contract-version change.
+  bucket to 100 µs at every offset, logging a throttled warning. At the default offset of 0 only
+  referenced buckets are floored: unreferenced bucket-table entries are never rewritten and never
+  reach the air, and frames whose referenced buckets are all ≥ 100 µs transmit byte-identical. At
+  a non-zero offset the compensation pass rewrites the whole bucket table, referenced or not (see
+  [#24](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/24)). No contract-version
+  change.
 
 ## [1.4.0] - 2026-08-02
 
