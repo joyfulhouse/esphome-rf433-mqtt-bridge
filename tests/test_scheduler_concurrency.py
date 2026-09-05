@@ -253,13 +253,14 @@ def test_inter_repeat_gap_stretches_3x_with_real_airtime(tmp_path: Path) -> None
     )
 
 
-def test_armed_stop_preempts_own_train_but_not_peers(tmp_path: Path) -> None:
-    """Truncate only the armed STOP's own train, delaying peers rather than dropping them.
+def test_timed_train_finishes_before_deadline_without_dropping_peers(
+    tmp_path: Path,
+) -> None:
+    """Finish the timed train first, delaying peers rather than dropping them.
 
-    An armed fail-safe STOP that comes due mid-run truncates only its OWN
-    command's remaining repeats; peer targets' trains are delayed, not
-    dropped. STOP copies dispatch consecutively (physical pacing only),
-    bypassing both the round-robin interleave and the user gap floor.
+    A started timed train keeps normal dispatch until its repeats finish.
+    Peer targets' trains are delayed, not dropped, and STOP copies dispatch
+    consecutively (physical pacing only), bypassing the user gap floor.
     """
     _compile_and_run(
         tmp_path,
@@ -268,8 +269,8 @@ def test_armed_stop_preempts_own_train_but_not_peers(tmp_path: Path) -> None:
   std::string reason;
   std::vector<std::string> displaced;
 
-  // A: repeats=5 with an armed fail-safe STOP (stop_after_ms=200); its deadline
-  // arms when A first dispatches at t=0 and comes due at t=200, mid-train.
+  // A: repeats=5 with an armed fail-safe STOP (stop_after_ms=200). Its train
+  // owns the bridge after starting at t=0 and finishes at t=140.
   // B, C: plain repeats=5 on different remotes. Tiny frames, gap=35.
   TargetScheduler s(35);
   assert(s.schedule("cmd-a", "a1b2c3:42:1", "A", "", 5, 200, "SA", 0, displaced, reason));
@@ -281,10 +282,16 @@ def test_armed_stop_preempts_own_train_but_not_peers(tmp_path: Path) -> None:
   assert(count_raw(t, "B") == 5);
   assert(count_raw(t, "C") == 5);
 
-  // A's OWN action train is truncated by its own STOP: only the repeats that
-  // fired before the t=200 deadline (at t=0 and t=105) go out; the remaining
-  // three action repeats are abandoned in favor of the STOP.
-  assert(count_raw(t, "A") == 2);
+  // A's five copies are consecutive normal-work slots and all land before
+  // the unchanged t=200 deadline.
+  std::vector<uint32_t> a_times;
+  for (const auto &tk : t)
+    if (tk.raw == "A")
+      a_times.push_back(tk.t);
+  const uint32_t expected_a_times[] = {0, 35, 70, 105, 140};
+  assert(a_times.size() == 5);
+  for (size_t i = 0; i < a_times.size(); i++)
+    assert(a_times[i] == expected_a_times[i]);
 
   // The fail-safe STOP fires all five copies CONSECUTIVELY once due -- 5 ms
   // apart (physical occupancy only), not interleaved with B/C and not held by
@@ -348,22 +355,48 @@ def test_staggered_admission_reproduces_on_air_run1(tmp_path: Path) -> None:
     )
 
 
-def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
+def test_timed_repeats_finish_with_solo_equal_stop_lateness(
     tmp_path: Path,
 ) -> None:
-    """Wait out the in-flight frame, then truncate only the timed command's own train.
+    """Pack timed repeats earlier while retaining the solo STOP-lateness bound.
 
     Validation against live-hardware run 3: a timed command's fail-safe STOP
-    is promoted ahead of queued peer ACTION work but still waits out the
-    in-flight frame's physical RF occupancy, and it truncates only ITS OWN
-    remaining action repeats -- never the peer's. Interleaving can push the
-    timed command's later action repeats past its own stop deadline, so it
-    delivers FEWER action repeats under concurrency than it would solo.
+    is promoted ahead of queued peer ACTION work and still waits out physical
+    RF occupancy. Consecutive scheduling preserves all timed repeats without
+    adding concurrency delay beyond the owning frame's solo occupancy.
     """
     _compile_and_run(
         tmp_path,
         "staggered_run3",
         r"""
+  // Pin the complete pre-fix solo timeline: dispatch selection must not alter
+  // a timed command when no peer is competing for the bridge.
+  std::string reason;
+  std::vector<std::string> displaced;
+  TargetScheduler solo(35);
+  assert(solo.schedule("solo", "a1b2c3:42:1", FX, "", 3, 2620, FW, 0,
+                       displaced, reason));
+  auto solo_t = run(solo, 0, 8000);
+  const std::string solo_frames[] = {FX, FX, FX, FW, FW, FW};
+  const uint32_t solo_times[] = {0, 1060, 2120, 3180, 4240, 5300};
+  assert(solo_t.size() == 6);
+  for (size_t i = 0; i < solo_t.size(); i++) {
+    assert(solo_t[i].raw == solo_frames[i]);
+    assert(solo_t[i].t == solo_times[i]);
+  }
+
+  // An untimed solo train retains the same pre-fix frame timeline too.
+  TargetScheduler untimed_solo(35);
+  assert(untimed_solo.schedule("untimed-solo", "a1b2c3:42:1", FX, "", 3, 0, "", 0,
+                               displaced, reason));
+  auto untimed_solo_t = run(untimed_solo, 0, 5000);
+  const uint32_t untimed_solo_times[] = {0, 1060, 2120};
+  assert(untimed_solo_t.size() == 3);
+  for (size_t i = 0; i < untimed_solo_t.size(); i++) {
+    assert(untimed_solo_t[i].raw == FX);
+    assert(untimed_solo_t[i].t == untimed_solo_times[i]);
+  }
+
   TargetScheduler s(35);
   // Timed A (repeats=3, STOP frame FW, deadline arms at first dispatch and
   // comes due at 2620 ms -- mid-train) concurrent with plain B (repeats=3).
@@ -376,16 +409,16 @@ def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
   // The PEER is not truncated: B still gets all three action repeats.
   assert(count_raw(t, FY) == 3);
 
-  // A's OWN action train IS truncated: interleaving delayed A's third action
-  // past its 2620 ms deadline, so A delivers only two of three action repeats,
-  // then the full three-copy fail-safe STOP.
-  assert(count_raw(t, FX) == 2);
+  // A keeps the bridge for its train, so all three action repeats land before
+  // the deadline and the full three-copy fail-safe STOP still follows.
+  assert(count_raw(t, FX) == 3);
   assert(count_raw(t, FW) == 3);
+  assert(t[0].raw == FX && t[0].t == 0);
+  assert(t[1].raw == FX && t[1].t == 1060);
+  assert(t[2].raw == FX && t[2].t == 2120);
 
-  // A started at slot 0 (t=0), so its deadline is 0 + 2620. The first STOP goes
-  // on air only after the in-flight frame (B, dispatched at slot 2 / t=2120)
-  // clears at t=3180: promoted ahead of queued work, but gated by physical RF
-  // occupancy. Lateness beyond the deadline is exactly that remaining occupancy.
+  // A started at t=0, so deadline_at is 2620. The first STOP waits only for
+  // A's in-flight third ACTION to clear at t=3180, matching the solo bound.
   uint32_t first_stop = 0, second_b = 0;
   int b_seen = 0;
   for (const auto &tk : t) {
@@ -394,12 +427,337 @@ def test_timed_stop_waits_for_inflight_and_truncates_only_its_own_train(
     if (tk.raw == FY && ++b_seen == 2)
       second_b = tk.t;
   }
-  assert(first_stop == 3180);
-  assert(first_stop - 2620 == 560);   // waited out the in-flight frame, not longer
+  constexpr uint32_t armed_deadline = 2620;
+  constexpr uint32_t pre_fix_first_stop = 3180;
+  assert(first_stop == pre_fix_first_stop);
+  assert(first_stop - armed_deadline == 560);  // waited out the in-flight frame, not longer
 
   // STOP priority: the first STOP copy goes on air BEFORE B's second action --
   // the promoted STOP jumps ahead of queued ACTION work.
   assert(second_b > first_stop);
+
+  // With asymmetric airtimes, the packed owner -- not the tiny peer -- may be
+  // in flight at deadline_at. Its STOP lateness remains exactly the same as
+  // solo: only the owning frame's remaining physical occupancy is charged.
+  TargetScheduler asymmetric_solo(35);
+  assert(asymmetric_solo.schedule("big-solo", "a1b2c3:42:1", FX, "", 2, 1061, FW, 0,
+                                  displaced, reason));
+  auto asymmetric_solo_t = run(asymmetric_solo, 0, 5000);
+
+  TargetScheduler asymmetric_shared(35);
+  assert(asymmetric_shared.schedule("big-shared", "a1b2c3:42:1", FX, "", 2, 1061, FW, 0,
+                                    displaced, reason));
+  assert(asymmetric_shared.schedule("tiny-peer", "a1b2c3:43:1", "P", "", 3, 0, "", 0,
+                                    displaced, reason));
+  auto asymmetric_shared_t = run(asymmetric_shared, 0, 6000);
+  assert(count_raw(asymmetric_shared_t, FX) == 2);
+  assert(count_raw(asymmetric_shared_t, "P") == 3);
+
+  uint32_t solo_first_stop = 0, shared_first_stop = 0, first_peer = 0;
+  for (const auto &tk : asymmetric_solo_t)
+    if (tk.raw == FW && solo_first_stop == 0)
+      solo_first_stop = tk.t;
+  for (const auto &tk : asymmetric_shared_t) {
+    if (tk.raw == FW && shared_first_stop == 0)
+      shared_first_stop = tk.t;
+    if (tk.raw == "P" && first_peer == 0)
+      first_peer = tk.t;
+  }
+  constexpr uint32_t asymmetric_deadline = 1061;
+  assert(asymmetric_shared_t[1].raw == FX);
+  const uint32_t owner_frame_dispatch = asymmetric_shared_t[1].t;
+  const uint32_t owner_frame_occupancy = asymmetric_solo_t[1].t - asymmetric_solo_t[0].t;
+  const uint32_t owner_frame_clear = owner_frame_dispatch + owner_frame_occupancy;
+  assert(shared_first_stop == owner_frame_clear);
+  assert(shared_first_stop - asymmetric_deadline == solo_first_stop - asymmetric_deadline);
+  assert(first_peer > shared_first_stop);
+""",
+    )
+
+
+def test_first_timed_train_owns_actions_and_trailers_before_second_starts(
+    tmp_path: Path,
+) -> None:
+    """Let the first timed train finish ACTION/TRAILER work before the second starts."""
+    _compile_and_run(
+        tmp_path,
+        "two_timed_train_ownership",
+        r"""
+  std::string reason;
+  std::vector<std::string> displaced;
+  TargetScheduler s(35);
+  assert(s.schedule("first", "a1b2c3:42:1", "A", "TA", 2, 500, "SA", 0,
+                    displaced, reason));
+  assert(s.schedule("second", "a1b2c3:43:1", "B", "", 2, 500, "SB", 0,
+                    displaced, reason));
+  auto t = run(s, 0, 1000);
+
+  // The first started timed command owns all normal ACTION and TRAILER slots.
+  const char *expected_train[] = {"A", "A", "TA", "TA", "B", "B"};
+  const uint32_t expected_times[] = {0, 35, 70, 105, 140, 175};
+  for (size_t i = 0; i < 6; i++) {
+    assert(t[i].raw == expected_train[i]);
+    assert(t[i].t == expected_times[i]);
+  }
+  assert(t[0].started == "first");
+  assert(t[4].started == "second");
+  assert(count_raw(t, "A") == 2 && count_raw(t, "TA") == 2);
+  assert(count_raw(t, "B") == 2);
+  assert(count_raw(t, "SA") == 2 && count_raw(t, "SB") == 2);
+""",
+    )
+
+
+def test_completion_telemetry_reports_delivered_action_repeats(tmp_path: Path) -> None:
+    """Report ACTION-only counts across solo and concurrent command shapes."""
+    _compile_and_run(
+        tmp_path,
+        "completion_telemetry",
+        r"""
+  std::string reason;
+  std::string started;
+  std::vector<std::string> displaced;
+  rf433::LifecycleEvent completed;
+
+  TargetScheduler solo(35);
+  assert(solo.schedule("solo", "a1b2c3:42:1", FX, "", 3, 2620, FW, 0,
+                       displaced, reason));
+  bool saw_solo = false;
+  for (uint32_t t = 0; t <= 8000; t++) {
+    auto raw = solo.next(t, started, &completed);
+    if (!raw || completed.command_id.empty())
+      continue;
+    assert(completed.status() == std::string("completed"));
+    assert(completed.has_action_repeats);
+    assert(completed.action_repeats_delivered == 3);
+    assert(completed.action_repeats_configured == 3);
+    saw_solo = true;
+  }
+  assert(saw_solo);
+
+  TargetScheduler concurrent(35);
+  assert(concurrent.schedule("timed", "a1b2c3:42:1", FX, "", 3, 2620, FW, 0,
+                             displaced, reason));
+  bool peer_admitted = false;
+  bool saw_timed = false;
+  for (uint32_t t = 0; t <= 12000; t++) {
+    if (!peer_admitted && t >= 500) {
+      assert(concurrent.schedule("peer", "a1b2c3:43:1", FY, "", 3, 0, "", t,
+                                 displaced, reason));
+      peer_admitted = true;
+    }
+    auto raw = concurrent.next(t, started, &completed);
+    if (!raw || completed.command_id != "timed")
+      continue;
+    assert(completed.has_action_repeats);
+    assert(completed.action_repeats_delivered == 3);
+    assert(completed.action_repeats_configured == 3);
+    saw_timed = true;
+  }
+  assert(saw_timed);
+
+  TargetScheduler truncated(35);
+  assert(truncated.schedule("truncated", "a1b2c3:42:1", "A", "", 5, 50, "SA", 0,
+                            displaced, reason));
+  assert(truncated.schedule("truncated-peer", "a1b2c3:43:1", "B", "", 3, 0, "", 0,
+                            displaced, reason));
+  int truncated_actions = 0;
+  int stop_frames = 0;
+  int peer_actions = 0;
+  uint32_t last_stop = 0;
+  uint32_t first_peer = 0;
+  bool saw_truncated = false;
+  for (uint32_t t = 0; t <= 500; t++) {
+    auto raw = truncated.next(t, started, &completed);
+    if (raw && *raw == "A")
+      truncated_actions++;
+    if (raw && *raw == "SA") {
+      stop_frames++;
+      last_stop = t;
+    }
+    if (raw && *raw == "B") {
+      peer_actions++;
+      if (first_peer == 0) {
+        first_peer = t;
+        assert(started == "truncated-peer");
+      }
+    }
+    if (completed.command_id == "truncated") {
+      assert(completed.has_action_repeats);
+      assert(completed.action_repeats_delivered == 2);
+      assert(completed.action_repeats_configured == 5);
+      saw_truncated = true;
+    }
+  }
+  assert(truncated_actions == 2 && stop_frames == 5 && saw_truncated);
+  assert(peer_actions == 3);
+  assert(first_peer > last_stop);
+
+  TargetScheduler with_trailer(35);
+  assert(with_trailer.schedule("trailer", "a1b2c3:42:1", "ACTION", "TRAILER", 3, 0, "", 0,
+                               displaced, reason));
+  int action_frames = 0;
+  int trailer_frames = 0;
+  bool saw_trailer = false;
+  for (uint32_t t = 0; t <= 500; t++) {
+    auto raw = with_trailer.next(t, started, &completed);
+    if (raw && *raw == "ACTION")
+      action_frames++;
+    if (raw && *raw == "TRAILER")
+      trailer_frames++;
+    if (completed.command_id == "trailer") {
+      assert(completed.action_repeats_delivered == 3);
+      assert(completed.action_repeats_configured == 3);
+      saw_trailer = true;
+    }
+  }
+  assert(action_frames == 3 && trailer_frames == 3 && saw_trailer);
+
+  TargetScheduler single(35);
+  assert(single.schedule("single", "a1b2c3:42:1", "ONE", "", 1, 0, "", 123,
+                         displaced, reason));
+  auto single_raw = single.next(123, started, &completed);
+  assert(single_raw && *single_raw == "ONE");
+  assert(started == "single" && completed.command_id == "single");
+  assert(completed.action_repeats_delivered == 1);
+  assert(completed.action_repeats_configured == 1);
+""",
+    )
+
+
+def test_completion_telemetry_yaml_source_presence_smoke() -> None:
+    """Smoke-check MQTT wiring presence; native simulations prove behavior."""
+    package = (PROJECT_ROOT / "rf433-mqtt-bridge.yaml").read_text()
+    required_once = (
+        "outbox.publish_or_enqueue(completed_event, send_status)",
+        'root["action_repeats_delivered"]',
+        'root["action_repeats_configured"]',
+        "event.has_action_repeats",
+        "&completed_event",
+    )
+    for token in required_once:
+        assert package.count(token) == 1, token
+
+
+def test_completed_outbox_is_best_effort_under_saturation(tmp_path: Path) -> None:
+    """Never evict or reorder existing lifecycle kinds for completion telemetry."""
+    _compile_and_run(
+        tmp_path,
+        "completion_outbox_priority",
+        r"""
+  auto unavailable = [](const rf433::LifecycleEvent &) { return false; };
+  auto existing_event = [](size_t index) {
+    const std::string id = "existing-" + std::to_string(index);
+    switch (index % 5) {
+      case 0:
+        return rf433::LifecycleEvent::accepted(id);
+      case 1:
+        return rf433::LifecycleEvent::rejected(id, "reason");
+      case 2:
+        return rf433::LifecycleEvent::started(id, 1, 2, 3);
+      case 3:
+        return rf433::LifecycleEvent::displaced(id, 1, 2, 3);
+      default:
+        return rf433::LifecycleEvent::disarmed(id, 2, 3);
+    }
+  };
+
+  rf433::LifecycleOutbox full_existing;
+  std::vector<rf433::LifecycleEvent> expected;
+  for (size_t index = 0; index < rf433::LifecycleOutbox::CAPACITY; index++) {
+    auto event = existing_event(index);
+    expected.push_back(event);
+    assert(!full_existing.publish_or_enqueue(event, unavailable));
+  }
+  assert(!full_existing.publish_or_enqueue(
+      rf433::LifecycleEvent::completed("best-effort", 2, 3), unavailable));
+  assert(full_existing.size() == rf433::LifecycleOutbox::CAPACITY);
+  assert(full_existing.dropped_count() == 0);
+
+  std::vector<rf433::LifecycleEvent> delivered;
+  auto collect = [&](const rf433::LifecycleEvent &event) {
+    delivered.push_back(event);
+    return true;
+  };
+  assert(full_existing.flush(collect) == expected.size());
+  for (size_t index = 0; index < expected.size(); index++) {
+    assert(delivered[index].kind == expected[index].kind);
+    assert(delivered[index].command_id == expected[index].command_id);
+  }
+
+  rf433::LifecycleOutbox replace_completion;
+  assert(!replace_completion.publish_or_enqueue(
+      rf433::LifecycleEvent::completed("replace-me", 1, 3), unavailable));
+  for (size_t index = 0; index + 1 < rf433::LifecycleOutbox::CAPACITY; index++)
+    assert(!replace_completion.publish_or_enqueue(existing_event(index), unavailable));
+  assert(!replace_completion.publish_or_enqueue(
+      existing_event(rf433::LifecycleOutbox::CAPACITY - 1), unavailable));
+
+  delivered.clear();
+  assert(replace_completion.flush(collect) == expected.size());
+  for (size_t index = 0; index < expected.size(); index++) {
+    assert(delivered[index].kind == expected[index].kind);
+    assert(delivered[index].command_id == expected[index].command_id);
+  }
+""",
+    )
+
+
+def test_completion_telemetry_preserves_dispatch_timelines(tmp_path: Path) -> None:
+    """Keep every frame and dispatch timestamp identical with telemetry enabled."""
+    _compile_and_run(
+        tmp_path,
+        "completion_timeline_equivalence",
+        r"""
+  auto scenario = [](bool telemetry, bool concurrent, bool pressure) {
+    TargetScheduler scheduler(35);
+    std::string reason;
+    std::string started;
+    std::vector<std::string> displaced;
+    assert(scheduler.schedule("timed", "a1b2c3:42:1", FX, "", 3, 2620, FW, 0,
+                              displaced, reason));
+
+    rf433::LifecycleOutbox outbox;
+    auto unavailable = [](const rf433::LifecycleEvent &) { return false; };
+    if (pressure) {
+      for (size_t index = 0; index < rf433::LifecycleOutbox::CAPACITY; index++) {
+        assert(!outbox.publish_or_enqueue(
+            rf433::LifecycleEvent::accepted("queued-" + std::to_string(index)), unavailable));
+      }
+    }
+
+    bool peer_admitted = false;
+    std::vector<Tick> timeline;
+    for (uint32_t t = 0; t <= 12000; t++) {
+      if (concurrent && !peer_admitted && t >= 500) {
+        assert(scheduler.schedule("peer", "a1b2c3:43:1", FY, "", 3, 0, "", t,
+                                  displaced, reason));
+        peer_admitted = true;
+      }
+      rf433::LifecycleEvent completed;
+      auto raw = telemetry ? scheduler.next(t, started, &completed) : scheduler.next(t, started);
+      if (raw)
+        timeline.push_back({t, *raw, started});
+      if (telemetry && !completed.command_id.empty())
+        assert(!outbox.publish_or_enqueue(completed, unavailable));
+    }
+    return timeline;
+  };
+  auto assert_same = [](const std::vector<Tick> &without_telemetry,
+                        const std::vector<Tick> &with_telemetry) {
+    assert(without_telemetry.size() == with_telemetry.size());
+    for (size_t index = 0; index < without_telemetry.size(); index++) {
+      assert(without_telemetry[index].t == with_telemetry[index].t);
+      assert(without_telemetry[index].raw == with_telemetry[index].raw);
+      assert(without_telemetry[index].started == with_telemetry[index].started);
+    }
+  };
+
+  assert_same(scenario(false, false, false), scenario(true, false, false));
+  const auto concurrent_timeline = scenario(true, true, false);
+  assert(count_raw(concurrent_timeline, FX) == 3);
+  assert_same(scenario(false, true, false), concurrent_timeline);
+  assert_same(scenario(false, true, true), scenario(true, true, true));
 """,
     )
 

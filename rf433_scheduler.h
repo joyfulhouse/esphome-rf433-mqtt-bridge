@@ -780,8 +780,25 @@ class TargetScheduler {
       if (stop_priority == 0 && this->next_user_at_.has_value() &&
           !due_(now_ms, *this->next_user_at_))
         continue;
-      for (size_t offset = 0; offset < count; offset++) {
-        const size_t index = (this->cursor_ + offset) % count;
+      size_t timed_action_owner = count;
+      if (stop_priority == 0) {
+        for (size_t offset = 0; offset < count; offset++) {
+          const size_t index = (this->cursor_ + offset) % count;
+          const Command &command = this->commands_.at(this->order_[index]);
+          // The policy permits at most one started timed ACTION/TRAILER train;
+          // that sole owner keeps normal dispatch until its train finishes.
+          if (command.started && command.stop_after_ms > 0 &&
+              (command.phase == Phase::ACTION || command.phase == Phase::TRAILER)) {
+            timed_action_owner = index;
+            break;
+          }
+        }
+      }
+      const bool timed_action_owned = stop_priority == 0 && timed_action_owner < count;
+      const size_t candidate_count = timed_action_owned ? 1 : count;
+      for (size_t offset = 0; offset < candidate_count; offset++) {
+        const size_t index =
+            timed_action_owned ? timed_action_owner : (this->cursor_ + offset) % count;
         const std::string target = this->order_[index];
         Command &command = this->commands_.at(target);
         const bool is_stop = command.phase == Phase::STOP;
