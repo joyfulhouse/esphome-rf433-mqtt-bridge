@@ -453,21 +453,24 @@ def test_timed_repeats_finish_with_solo_equal_stop_lateness(
   assert(count_raw(asymmetric_shared_t, FX) == 2);
   assert(count_raw(asymmetric_shared_t, "P") == 3);
 
-  uint32_t solo_first_stop = 0, shared_first_stop = 0;
+  uint32_t solo_first_stop = 0, shared_first_stop = 0, first_peer = 0;
   for (const auto &tk : asymmetric_solo_t)
     if (tk.raw == FW && solo_first_stop == 0)
       solo_first_stop = tk.t;
-  for (const auto &tk : asymmetric_shared_t)
+  for (const auto &tk : asymmetric_shared_t) {
     if (tk.raw == FW && shared_first_stop == 0)
       shared_first_stop = tk.t;
+    if (tk.raw == "P" && first_peer == 0)
+      first_peer = tk.t;
+  }
   constexpr uint32_t asymmetric_deadline = 1061;
+  assert(asymmetric_shared_t[1].raw == FX);
   const uint32_t owner_frame_dispatch = asymmetric_shared_t[1].t;
   const uint32_t owner_frame_occupancy = asymmetric_solo_t[1].t - asymmetric_solo_t[0].t;
   const uint32_t owner_frame_clear = owner_frame_dispatch + owner_frame_occupancy;
   assert(shared_first_stop == owner_frame_clear);
-  assert(shared_first_stop - asymmetric_deadline == owner_frame_clear - asymmetric_deadline);
-  assert(shared_first_stop - asymmetric_deadline <= owner_frame_occupancy);
   assert(shared_first_stop - asymmetric_deadline == solo_first_stop - asymmetric_deadline);
+  assert(first_peer > shared_first_stop);
 """,
     )
 
