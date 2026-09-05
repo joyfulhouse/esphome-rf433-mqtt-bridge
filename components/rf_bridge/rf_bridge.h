@@ -64,9 +64,12 @@ class RFBridgeComponent : public uart::UARTDevice, public Component {
   void start_bucket_sniffing();
   void send_raw(const std::string &code);
   // Compile-time OB38S003 transmit compensation, in microseconds subtracted
-  // from every bucket of an outbound B0 frame. 0 (the default) leaves every
-  // well-formed frame byte-identical; send_raw still drops a MALFORMED B0 frame
-  // at every offset. See b0_with_bucket_offset in rf_bridge_protocol.h.
+  // from every bucket of an outbound B0 frame. 0 (the default) skips the
+  // offset rewrite but NOT the bucket floor: send_raw still raises every
+  // REFERENCED bucket shorter than B0_MIN_BUCKET_US to 100 us at every offset
+  // (unreferenced table entries are never rewritten), and still drops a
+  // MALFORMED B0 frame. See b0_with_bucket_offset and
+  // b0_floor_referenced_buckets in rf_bridge_protocol.h.
   void set_tx_bucket_offset_us(uint16_t offset_us) { this->tx_bucket_offset_us_ = offset_us; }
   // The one place anything may read the effective offset. The package publishes
   // it on retained /info through this getter rather than splicing the YAML
