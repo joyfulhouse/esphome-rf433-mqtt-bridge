@@ -61,8 +61,10 @@ inline constexpr char B0_TRIM_CHARS[] = " \t\n\v\f\r";
 // rf433_scheduler.h mirrors this value as rf433::B0_MIN_BUCKET_US so its
 // airtime estimate floors each bucket exactly as emitted here and stays an
 // upper bound on real airtime at every offset (it cannot include this header;
-// see the note there). tests/test_firmware.py pins the two equal -- change
-// both together.
+// see the note there) -- except that at offset 0 the floor does not run, so a
+// referenced literal 0 us bucket still keys ~659 ms (HARDWARE.md caveat 2a), a
+// residual the estimate does not cover. tests/test_firmware.py pins the two
+// equal -- change both together.
 constexpr uint16_t B0_MIN_BUCKET_US = 100;
 
 // `inline`, not `static`: two inline functions below odr-use this object, and a
