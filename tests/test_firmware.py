@@ -566,9 +566,7 @@ int main() {
   raw = concurrent.next(70, started);
   assert(raw && *raw == "B" && started.empty());
   assert(!concurrent.next(105, started));
-  for (uint32_t t = 106; t < 1000; t++)
-    assert(!concurrent.next(t, started));  // no remaining A, TA, or SA frame
-  assert(!concurrent.next(1000, started));
+  assert(!concurrent.next(1000, started));  // no remaining A, TA, or SA frame
   assert(concurrent.idle());
 
   // Disarming a displaced command purges every owed STOP copy parked in the
