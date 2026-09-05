@@ -550,6 +550,10 @@ interval:
                     root["t"] = event.timestamp_ms;
                     root["boot"] = event.boot_id;
                   }
+                  if (event.has_action_repeats) {
+                    root["action_repeats_delivered"] = event.action_repeats_delivered;
+                    root["action_repeats_configured"] = event.action_repeats_configured;
+                  }
                 }, 1, false);
           };
           if (id(mqtt_client).is_connected())
@@ -615,21 +619,26 @@ interval:
             id(next_info_ms) = now_ms + 60000;
           }
           std::string started_command_id;
+          rf433::LifecycleEvent completed_event;
           const uint32_t dispatch_ms = millis();
-          const auto raw = sched.next(dispatch_ms, started_command_id);
+          const auto raw = sched.next(dispatch_ms, started_command_id, &completed_event);
           if (!raw.has_value())
             return;
           id(portisch_rf_bridge).send_raw(*raw);
-          if (started_command_id.empty())
-            return;
-          // `started` means this frame was handed to the RF coprocessor over
-          // UART. ESPHome's rf_bridge send_raw does not wait for an EFM8BB1
-          // ack, so `started` is proof of dispatch, not of RF emission.
-          const uint32_t status_ms = millis();
-          outbox.publish_or_enqueue(
-              rf433::LifecycleEvent::started(
-                  started_command_id, status_ms - dispatch_ms, status_ms, id(boot_id)),
-              send_status);
+          if (!started_command_id.empty()) {
+            // `started` means this frame was handed to the RF coprocessor over
+            // UART. ESPHome's rf_bridge send_raw does not wait for an EFM8BB1
+            // ack, so `started` is proof of dispatch, not of RF emission.
+            const uint32_t status_ms = millis();
+            outbox.publish_or_enqueue(
+                rf433::LifecycleEvent::started(
+                    started_command_id, status_ms - dispatch_ms, status_ms, id(boot_id)),
+                send_status);
+          }
+          // The deployed consumer safely ignores unknown lifecycle kinds;
+          // completion telemetry is additive and never load-bearing.
+          if (!completed_event.command_id.empty())
+            outbox.publish_or_enqueue(completed_event, send_status);
   - interval: 10s
     then:
       - lambda: |-

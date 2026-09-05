@@ -65,6 +65,7 @@ enum class LifecycleKind : uint8_t {
   STARTED,
   DISPLACED,
   DISARMED,
+  COMPLETED,
 };
 
 struct LifecycleEvent {
@@ -74,8 +75,11 @@ struct LifecycleEvent {
   uint32_t age_ms{0};
   uint32_t timestamp_ms{0};
   uint32_t boot_id{0};
+  int action_repeats_delivered{0};
+  int action_repeats_configured{0};
   bool has_age{false};
   bool has_clock{false};
+  bool has_action_repeats{false};
 
   static LifecycleEvent accepted(const std::string &command_id) {
     return make_(LifecycleKind::ACCEPTED, command_id);
@@ -95,6 +99,18 @@ struct LifecycleEvent {
     event.boot_id = boot_id;
     event.has_age = true;
     event.has_clock = true;
+    return event;
+  }
+
+  static LifecycleEvent completed(const std::string &command_id, int action_repeats_delivered,
+                                  int action_repeats_configured) {
+    // Counts-only telemetry is emitted only on normal scheduler completion.
+    // Displacement/disarm removals report their existing lifecycle event, and
+    // completion intentionally carries no clock or age correlation.
+    LifecycleEvent event = make_(LifecycleKind::COMPLETED, command_id);
+    event.action_repeats_delivered = action_repeats_delivered;
+    event.action_repeats_configured = action_repeats_configured;
+    event.has_action_repeats = true;
     return event;
   }
 
@@ -142,6 +158,8 @@ struct LifecycleEvent {
         return "rejected";
       case LifecycleKind::STARTED:
         return "started";
+      case LifecycleKind::COMPLETED:
+        return "completed";
       case LifecycleKind::DISPLACED:
         return "displaced";
       case LifecycleKind::DISARMED:
@@ -160,12 +178,13 @@ struct LifecycleEvent {
 };
 
 // ESPHome's MQTT client retries a failed QoS enqueue only once immediately.
-// Keep lifecycle truth across longer disconnects in a fixed FIFO. Repeated
-// callbacks for the same command transition coalesce in place; transitions
+// Keep lifecycle truth across longer disconnects in a fixed FIFO. COMPLETED
+// telemetry is best-effort and never displaces an existing lifecycle kind.
+// Repeated callbacks for the same command transition coalesce in place; transitions
 // retain lifecycle order per command (accepted before started) even if a
 // broker replay arrives after a later phase was queued. Sustained overload
-// drops the oldest event and increments dropped_count_ instead of growing heap
-// without bound.
+// of existing lifecycle kinds drops the oldest event and increments
+// dropped_count_ instead of growing heap without bound.
 class LifecycleOutbox {
  public:
   static constexpr size_t CAPACITY = 32;
@@ -212,10 +231,22 @@ class LifecycleOutbox {
       }
     }
     if (this->size_ == CAPACITY) {
-      this->pop_front_();
-      this->dropped_count_++;
-      if (insertion > 0)
-        insertion--;
+      if (event.kind == LifecycleKind::COMPLETED)
+        return;
+      const auto completed = std::find_if(
+          this->events_.begin(), this->events_.begin() + this->size_,
+          [](const LifecycleEvent &queued) { return queued.kind == LifecycleKind::COMPLETED; });
+      if (completed != this->events_.begin() + this->size_) {
+        const size_t removed = static_cast<size_t>(std::distance(this->events_.begin(), completed));
+        this->erase_at_(removed);
+        if (insertion > removed)
+          insertion--;
+      } else {
+        this->pop_front_();
+        this->dropped_count_++;
+        if (insertion > 0)
+          insertion--;
+      }
     }
     for (size_t index = this->size_; index > insertion; index--)
       this->events_[index] = std::move(this->events_[index - 1]);
@@ -233,6 +264,8 @@ class LifecycleOutbox {
       case LifecycleKind::DISPLACED:
       case LifecycleKind::DISARMED:
         return 2;
+      case LifecycleKind::COMPLETED:
+        return 3;
     }
     return 0;
   }
@@ -240,7 +273,11 @@ class LifecycleOutbox {
   void pop_front_() {
     if (this->empty())
       return;
-    for (size_t index = 1; index < this->size_; index++)
+    this->erase_at_(0);
+  }
+
+  void erase_at_(size_t removed) {
+    for (size_t index = removed + 1; index < this->size_; index++)
       this->events_[index - 1] = std::move(this->events_[index]);
     this->events_[--this->size_] = LifecycleEvent{};
   }
@@ -677,8 +714,11 @@ class TargetScheduler {
     return 0;
   }
 
-  std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id) {
+  std::optional<std::string> next(uint32_t now_ms, std::string &started_command_id,
+                                  LifecycleEvent *completed_event = nullptr) {
     started_command_id.clear();
+    if (completed_event != nullptr)
+      *completed_event = LifecycleEvent{};
     // Age-based reset applies only to the discretionary user floor. Physical
     // occupancy has its own short, bounded rf_busy_until_ horizon and is never
     // bypassed. Resetting only when the floor is >60s stale preserves spacing
@@ -761,6 +801,8 @@ class TargetScheduler {
             command.deadline_at = now_ms + command.stop_after_ms;
           }
         }
+        if (command.phase == Phase::ACTION)
+          command.action_repeats_delivered++;
         command.remaining--;
         const bool complete = command.remaining == 0 && this->advance_(command);
         if (command.remaining > 0) {
@@ -770,6 +812,10 @@ class TargetScheduler {
 
         this->flush_last_ = false;
         this->cursor_ = (index + 1) % count;
+        if (complete && completed_event != nullptr) {
+          *completed_event = LifecycleEvent::completed(
+              command.command_id, command.action_repeats_delivered, command.repeats);
+        }
         if (complete)
           this->erase_(target);
         this->record_dispatch_(now_ms, airtime_ms, uart_ms_(raw.size()));
@@ -809,6 +855,7 @@ class TargetScheduler {
     uint32_t stop_airtime_ms{0};
     int repeats{1};
     int remaining{1};
+    int action_repeats_delivered{0};
     uint32_t stop_after_ms{0};
     uint32_t deadline_at{0};
     uint32_t next_at{0};
