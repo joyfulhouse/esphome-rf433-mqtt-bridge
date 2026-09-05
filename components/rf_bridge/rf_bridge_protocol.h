@@ -445,23 +445,29 @@ inline std::string b0_with_bucket_offset(const std::string &frame, uint16_t offs
 // B0_MIN_BUCKET_US); the header, data nibbles, trailer, and every
 // unreferenced bucket stay byte-verbatim.
 //
+// `frame` MUST classify COMPENSABLE (b0_frame_status): the only caller,
+// send_raw, has already run that check, and re-checking here would rescan the
+// whole frame on every repeat of every dispatch.
+//
 // Returns false -- leaving `output` untouched, so the caller can emit the
-// original string with zero allocation -- when the frame is not COMPENSABLE
-// or no referenced bucket is below the floor. On true, `output` is the
-// floored copy and `clamped_buckets`, when non-null, receives how many
-// buckets were floored. A data nibble can in theory reference an undefined
-// bucket here precisely because send_raw never ran normalize_b0; indices >=
-// bucket_count are left alone (normalize_b0 rejects them separately).
+// original string with zero allocation -- when no referenced bucket is below
+// the floor. On true, `output` is the floored copy and `clamped_buckets`, when
+// non-null, receives how many buckets were floored. A data nibble can in
+// theory reference an undefined bucket here precisely because send_raw never
+// ran normalize_b0; indices >= bucket_count are left alone (normalize_b0
+// rejects them separately).
 inline bool b0_floor_referenced_buckets(const std::string &frame, std::string &output,
                                         size_t *clamped_buckets = nullptr) {
   if (clamped_buckets != nullptr)
     *clamped_buckets = 0;
-  if (b0_frame_status(frame) != B0FrameStatus::COMPENSABLE)
-    return false;
   const size_t body_length = static_cast<size_t>((hex_nibble(frame[4]) << 4) | hex_nibble(frame[5]));
   const size_t bucket_count = static_cast<size_t>((hex_nibble(frame[6]) << 4) | hex_nibble(frame[7]));
   const size_t body_end = 6U + body_length * 2U;
   // A bucket index is 3 bits, so the referenced sub-floor set is a bitmask.
+  // The & 0x07 cap keeps every probed index in 0..7, and the bucket >=
+  // bucket_count skip keeps the probe inside the DECLARED table, so this scan
+  // is safe even when a crafted frame declares more than 8 buckets (possible
+  // here: send_raw bypasses normalize_b0's count check).
   uint8_t below_floor = 0;
   for (size_t index = B0_BUCKET_TABLE_START + bucket_count * 4U; index < body_end; index++) {
     const size_t bucket = static_cast<size_t>(hex_nibble(frame[index]) & 0x07);
@@ -474,7 +480,10 @@ inline bool b0_floor_referenced_buckets(const std::string &frame, std::string &o
     return false;
   output = frame;
   size_t clamped = 0;
-  for (size_t bucket = 0; bucket < bucket_count; bucket++) {
+  // Walk the mask's eight possible bits, not 0..bucket_count: the declared
+  // count is caller-controlled here, and a count-wide loop would evaluate
+  // 1U << bucket into undefined behavior once bucket reaches 32.
+  for (size_t bucket = 0; bucket < 8U; bucket++) {
     if ((below_floor & (1U << bucket)) == 0)
       continue;
     b0_set_bucket(output, bucket, B0_MIN_BUCKET_US);

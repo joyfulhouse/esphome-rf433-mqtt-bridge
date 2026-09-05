@@ -2824,7 +2824,35 @@ int main() {
   assert(compensated.serialized() == "AAB005010800CF0055");
   assert(compensated.flush_count() == 1);
   assert(warnings_since_reset() == 0);
+
+  // A crafted COMPENSABLE frame declaring far more than 8 buckets (send_raw
+  // bypasses normalize_b0's 1..8 count check): count 0x28 = 40, length 0x54 =
+  // count + repeat + 80 bucket bytes + 2 data bytes. Bucket 0 is 1 us and
+  // referenced; bucket 1 is a legal 100 us and also referenced. The floor must
+  // rewrite only bucket 0's 4 chars and leave the other 39 byte-verbatim, and
+  // its rewrite loop must never evaluate 1U << bucket past bit 7 -- this
+  // binary is built with -fsanitize=undefined, so a count-wide loop would
+  // abort here instead of silently mis-shifting.
+  std::string crafted = "AAB0542808";
+  for (int index = 0; index < 40; index++)
+    crafted += (index == 0 ? "0001" : "0064");
+  crafted += "0001";
+  crafted += "55";
+  reset_warnings();
+  ProbeBridge wide;
+  wide.send_raw(crafted);
+  std::string floored_wide = "AAB0542808";
+  for (int index = 0; index < 40; index++)
+    floored_wide += "0064";
+  floored_wide += "0001";
+  floored_wide += "55";
+  assert(wide.serialized() == floored_wide);
+  assert(wide.flush_count() == 1);
+  assert(warnings_since_reset() == 1);
   return 0;
 }
 """,
+        # -fno-sanitize-recover so a triggered check fails the test instead of
+        # printing and exiting 0.
+        extra_flags=["-fsanitize=undefined", "-fno-sanitize-recover=undefined"],
     )
