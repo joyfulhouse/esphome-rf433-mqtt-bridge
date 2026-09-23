@@ -38,5 +38,16 @@ hardware-validated. The AOK tests include a re-keyed 65-pair fixture derived fro
 Its field jitter and truncated trailer are preserved without publishing the source remote's
 fixed-code identity; synthesized fixtures cover the broader envelope behavior.
 
+## Upstream status
+
+The two generic receive fixes (no ACK for B1 deliveries, declared-length B1 framing with a
+quiet-confirmed `0x55` terminator) were merged upstream as
+[esphome/esphome#17683](https://github.com/esphome/esphome/pull/17683) and ship in ESPHome
+2026.9.0. The fork stays vendored because everything else listed above is fork-only:
+`on_bucket_received`, AOK envelope filtering, A6/AB bounds checks, the startup A7 reset,
+`receive_idle()`, and `tx_bucket_offset_us`. This copy compiles unchanged on ESPHome 2026.9.0.
+Upstream's other changes to this component since 2026.6.5 (`final` classes, config-time UART
+validation, and `register_apply_action` in the unreleased `dev` branch) have not been ported.
+
 Rebase these files deliberately when changing the pinned ESPHome version; a local external
 component shadows the complete upstream `rf_bridge` implementation.

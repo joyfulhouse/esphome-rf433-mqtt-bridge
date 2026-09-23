@@ -10,6 +10,18 @@ Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is d
 
 ## [Unreleased]
 
+### Changed
+
+- **Builds on ESPHome 2026.9.0, which is now the minimum version.** The vendored `mqtt`
+  component is re-vendored from 2026.9.0 with the inbound payload guard re-applied. The 2026.7.3
+  copy called a core helper that 2026.9 removed, so it no longer compiled. CI and the documented
+  compile and flash commands now pin `esphome==2026.9.0`.
+- `secrets.example.yaml` uses a non-zero placeholder API key. ESPHome 2026.9 rejects the
+  all-zeros key at config validation, which failed the example compile.
+- The `rf_bridge` receive fixes are now upstream in ESPHome 2026.9.0 as
+  [esphome/esphome#17683](https://github.com/esphome/esphome/pull/17683). The component stays
+  vendored for its fork-only features. See [components/rf_bridge/README.md](components/rf_bridge/README.md).
+
 ### Fixed
 
 - **Frames referencing a bucket shorter than 100 µs are rejected at admission and floored in
