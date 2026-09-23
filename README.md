@@ -152,7 +152,7 @@ simply your HA host; a standalone broker works identically.
    `rf433-mqtt-bridge.yaml` loads `components/rf_bridge/` as a local external component. Keep that
    directory intact rather than flattening it. It is vendored from ESPHome 2026.6.5's
    `esphome/components/rf_bridge` and extended with the B1 receive callback used by this package.
-   `components/mqtt/` is a second, separate vendored component (ESPHome 2026.7.3) carrying the
+   `components/mqtt/` is a second, separate vendored component (ESPHome 2026.9.0) carrying the
    inbound payload guard described in [components/mqtt/README.md](components/mqtt/README.md).
 
    <details>
@@ -173,11 +173,12 @@ simply your HA host; a standalone broker works identically.
 3. Adjust the substitutions (bridge id, area, broker, credentials). Set `default_bridge: "true"`
    on exactly one bridge in your home. Networking is DHCP by default; a commented `manual_ip`
    block in the example shows how to pin a static address.
-4. Validate and flash with the hardware-tested ESPHome release:
+4. Validate and flash with the pinned ESPHome release (2026.9.0 or newer is required: the
+   vendored `mqtt` component tracks that release's core APIs):
 
    ```shell
-   uvx --from "esphome==2026.7.3" esphome compile living-room.yaml
-   uvx --from "esphome==2026.7.3" esphome run living-room.yaml
+   uvx --from "esphome==2026.9.0" esphome compile living-room.yaml
+   uvx --from "esphome==2026.9.0" esphome run living-room.yaml
    ```
 
 First flash of a stock device requires serial (5-pin header beside the power switch, switch slid

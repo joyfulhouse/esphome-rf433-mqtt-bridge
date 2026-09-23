@@ -1,8 +1,15 @@
 # Vendored ESPHome mqtt component
 
-All 53 files in this directory were copied from `esphome/components/mqtt` in **ESPHome
-2026.7.3** (tag commit `985a08e2473d56c23f8ab31746a119fe5f5bbae9`). The upstream component
+All 53 upstream files in this directory were copied from `esphome/components/mqtt` in
+**ESPHome 2026.9.0** (tag commit `c6e4c87e525dd343e470d8dea368957a002f6505`). The upstream component
 is licensed under ESPHome's MIT license.
+
+History: first vendored from 2026.7.3; re-vendored from 2026.9.0 because 2026.9 removed core
+helpers the 2026.7.3 copy called (`make_name_with_suffix`), so the old copy no longer compiled.
+The re-vendor copied every C++ file wholesale, re-applied the guard below, and ported upstream's
+`__init__.py` changes (`CONF_DISCOVER_IP` from `esphome.const`, the `esp-tls` IDF include, and the
+`USE_<ENTITY>` source-file filter) onto the restyled module. This copy therefore requires ESPHome
+2026.9.0 or newer.
 
 This copy carries one behavioural change on top of upstream: the inbound payload guard
 described below.
@@ -16,10 +23,8 @@ rules. The split is pure code motion -- the order of `cg.add(...)` emissions, an
 the generated C++, is unchanged. Upstream's `AUTO_LOAD` callable is preserved as a module
 attribute aliasing `_auto_load`, because ESPHome's loader resolves that name by string.
 
-Note: the fleet's esphome-config CI currently builds against ESPHome 2026.7.2 and is
-scheduled to bump to 2026.7.3 at Batch B rollout; the `mqtt` component is byte-identical
-between those two releases, so this vendor commit's provenance and the fleet's eventual
-runtime match exactly.
+Note: any fleet esphome-config CI that builds these sources must use ESPHome 2026.9.0 or
+newer; older releases lack core APIs this copy calls.
 
 ## Why this exists
 

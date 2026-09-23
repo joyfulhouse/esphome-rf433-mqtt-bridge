@@ -675,7 +675,7 @@ this hardware. For **this** project it is only a stepping stone, for two reasons
    (switch toward the header, hold the button while powering on). Then run:
 
    ```shell
-   uvx --from "esphome==2026.7.3" esphome run living-room.yaml
+   uvx --from "esphome==2026.9.0" esphome run living-room.yaml
    ```
 3. **Later updates are OTA.** Every update after this first one goes over Wi-Fi — no serial cable.
 

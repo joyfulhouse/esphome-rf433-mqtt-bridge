@@ -1,4 +1,4 @@
-"""Vendored ESPHome 2026.7.3 mqtt component codegen.
+"""Vendored ESPHome 2026.9.0 mqtt component codegen.
 
 The bridge's only behavioural change to this component -- the bounded inbound
 payload guard -- lives in `mqtt_client.cpp`. This module is upstream's codegen
@@ -16,7 +16,10 @@ from esphome.components.esp32 import (
     idf_version,
     include_builtin_idf_component,
 )
-from esphome.config_helpers import filter_source_files_from_platform
+from esphome.config_helpers import (
+    filter_source_files_from_defines,
+    filter_source_files_from_platform,
+)
 from esphome.const import (
     CONF_AVAILABILITY,
     CONF_BIRTH_MESSAGE,
@@ -28,6 +31,7 @@ from esphome.const import (
     CONF_CLIENT_ID,
     CONF_COMMAND_RETAIN,
     CONF_COMMAND_TOPIC,
+    CONF_DISCOVER_IP,
     CONF_DISCOVERY,
     CONF_DISCOVERY_OBJECT_ID_GENERATOR,
     CONF_DISCOVERY_PREFIX,
@@ -86,7 +90,6 @@ def _auto_load() -> list[str]:
 AUTO_LOAD = _auto_load
 
 
-CONF_DISCOVER_IP = "discover_ip"
 CONF_IDF_SEND_ASYNC = "idf_send_async"
 CONF_WAIT_FOR_CONNECTION = "wait_for_connection"
 
@@ -358,6 +361,8 @@ def _add_platform_libraries() -> None:
             add_idf_component(name="espressif/mqtt", ref="1.0.0")
         else:
             include_builtin_idf_component("mqtt")
+        # mqtt_client.h drags in esp_tls types; esp-tls is excluded by default
+        include_builtin_idf_component("esp-tls")
 
 
 def _add_discovery(var: object, config: ConfigType) -> None:
@@ -690,7 +695,7 @@ async def mqtt_disable_to_code(
     return cg.new_Pvariable(action_id, template_arg, paren)
 
 
-FILTER_SOURCE_FILES = filter_source_files_from_platform(
+_platform_filter = filter_source_files_from_platform(
     {
         "mqtt_backend_esp32.cpp": {
             PlatformFramework.ESP32_ARDUINO,
@@ -698,3 +703,35 @@ FILTER_SOURCE_FILES = filter_source_files_from_platform(
         },
     }
 )
+
+# Each entity file is fully #ifdef'd on the USE_<ENTITY> define the core
+# emits for entity platforms present in the config.
+_define_filter = filter_source_files_from_defines(
+    {
+        "mqtt_alarm_control_panel.cpp": "USE_ALARM_CONTROL_PANEL",
+        "mqtt_binary_sensor.cpp": "USE_BINARY_SENSOR",
+        "mqtt_button.cpp": "USE_BUTTON",
+        "mqtt_climate.cpp": "USE_CLIMATE",
+        "mqtt_cover.cpp": "USE_COVER",
+        "mqtt_date.cpp": "USE_DATETIME_DATE",
+        "mqtt_datetime.cpp": "USE_DATETIME_DATETIME",
+        "mqtt_event.cpp": "USE_EVENT",
+        "mqtt_fan.cpp": "USE_FAN",
+        "mqtt_light.cpp": "USE_LIGHT",
+        "mqtt_lock.cpp": "USE_LOCK",
+        "mqtt_number.cpp": "USE_NUMBER",
+        "mqtt_select.cpp": "USE_SELECT",
+        "mqtt_sensor.cpp": "USE_SENSOR",
+        "mqtt_switch.cpp": "USE_SWITCH",
+        "mqtt_text.cpp": "USE_TEXT",
+        "mqtt_text_sensor.cpp": "USE_TEXT_SENSOR",
+        "mqtt_time.cpp": "USE_DATETIME_TIME",
+        "mqtt_update.cpp": "USE_UPDATE",
+        "mqtt_valve.cpp": "USE_VALVE",
+    }
+)
+
+
+def FILTER_SOURCE_FILES() -> list[str]:  # noqa: N802 -- name is resolved by ESPHome's loader
+    """Combine upstream's platform and entity-define source filters."""
+    return _platform_filter() + _define_filter()
