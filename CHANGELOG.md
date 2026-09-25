@@ -10,6 +10,39 @@ Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is d
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-25
+
+Contract stays **v3**. Every wire change below is additive: consumers that read named fields and
+ignore unknown statuses are unaffected. zemismart-blinds 0.9.5 was checked against it. At the
+default `tx_bucket_offset_us: "0"`, a well-formed frame whose referenced buckets are all at least
+100 µs transmits byte-identical to 1.4.0.
+
+### Added
+
+- **`completed` TX telemetry on `/status`**
+  ([#17](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/pull/17), part of
+  [zemismart-blinds#22](https://github.com/joyfulhouse/zemismart-blinds/issues/22)): when a
+  normally scheduled command finishes, the bridge emits one non-retained QoS 1
+  `{"status":"completed","command_id":…,"action_repeats_delivered":N,"action_repeats_configured":M}`.
+  It counts ACTION frames handed to the RF coprocessor, not motor acknowledgements. It is
+  best-effort outbox traffic that never evicts or reorders an existing lifecycle status.
+  Displacement and disarm keep their existing events and report no count.
+- **`hardware_variant` inventory tag**
+  ([#12](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/pull/12)): a new substitution,
+  default `efm8bb1-portisch`, published verbatim as `hw` in retained `/info`. It is inventory only
+  and changes no behaviour. The new `examples/bedroom-v22.yaml` covers Sonoff R2 v2.2 boards
+  (OB38S003 running the vendored mightymos firmware,
+  [#13](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/pull/13)).
+- **Opt-in `tx_bucket_offset_us`**
+  ([#15](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/pull/15),
+  [#16](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/pull/16)): microseconds
+  subtracted from every bucket of an outbound B0 frame, to offset the OB38S003 port's long
+  transmit timing (upstream mightymos/RF-Bridge-OB38S003#27). It is for OB38S003 boards only,
+  accepts 0–120, and defaults to 0. Do not combine it with hand-tuned codes. The effective value
+  is published as `tx_offset_us` in retained `/info` so a fleet audit can see which bridges
+  compensate. `send_raw` now cross-checks a B0 frame's declared length and bucket count, and
+  leaves a malformed frame untouched rather than rewriting its data.
+
 ### Changed
 
 - **Builds on ESPHome 2026.9.0, which is now the minimum version.** The vendored `mqtt`
@@ -24,6 +57,14 @@ Flashing instructions live in [HARDWARE.md](HARDWARE.md); the MQTT contract is d
 
 ### Fixed
 
+- **A timed command keeps all of its ACTION repeats under concurrency**
+  ([#20](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/pull/20), part of
+  [zemismart-blinds#22](https://github.com/joyfulhouse/zemismart-blinds/issues/22)): same-bridge
+  round-robin could let a timed command reach its fail-safe STOP deadline before all of its
+  configured repeats went out. Once a timed command dispatches its first ACTION, it now owns
+  dispatch through its remaining ACTION and TRAILER copies. Untimed peers are delayed, not
+  dropped. Deadlines are never recomputed, and STOP lateness stays bounded by one owner-frame
+  airtime, the same bound as a solo command.
 - **Frames referencing a bucket shorter than 100 µs are rejected at admission and floored in
   `send_raw`** ([#18](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/18)):
   `normalize_b0` validated structure, bucket references, and the 2 s airtime ceiling, but had no
@@ -203,6 +244,10 @@ First public release.
 - Retained `rf433/<bridge>/availability` and `/info` discovery.
 - Vendored, extended `rf_bridge` component adding the B1 receive callback with correct framing.
 
+[Unreleased]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/releases/tag/v1.5.0
+[1.4.0]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/releases/tag/v1.4.0
+[1.3.0]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/releases/tag/v1.3.0
 [1.2.2]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/releases/tag/v1.2.2
 [1.2.1]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/releases/tag/v1.2.1
 [1.2.0]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/releases/tag/v1.2.0
