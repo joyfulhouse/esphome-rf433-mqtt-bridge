@@ -164,7 +164,7 @@ simply your HA host; a standalone broker works identically.
 
    ```yaml
    external_components:
-     - source: github://joyfulhouse/esphome-rf433-mqtt-bridge@v1.2.2
+     - source: github://joyfulhouse/esphome-rf433-mqtt-bridge@v1.5.0
        components: [rf_bridge]
    ```
 

@@ -1278,8 +1278,8 @@ def test_release_metadata_matches_latest_tag() -> None:
         "[package.dev-dependencies]", maxsplit=1
     )[0]
 
-    assert 'version = "1.2.2"' in pyproject
-    assert 'version = "1.2.2"' in project_lock_entry
+    assert 'version = "1.5.0"' in pyproject
+    assert 'version = "1.5.0"' in project_lock_entry
     assert "uv run --locked ruff check ." in workflow
     assert "uv run --locked ruff format --check ." in workflow
     assert "uv run --locked pytest -q" in workflow
